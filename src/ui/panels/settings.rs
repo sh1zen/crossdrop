@@ -1,0 +1,321 @@
+use crate::core::initializer::PeerNode;
+use crate::ui::traits::{Action, Component, Focusable, FocusableElement, Handler};
+use crate::workers::app::App;
+use crossterm::event::KeyCode;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Frame,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FocusElement {
+    DisplayNameInput,        // Index 0
+    RemoteAccessToggle,      // Index 1
+    RemoteKeyListenerToggle, // Index 2
+    ThemeToggle,             // Index 3
+}
+
+impl FocusElement {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => FocusElement::DisplayNameInput,
+            1 => FocusElement::RemoteAccessToggle,
+            2 => FocusElement::RemoteKeyListenerToggle,
+            3 => FocusElement::ThemeToggle,
+            _ => FocusElement::DisplayNameInput,
+        }
+    }
+
+    fn to_index(self) -> usize {
+        match self {
+            FocusElement::DisplayNameInput => 0,
+            FocusElement::RemoteAccessToggle => 1,
+            FocusElement::RemoteKeyListenerToggle => 2,
+            FocusElement::ThemeToggle => 3,
+        }
+    }
+}
+
+pub struct SettingsPanel {
+    focused_element: FocusElement,
+}
+
+impl Default for SettingsPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SettingsPanel {
+    pub fn new() -> Self {
+        Self {
+            focused_element: FocusElement::DisplayNameInput,
+        }
+    }
+}
+
+impl Component for SettingsPanel {
+    fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([
+                Constraint::Length(3), // Display name input
+                Constraint::Length(3), // Remote access toggle
+                Constraint::Length(3), // Remote key listener toggle
+                Constraint::Length(3), // Theme toggle
+                Constraint::Min(0),    // Spacer
+            ])
+            .split(area);
+
+        let accent = app.state.settings.theme.accent();
+
+        // Display name input
+        let name_focused = self.focused_element == FocusElement::DisplayNameInput;
+        let name_border_color = if name_focused { accent } else { Color::DarkGray };
+
+        let name_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(name_border_color))
+            .title(Span::styled(
+                " Display Name ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let name_text = Paragraph::new(app.input.as_str()).block(name_block);
+        f.render_widget(name_text, chunks[0]);
+
+        // Remote access toggle
+        let toggle_focused = self.focused_element == FocusElement::RemoteAccessToggle;
+        let toggle_border_color = if toggle_focused { accent } else { Color::DarkGray };
+
+        let toggle_status = if app.state.settings.remote_access {
+            Span::styled(" ENABLED ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(" DISABLED ", Style::default().fg(Color::Red))
+        };
+
+        let toggle_help = if toggle_focused {
+            Span::styled(" (Press 'a' to toggle) ", Style::default().fg(Color::Gray))
+        } else {
+            Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
+        };
+
+        let toggle_line = Line::from(vec![
+            Span::raw("Remote Access: "),
+            toggle_status,
+            toggle_help,
+        ]);
+
+        let toggle_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(toggle_border_color))
+            .title(Span::styled(
+                " Remote File System Access ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let toggle_widget = Paragraph::new(toggle_line).block(toggle_block);
+        f.render_widget(toggle_widget, chunks[1]);
+
+        // Remote key listener toggle
+        let rkl_focused = self.focused_element == FocusElement::RemoteKeyListenerToggle;
+        let rkl_border_color = if rkl_focused { accent } else { Color::DarkGray };
+
+        let rkl_status = if app.state.settings.remote_key_listener {
+            Span::styled(" ENABLED ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(" DISABLED ", Style::default().fg(Color::Red))
+        };
+
+        let rkl_help = if rkl_focused {
+            Span::styled(" (Press 'k' to toggle) ", Style::default().fg(Color::Gray))
+        } else {
+            Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
+        };
+
+        let rkl_line = Line::from(vec![
+            Span::raw("Share Keystrokes: "),
+            rkl_status,
+            rkl_help,
+        ]);
+
+        let rkl_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(rkl_border_color))
+            .title(Span::styled(
+                " Remote Key Sharing ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let rkl_widget = Paragraph::new(rkl_line).block(rkl_block);
+        f.render_widget(rkl_widget, chunks[2]);
+
+        // Theme toggle
+        let theme_focused = self.focused_element == FocusElement::ThemeToggle;
+        let theme_border_color = if theme_focused {
+            app.state.settings.theme.accent()
+        } else {
+            Color::DarkGray
+        };
+
+        let theme_label = Span::styled(
+            format!(" {} ", app.state.settings.theme.label()),
+            Style::default().fg(app.state.settings.theme.accent()),
+        );
+
+        let theme_help = if theme_focused {
+            Span::styled(" (Press 't' to cycle) ", Style::default().fg(Color::Gray))
+        } else {
+            Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
+        };
+
+        let theme_line = Line::from(vec![
+            Span::raw("Theme: "),
+            theme_label,
+            theme_help,
+        ]);
+
+        let theme_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme_border_color))
+            .title(Span::styled(
+                " UI Theme ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let theme_widget = Paragraph::new(theme_line).block(theme_block);
+        f.render_widget(theme_widget, chunks[3]);
+    }
+
+    fn on_focus(&mut self, app: &mut App, _node: &PeerNode) {
+        // Initialize input with current display name
+        app.input = app.state.settings.display_name.clone();
+        self.focused_element = FocusElement::DisplayNameInput;
+    }
+
+    fn on_blur(&mut self, app: &mut App) {
+        app.input.clear();
+    }
+}
+
+impl Handler for SettingsPanel {
+    fn handle_key(&mut self, app: &mut App, node: &PeerNode, key: KeyCode) -> Option<Action> {
+        match key {
+            KeyCode::Esc => {
+                app.input.clear();
+                return Some(Action::SwitchMode(crate::workers::app::Mode::Home));
+            }
+            KeyCode::Tab => {
+                self.focus_next();
+            }
+            KeyCode::BackTab => {
+                self.focus_prev();
+            }
+            KeyCode::Enter => {
+                // Save display name
+                let name = app.input.trim().to_string();
+                if name != app.state.settings.display_name {
+                    app.state.settings.display_name = name.clone();
+                    if name.is_empty() {
+                        app.set_status("Display name cleared".to_string());
+                    } else {
+                        app.set_status(format!("Display name set to: {}", name));
+                    }
+
+                    // Persist to disk
+                    if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                        let _ = p.save_display_name(&name);
+                    }
+
+                    if !name.is_empty() {
+                        let node = node.clone();
+                        tokio::spawn(async move {
+                            node.broadcast_display_name(name).await;
+                        });
+                    }
+                }
+                app.input.clear();
+                return Some(Action::SwitchMode(crate::workers::app::Mode::Home));
+            }
+            KeyCode::Char(c) => {
+                match self.focused_element {
+                    FocusElement::DisplayNameInput => {
+                        // ALL characters (including 'a') go to input when input is focused
+                        app.input.push(c);
+                    }
+                    FocusElement::RemoteAccessToggle => {
+                        // Only 'a'/'A' toggles when focused on toggle
+                        if c == 'a' || c == 'A' {
+                            app.state.settings.remote_access = !app.state.settings.remote_access;
+                            let enabled = app.state.settings.remote_access;
+                            // Persist to disk
+                            if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                                let _ = p.save_remote_access(enabled);
+                            }
+                            app.set_status(format!(
+                                "Remote access {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            ));
+                        }
+                    }
+                    FocusElement::RemoteKeyListenerToggle => {
+                        if c == 'k' || c == 'K' {
+                            app.state.settings.remote_key_listener = !app.state.settings.remote_key_listener;
+                            let enabled = app.state.settings.remote_key_listener;
+                            // Persist to disk
+                            if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                                let _ = p.save_remote_key_listener(enabled);
+                            }
+                            app.set_status(format!(
+                                "Remote key listener {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            ));
+                            return Some(Action::UpdateGlobalKeyboardListener);
+                        }
+                    }
+                    FocusElement::ThemeToggle => {
+                        if c == 't' || c == 'T' {
+                            app.state.settings.theme = app.state.settings.theme.next();
+                            let theme_str = app.state.settings.theme.to_str().to_string();
+                            app.set_status(format!("Theme: {}", app.state.settings.theme.label()));
+                            // Persist theme
+                            if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                                let _ = p.save_theme(&theme_str);
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if self.focused_element == FocusElement::DisplayNameInput {
+                    app.input.pop();
+                }
+            }
+            _ => {}
+        }
+        Some(Action::None)
+    }
+}
+
+impl Focusable for SettingsPanel {
+    fn focusable_elements(&self) -> Vec<FocusableElement> {
+        vec![
+            FocusableElement::TextInput,
+            FocusableElement::Toggle,
+            FocusableElement::Toggle,
+            FocusableElement::Toggle,
+        ]
+    }
+
+    fn focused_index(&self) -> usize {
+        self.focused_element.to_index()
+    }
+
+    fn set_focus(&mut self, index: usize) {
+        self.focused_element = FocusElement::from_index(index);
+    }
+}

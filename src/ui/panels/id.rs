@@ -1,0 +1,77 @@
+use crate::core::initializer::PeerNode;
+use crate::ui::traits::{Action, Component, Handler};
+use crate::utils::clipboard::copy_to_clipboard;
+use crate::workers::app::App;
+use crossterm::event::KeyCode;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, Borders, Paragraph, Wrap},
+    Frame,
+};
+
+pub struct IdPanel;
+
+impl Default for IdPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdPanel {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Component for IdPanel {
+    fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+            ])
+            .split(area);
+
+        let peer_id_widget = Paragraph::new(app.peer_id.as_str())
+            .block(
+                Block::default()
+                    .title(" Your Peer ID ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .style(Style::default().fg(Color::Cyan));
+        f.render_widget(peer_id_widget, chunks[0]);
+
+        let ticket_widget = Paragraph::new(app.ticket.as_str())
+            .block(
+                Block::default()
+                    .title(" Your Full Ticket ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            )
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Green));
+        f.render_widget(ticket_widget, chunks[1]);
+    }
+}
+
+impl Handler for IdPanel {
+    fn handle_key(&mut self, app: &mut App, _node: &PeerNode, key: KeyCode) -> Option<Action> {
+        match key {
+            KeyCode::Esc => {
+                app.notify.clear();
+                Some(Action::SwitchMode(crate::workers::app::Mode::Home))
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if copy_to_clipboard(&app.ticket) {
+                    Some(Action::SetStatus("Ticket copied to clipboard!".to_string()))
+                } else {
+                    Some(Action::SetStatus("Failed to copy to clipboard".to_string()))
+                }
+            }
+            _ => Some(Action::None),
+        }
+    }
+}
