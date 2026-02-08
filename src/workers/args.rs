@@ -40,6 +40,14 @@ pub struct Args {
     /// Path to file storing persistent secret key.
     #[clap(long)]
     pub secret_file: Option<PathBuf>,
+
+    /// Remote access allowed
+    #[clap(long)]
+    pub remote_access: bool,
+
+    /// Display name for this peer.
+    #[clap(long)]
+    pub display_name: Option<String>,
 }
 
 impl Args {
@@ -93,6 +101,12 @@ impl Args {
         }
         if cli.port > 0 {
             file.port = cli.port;
+        }
+        if cli.display_name.is_some() {
+            file.display_name = cli.display_name;
+        }
+        if cli.remote_access {
+            file.remote_access = true;
         }
         file.relay = cli.relay;
         file

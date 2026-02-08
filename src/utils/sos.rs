@@ -8,7 +8,6 @@ pub struct SignalOfStop {
     internal: Arc<SharedState>,
 }
 
-
 #[derive(Debug, Default)]
 struct SharedState {
     closing: AtomicBool,
@@ -39,12 +38,6 @@ impl SignalOfStop {
         }
     }
 
-    pub fn restore(&self) {
-        if self.internal.mutex.lock().is_ok() {
-            self.internal.closing.store(false, Ordering::Relaxed);
-        }
-    }
-
     pub fn cancelled(&self) -> bool {
         self.internal.closing.load(Ordering::Relaxed)
     }
@@ -62,28 +55,9 @@ impl SignalOfStop {
         self.cancelled()
     }
 
-    pub fn wait_cancellation(&self) {
-        // Only lock the mutex while checking and waiting on the condition variable
-        let mut guard = self.internal.mutex.lock().unwrap();
-
-        while !self.cancelled() {
-            guard = self.internal.condvar.wait(guard).unwrap();
-        }
-    }
-
-    pub fn spawn<F>(&self, fut: F)
-    where
-        F: Future<Output=()> + Send + 'static,
-    {
-        let clone = self.clone();
-        tokio::spawn(async move {
-            let _ = clone.select(fut).await;
-        });
-    }
-
     pub async fn select<F, T>(&self, fut: F) -> Result<T, ()>
     where
-        F: Future<Output=T> + Send + 'static,
+        F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
         let clone = self.clone();

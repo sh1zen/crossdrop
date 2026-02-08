@@ -112,12 +112,13 @@ fn try_acquire_lock(lock_path: &Path) -> bool {
 /// Load an existing key from file, or generate a new one and save it.
 fn load_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
     if path.exists() {
-        let hex_str =
-            std::fs::read_to_string(path).context("failed to read secret key file")?;
+        let hex_str = std::fs::read_to_string(path).context("failed to read secret key file")?;
         return SecretKey::from_str(hex_str.trim()).context("invalid secret key in file");
     }
 
-    let key = SecretKey::generate(&mut rand::rng());
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    let key = SecretKey::from_bytes(&bytes);
     let hex_str = hex::encode(key.to_bytes());
 
     if let Some(parent) = path.parent() {
@@ -176,9 +177,13 @@ pub fn get_or_create_secret(
 
         // All 10 slots taken — ephemeral key
         tracing::warn!("All secret key slots in use, using ephemeral identity");
-        return Ok((SecretKey::generate(&mut rand::rng()), None));
+        let mut bytes = [0u8; 32];
+        rand::fill(&mut bytes);
+        return Ok((SecretKey::from_bytes(&bytes), None));
     }
 
     // No home dir — ephemeral key
-    Ok((SecretKey::generate(&mut rand::rng()), None))
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    Ok((SecretKey::from_bytes(&bytes), None))
 }

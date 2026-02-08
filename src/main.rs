@@ -1,24 +1,26 @@
-mod app;
 mod core;
+mod ui;
 mod utils;
 mod workers;
 
-use crate::app::Args;
 use crate::utils::log_buffer::{BufferLayer, LogBuffer};
 use crate::utils::sos::SignalOfStop;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use workers::args::Args;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::load();
 
     // Init tracing with layered subscriber
+    // Note: webrtc_ice generates many "unknown TransactionID" warnings for late-arriving
+    // STUN responses, which are normal. Filter these out to reduce noise.
     let filter = match args.verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
+        0 => "warn,webrtc_ice::agent=error",
+        1 => "info,webrtc_ice::agent=error",
+        2 => "debug,webrtc_ice::agent=error",
         _ => "trace",
     };
 
@@ -43,5 +45,5 @@ async fn main() -> anyhow::Result<()> {
         sos_clone.cancel();
     });
 
-    workers::tui::run(args, sos, log_buffer).await
+    ui::run(args, sos, log_buffer).await
 }

@@ -37,14 +37,6 @@ impl LogBuffer {
     pub fn entries(&self) -> Vec<LogEntry> {
         self.entries.lock().unwrap().clone()
     }
-
-    pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
-    }
-
-    pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
-    }
 }
 
 pub struct BufferLayer {

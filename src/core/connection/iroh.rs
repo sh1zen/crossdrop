@@ -1,5 +1,5 @@
-use crate::app::RelayModeOption;
 use crate::core::connection::ticket::Ticket;
+use crate::workers::args::RelayModeOption;
 use anyhow::Context;
 use iroh::address_lookup::dns::DnsAddressLookup;
 use iroh::address_lookup::pkarr::PkarrPublisher;
@@ -23,14 +23,9 @@ impl Iroh {
         ipv6_addr: Option<std::net::SocketAddrV6>,
         port: u16,
     ) -> anyhow::Result<Self> {
-        let endpoint = Self::bind_with_retry(
-            secret_key,
-            relay_mode.clone(),
-            ipv4_addr,
-            ipv6_addr,
-            port,
-        )
-        .await?;
+        let endpoint =
+            Self::bind_with_retry(secret_key, relay_mode.clone(), ipv4_addr, ipv6_addr, port)
+                .await?;
 
         if !matches!(relay_mode, RelayModeOption::Disabled) {
             let ep = endpoint.clone();
@@ -67,15 +62,13 @@ impl Iroh {
         if let Some(addr) = ipv4_addr {
             // If a port override is set, replace the port in the explicit address
             if port > 0 {
-                builder = builder
-                    .bind_addr(SocketAddrV4::new(*addr.ip(), port))?;
+                builder = builder.bind_addr(SocketAddrV4::new(*addr.ip(), port))?;
             } else {
                 builder = builder.bind_addr(addr)?;
             }
         } else if port > 0 {
             // No explicit IPv4 addr but a port was requested
-            builder = builder
-                .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
+            builder = builder.bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))?;
         }
 
         if let Some(addr) = ipv6_addr {
@@ -121,7 +114,10 @@ impl Iroh {
                 }
                 Err(e) => {
                     let msg = format!("{e}");
-                    if msg.contains("in use") || msg.contains("AddrInUse") || msg.contains("address already") {
+                    if msg.contains("in use")
+                        || msg.contains("AddrInUse")
+                        || msg.contains("address already")
+                    {
                         tracing::debug!("Port {try_port} in use, trying next...");
                         last_err = Some(e);
                         continue;
@@ -139,9 +135,7 @@ impl Iroh {
         );
         Self::try_bind(secret_key, &relay_mode, ipv4_addr, ipv6_addr, 0)
             .await
-            .map_err(|e| {
-                last_err.unwrap_or(e)
-            })
+            .map_err(|e| last_err.unwrap_or(e))
     }
 
     pub fn endpoint(&self) -> anyhow::Result<&Endpoint> {
@@ -154,9 +148,7 @@ impl Iroh {
         if ticket.address.relay_urls().next().is_none()
             && ticket.address.ip_addrs().next().is_none()
         {
-            tracing::warn!(
-                "Ticket has no IP or relay: remote peer may not be reachable"
-            );
+            tracing::warn!("Ticket has no IP or relay: remote peer may not be reachable");
         }
 
         let conn = endpoint

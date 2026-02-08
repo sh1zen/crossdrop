@@ -1,6 +1,6 @@
 mod iroh;
-pub mod webrtc;
 mod ticket;
+pub mod webrtc;
 
 pub use iroh::Iroh;
 pub use ticket::Ticket;

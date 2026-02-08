@@ -1,0 +1,21 @@
+pub mod chat;
+pub mod connect;
+pub mod files;
+pub mod home;
+pub mod id;
+pub mod logs;
+pub mod peers;
+pub mod remote;
+pub mod send;
+pub mod settings;
+
+pub use chat::ChatPanel;
+pub use connect::ConnectPanel;
+pub use files::FilesPanel;
+pub use home::HomePanel;
+pub use id::IdPanel;
+pub use logs::LogsPanel;
+pub use peers::PeersPanel;
+pub use remote::RemotePanel;
+pub use send::SendPanel;
+pub use settings::SettingsPanel;
