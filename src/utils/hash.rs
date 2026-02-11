@@ -1,5 +1,5 @@
 use anyhow::Context;
-use base64::engine::general_purpose::PAD;
+use base64::engine::general_purpose::{PAD, URL_SAFE_NO_PAD};
 use base64::engine::GeneralPurpose;
 use base64::{alphabet, Engine};
 use brotli::{CompressorWriter, Decompressor};
@@ -9,18 +9,39 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// Version prefix for the compact encoding format.
+/// Allows future format changes without breaking existing IDs.
+const COMPACT_VERSION: &str = "1";
+
 pub fn compress_string(data: String) -> anyhow::Result<String> {
+    // Use compact encoding: version prefix + URL-safe Base64 (no padding)
     let mut compressed = Vec::new();
     {
         let mut compressor = CompressorWriter::new(&mut compressed, 4096, 11, 22);
         compressor.write_all(data.as_bytes())?;
     }
-    let compressed = GeneralPurpose::new(&alphabet::STANDARD, PAD).encode(compressed);
-    Ok(compressed)
+    let encoded = URL_SAFE_NO_PAD.encode(&compressed);
+    Ok(format!("{}{}", COMPACT_VERSION, encoded))
 }
 
 pub fn expand_string(packed: String) -> anyhow::Result<String> {
-    let compressed = GeneralPurpose::new(&alphabet::STANDARD, PAD).decode(packed.trim())?;
+    let trimmed = packed.trim();
+    // Detect format: if starts with version prefix, use compact format
+    let compressed = if let Some(rest) = trimmed.strip_prefix(COMPACT_VERSION) {
+        // Try URL-safe no-pad first (new compact format)
+        URL_SAFE_NO_PAD
+            .decode(rest)
+            .or_else(|_| {
+                // Fallback: maybe the '1' was part of old base64 data
+                GeneralPurpose::new(&alphabet::STANDARD, PAD).decode(trimmed)
+            })
+            .context("failed to decode base64")?
+    } else {
+        // Legacy format: standard base64 with padding
+        GeneralPurpose::new(&alphabet::STANDARD, PAD)
+            .decode(trimmed)
+            .context("failed to decode legacy base64")?
+    };
     let mut decompressor = Decompressor::new(&*compressed, 4096);
     let mut decompressed_data = String::new();
     decompressor.read_to_string(&mut decompressed_data)?;
@@ -131,34 +152,26 @@ fn load_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
 
 /// Get or create a persistent secret key, with per-instance locking.
 ///
-/// When no explicit `secret_file` is given, automatically finds an available
-/// slot (`secret_key`, `secret_key_1`, …, `secret_key_9`) so that multiple
-/// instances on the same machine each get their own identity.
+/// Automatically finds an available slot (`secret_key`, `secret_key_1`, …,
+/// `secret_key_9`) in the configured data directory so that multiple instances
+/// on the same machine each get their own identity.
 ///
 /// Returns the key and an `InstanceGuard` that releases the lock on drop.
 ///
 /// Priority:
 /// 1. `IROH_SECRET` environment variable
-/// 2. Explicit `--secret-file` path (no locking)
-/// 3. Auto-detect available slot in `~/.crossdrop/`
-/// 4. Ephemeral key as last resort
-pub fn get_or_create_secret(
-    secret_file: Option<&Path>,
-) -> anyhow::Result<(SecretKey, Option<InstanceGuard>)> {
+/// 2. Auto-detect available slot in the data directory
+/// 3. Ephemeral key as last resort
+pub fn get_or_create_secret() -> anyhow::Result<(SecretKey, Option<InstanceGuard>)> {
     // 1. Env var
     if let Ok(secret) = std::env::var("IROH_SECRET") {
         let key = SecretKey::from_str(&secret).context("invalid IROH_SECRET")?;
         return Ok((key, None));
     }
 
-    // 2. Explicit file — use directly, no locking
-    if let Some(path) = secret_file {
-        let key = load_or_create_key(path)?;
-        return Ok((key, None));
-    }
-
-    // 3. Auto-detect available slot
-    if let Some(base_dir) = dirs::home_dir().map(|h| h.join(".crossdrop")) {
+    // 2. Auto-detect available slot
+    {
+        let base_dir = crate::utils::data_dir::get().to_path_buf();
         let _ = std::fs::create_dir_all(&base_dir);
 
         let candidates = std::iter::once("secret_key".to_string())
@@ -182,8 +195,4 @@ pub fn get_or_create_secret(
         return Ok((SecretKey::from_bytes(&bytes), None));
     }
 
-    // No home dir — ephemeral key
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    Ok((SecretKey::from_bytes(&bytes), None))
 }

@@ -140,7 +140,7 @@ impl Component for FilesPanel {
             let mut grouped_sends: std::collections::HashMap<&str, Vec<_>> = std::collections::HashMap::new();
             for (filename, sent, total) in send_items.iter() {
                 let parent_dir = filename.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-                grouped_sends.entry(parent_dir).or_insert_with(Vec::new).push((filename.as_str(), *sent, *total));
+                grouped_sends.entry(parent_dir).or_default().push((filename.as_str(), *sent, *total));
             }
 
             // Show aggregated or individual entries
@@ -206,7 +206,7 @@ impl Component for FilesPanel {
             let mut grouped_receives: std::collections::HashMap<&str, Vec<_>> = std::collections::HashMap::new();
             for (filename, recv, total) in recv_items.iter() {
                 let parent_dir = filename.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-                grouped_receives.entry(parent_dir).or_insert_with(Vec::new).push((filename.as_str(), *recv, *total));
+                grouped_receives.entry(parent_dir).or_default().push((filename.as_str(), *recv, *total));
             }
 
             // Show aggregated or individual entries

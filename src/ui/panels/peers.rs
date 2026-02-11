@@ -38,24 +38,35 @@ impl Component for PeersPanel {
             .enumerate()
             .map(|(i, p)| {
                 let is_selected = i == app.selected_peer_idx;
+                let is_online = app.is_peer_online(p);
                 let display = get_display_name(app, p);
                 let short = short_peer_id(p);
+
+                // Status indicator: green circle for online, grey for offline
+                let status_indicator = if is_online {
+                    Span::styled("● ", Style::default().fg(Color::Green))
+                } else {
+                    Span::styled("● ", Style::default().fg(Color::DarkGray))
+                };
+
+                let name_style = if !is_online {
+                    // Offline peers always rendered in dark grey
+                    Style::default().fg(Color::DarkGray)
+                } else if is_selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
 
                 let mut spans = vec![
                     Span::styled(
                         if is_selected { " > " } else { "   " },
                         Style::default().fg(Color::Cyan),
                     ),
-                    Span::styled(
-                        display,
-                        if is_selected {
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Gray)
-                        },
-                    ),
+                    status_indicator,
+                    Span::styled(display, name_style),
                 ];
 
                 // Show peer ID if display name is different
@@ -69,8 +80,16 @@ impl Component for PeersPanel {
                 // Show cipher key if available
                 if let Some(key) = app.peer_keys.get(p) {
                     spans.push(Span::styled(
-                        format!(" [{}]", format_cipher_key(key)),
-                        Style::default().fg(Color::Yellow),
+                        format!(" [key: {}]", format_cipher_key(key)),
+                        Style::default().fg(if is_online { Color::Yellow } else { Color::DarkGray }),
+                    ));
+                }
+
+                // Show offline label
+                if !is_online {
+                    spans.push(Span::styled(
+                        " [offline]",
+                        Style::default().fg(Color::DarkGray),
                     ));
                 }
 
@@ -78,9 +97,11 @@ impl Component for PeersPanel {
             })
             .collect();
 
+        let online_count = app.peers.iter().filter(|p| app.is_peer_online(p)).count();
+        let total_count = app.peers.len();
         let peer_list = List::new(items).block(
             Block::default()
-                .title(format!(" Connected Peers ({}) ", app.peers.len()))
+                .title(format!(" Peers ({}/{} online) ", online_count, total_count))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         );

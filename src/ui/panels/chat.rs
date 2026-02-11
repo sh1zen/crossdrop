@@ -1,7 +1,8 @@
 use crate::core::initializer::PeerNode;
-use crate::ui::helpers::{format_elapsed, get_display_name};
+use crate::ui::commands::{parse_command, ChatCommand, COMMAND_HELP};
+use crate::ui::helpers::{format_timestamp_now, get_display_name};
 use crate::ui::traits::{Action, Component, Handler};
-use crate::workers::app::{App, ChatMessage, ChatTarget, Mode};
+use crate::workers::app::{App, ChatTarget, Message, MessageSender, Mode};
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -11,6 +12,7 @@ use ratatui::{
     Frame,
 };
 use std::time::Instant;
+use uuid::Uuid;
 
 pub struct ChatPanel;
 
@@ -95,24 +97,45 @@ impl Component for ChatPanel {
         );
         f.render_widget(sidebar, chunks[0]);
 
-        // Right panel: messages + input
+        // Right panel: messages + typing indicator + input
+        // Determine if any peer is typing for the current target
+        let typing_peers: Vec<String> = app
+            .typing
+            .typing_peers()
+            .into_iter()
+            .filter(|pid| match &app.chat_target {
+                ChatTarget::Room => true,
+                ChatTarget::Peer(target_pid) => *pid == target_pid,
+            })
+            .map(|pid| get_display_name(app, pid))
+            .collect();
+
+        let has_typing = !typing_peers.is_empty();
+
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .constraints(if has_typing {
+                vec![
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                ]
+            } else {
+                vec![Constraint::Min(1), Constraint::Length(3)]
+            })
             .split(chunks[1]);
 
         let target_label = app.chat_target.label(&app.peer_names);
 
-        // Filter messages for current target
-        let messages: Vec<Line> = app
-            .chat_history
+        // Render messages from the logical message table
+        let filtered: Vec<&Message> = app.messages.messages_for(&app.chat_target);
+        let messages: Vec<Line> = filtered
             .iter()
-            .filter(|m| m.target == app.chat_target)
             .map(|m| {
-                let time_str = format_elapsed(m.timestamp);
+                let time_str = &m.timestamp;
 
-                if m.from_me {
-                    Line::from(vec![
+                match &m.sender {
+                    MessageSender::Me => Line::from(vec![
                         Span::styled(
                             format!("[{}] ", time_str),
                             Style::default().fg(Color::Indexed(240)),
@@ -125,22 +148,21 @@ impl Component for ChatPanel {
                         ),
                         Span::styled("> ", Style::default().fg(Color::DarkGray)),
                         Span::raw(&m.text),
-                    ])
-                } else {
-                    Line::from(vec![
+                    ]),
+                    MessageSender::Peer(pid) => Line::from(vec![
                         Span::styled(
                             format!("[{}] ", time_str),
                             Style::default().fg(Color::Indexed(240)),
                         ),
                         Span::styled(
-                            format!("{} ", get_display_name(app, &m.peer_id)),
+                            format!("{} ", get_display_name(app, pid)),
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("> ", Style::default().fg(Color::DarkGray)),
                         Span::raw(&m.text),
-                    ])
+                    ]),
                 }
             })
             .collect();
@@ -175,6 +197,20 @@ impl Component for ChatPanel {
             .scroll((scroll_offset, 0));
         f.render_widget(msg_widget, right_chunks[0]);
 
+        // Typing indicator (shown only when someone is typing)
+        if has_typing {
+            let typing_text = if typing_peers.len() == 1 {
+                format!(" {} is typing...", typing_peers[0])
+            } else {
+                let names = typing_peers.join(", ");
+                format!(" {} are typing...", names)
+            };
+            let typing_widget = Paragraph::new(typing_text)
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+            f.render_widget(typing_widget, right_chunks[1]);
+        }
+
+        let input_idx = if has_typing { 2 } else { 1 };
         let input_text = format!("{}_", app.input);
         let input_title = match &app.chat_target {
             ChatTarget::Room => " Message (broadcast) ",
@@ -188,7 +224,15 @@ impl Component for ChatPanel {
                     .border_style(Style::default().fg(border_color)),
             )
             .style(Style::default().fg(Color::White));
-        f.render_widget(input_widget, right_chunks[1]);
+        f.render_widget(input_widget, right_chunks[input_idx]);
+    }
+
+    fn on_focus(&mut self, app: &mut App) {
+        // Reset unread for the currently active chat target
+        match &app.chat_target {
+            ChatTarget::Room => app.unread.reset_room(),
+            ChatTarget::Peer(pid) => app.unread.reset_peer(&pid.clone()),
+        }
     }
 
     fn on_blur(&mut self, app: &mut App) {
@@ -208,7 +252,8 @@ impl Handler for ChatPanel {
                 let targets = app.chat_targets();
                 if !targets.is_empty() {
                     app.chat_sidebar_idx = (app.chat_sidebar_idx + 1) % targets.len();
-                    app.chat_target = targets[app.chat_sidebar_idx].clone();
+                    let new_target = targets[app.chat_sidebar_idx].clone();
+                    app.switch_chat_target(new_target);
                 }
                 Some(Action::None)
             }
@@ -221,35 +266,75 @@ impl Handler for ChatPanel {
                     } else {
                         app.chat_sidebar_idx -= 1;
                     }
-                    app.chat_target = targets[app.chat_sidebar_idx].clone();
+                    let new_target = targets[app.chat_sidebar_idx].clone();
+                    app.switch_chat_target(new_target);
                 }
                 Some(Action::None)
             }
             KeyCode::Enter => {
                 if !app.input.is_empty() {
+                    let input = app.input.clone();
+
+                    // ── Command handling ──────────────────────────────────
+                    if let Some(cmd_result) = parse_command(&input) {
+                        app.input.clear();
+                        match cmd_result {
+                            Ok(ChatCommand::Clear) => {
+                                app.messages.clear_target(&app.chat_target);
+                                return Some(Action::None);
+                            }
+                            Ok(ChatCommand::Help) => {
+                                // Insert an ephemeral help message (local only)
+                                let help_text = COMMAND_HELP
+                                    .iter()
+                                    .map(|(cmd, desc)| format!("  {} — {}", cmd, desc))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                app.messages.insert(Message {
+                                    id: Uuid::new_v4(),
+                                    sender: MessageSender::Me,
+                                    text: format!("Available commands:\n{}", help_text),
+                                    timestamp: format_timestamp_now(),
+                                    target: app.chat_target.clone(),
+                                    recipients: vec![],
+                                    created_at: Instant::now(),
+                                });
+                                return Some(Action::None);
+                            }
+                            Err(err_msg) => {
+                                return Some(Action::SetStatus(err_msg));
+                            }
+                        }
+                    }
+
+                    // ── Regular message send ─────────────────────────────
                     if app.peers.is_empty() {
                         return Some(Action::SetStatus("No peers connected".to_string()));
                     }
 
-                    let msg = app.input.clone();
+                    let msg = input;
                     let msg_len = msg.len() as u64;
                     let target = app.chat_target.clone();
+                    let msg_id = Uuid::new_v4();
 
                     match &target {
                         ChatTarget::Room => {
-                            // Broadcast: record one message per peer
-                            for peer_id in &app.peers {
-                                app.chat_history.push(ChatMessage {
-                                    from_me: true,
-                                    peer_id: peer_id.clone(),
-                                    text: msg.clone(),
-                                    timestamp: Instant::now(),
-                                    target: ChatTarget::Room,
-                                });
-                            }
-                            app.stats.messages_sent += app.peers.len() as u64;
-                            app.stats.bytes_sent += msg_len * app.peers.len() as u64;
+                            // Single canonical message entry for all peers
+                            app.messages.insert(Message {
+                                id: msg_id,
+                                sender: MessageSender::Me,
+                                text: msg.clone(),
+                                timestamp: format_timestamp_now(),
+                                target: ChatTarget::Room,
+                                recipients: app.peers.clone(),
+                                created_at: Instant::now(),
+                            });
+                            let peer_count = app.peers.len() as u64;
+                            app.engine.record_message_sent(msg_len * peer_count);
+                            app.stats.messages_sent += peer_count;
+                            app.stats.bytes_sent += msg_len * peer_count;
 
+                            // Network: still sent individually to each peer
                             let node = node.clone();
                             let m = msg.clone();
                             tokio::spawn(async move {
@@ -259,22 +344,26 @@ impl Handler for ChatPanel {
                             });
                         }
                         ChatTarget::Peer(peer_id) => {
-                            // DM: send to one peer
-                            app.chat_history.push(ChatMessage {
-                                from_me: true,
-                                peer_id: peer_id.clone(),
+                            // DM: one message, one peer, only in this chat view
+                            app.messages.insert(Message {
+                                id: msg_id,
+                                sender: MessageSender::Me,
                                 text: msg.clone(),
-                                timestamp: Instant::now(),
+                                timestamp: format_timestamp_now(),
                                 target: ChatTarget::Peer(peer_id.clone()),
+                                recipients: vec![peer_id.clone()],
+                                created_at: Instant::now(),
                             });
+                            app.engine.record_message_sent(msg_len);
                             app.stats.messages_sent += 1;
                             app.stats.bytes_sent += msg_len;
 
+                            // Use DM protocol so receiver routes to peer chat
                             let node = node.clone();
                             let pid = peer_id.clone();
                             let m = msg.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = node.send_chat(&pid, &m).await {
+                                if let Err(e) = node.send_dm(&pid, &m).await {
                                     tracing::error!("DM failed: {e}");
                                 }
                             });
@@ -287,13 +376,44 @@ impl Handler for ChatPanel {
             }
             KeyCode::Backspace => {
                 app.input.pop();
+                // Still typing — send indicator
+                send_typing_throttled(app, node);
                 Some(Action::None)
             }
             KeyCode::Char(c) => {
                 app.input.push(c);
+                send_typing_throttled(app, node);
                 Some(Action::None)
             }
             _ => Some(Action::None),
         }
     }
+}
+
+/// Send a typing indicator to relevant peers, throttled to at most once per 2 s.
+fn send_typing_throttled(app: &mut App, node: &PeerNode) {
+    let should_send = match app.last_typing_sent {
+        Some(last) => last.elapsed().as_secs() >= 2,
+        None => true,
+    };
+    if !should_send || app.input.is_empty() {
+        return;
+    }
+    app.last_typing_sent = Some(Instant::now());
+
+    let node = node.clone();
+    let target = app.chat_target.clone();
+    let peers = app.peers.clone();
+    tokio::spawn(async move {
+        match target {
+            ChatTarget::Room => {
+                let _ = node.broadcast_typing().await;
+            }
+            ChatTarget::Peer(pid) => {
+                let _ = node.send_typing(&pid).await;
+            }
+        }
+        // If in Room, also avoid sending individual typing to all — broadcast is enough
+        drop(peers);
+    });
 }

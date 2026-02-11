@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tracing::field::{Field, Visit};
@@ -16,26 +17,26 @@ pub struct LogEntry {
 
 #[derive(Clone)]
 pub struct LogBuffer {
-    entries: Arc<Mutex<Vec<LogEntry>>>,
+    entries: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
 impl LogBuffer {
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(Vec::new())),
+            entries: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     pub fn push(&self, entry: LogEntry) {
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= MAX_ENTRIES {
-            entries.remove(0);
+            entries.pop_front();
         }
-        entries.push(entry);
+        entries.push_back(entry);
     }
 
     pub fn entries(&self) -> Vec<LogEntry> {
-        self.entries.lock().unwrap().clone()
+        self.entries.lock().unwrap().iter().cloned().collect()
     }
 }
 

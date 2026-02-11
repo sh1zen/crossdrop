@@ -14,11 +14,14 @@ use workers::args::Args;
 async fn main() -> anyhow::Result<()> {
     let args = Args::load();
 
+    // Initialize the global data directory (must happen before any persistence access)
+    crate::utils::data_dir::init(args.conf.as_deref());
+
     // Init tracing with layered subscriber
     // Note: webrtc_ice generates many "unknown TransactionID" warnings for late-arriving
     // STUN responses, which are normal. Filter these out to reduce noise.
     let filter = match args.verbose {
-        0 => "warn,webrtc_ice::agent=error",
+        0 => "warn,crossdrop=info,webrtc_ice::agent=error",
         1 => "info,webrtc_ice::agent=error",
         2 => "debug,webrtc_ice::agent=error",
         _ => "trace",

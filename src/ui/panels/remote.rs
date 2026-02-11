@@ -1,9 +1,9 @@
 use crate::core::initializer::PeerNode;
+use crate::ui::executer::UIPopup;
 use crate::ui::helpers::{format_file_size, get_display_name};
 use crate::ui::traits::{Action, Component, Handler};
-use crate::workers::app::{AcceptingFileOffer, AcceptingFolderOffer, App, Mode};
+use crate::workers::app::{App, Mode, RemoteFileRequest, RemoteFolderRequest};
 use crossterm::event::KeyCode;
-use uuid::Uuid;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -131,7 +131,7 @@ impl Handler for RemotePanel {
                             });
                         }
                     } else {
-                        // Show save path popup for fetching file (treating it as a file offer)
+                        // Show request file popup
                         if let Some(peer_id) = &app.remote_peer {
                             let remote_path = if app.remote_path.ends_with('/') {
                                 format!("{}{}", app.remote_path, entry.name)
@@ -142,17 +142,16 @@ impl Handler for RemotePanel {
                             let save_dir = std::env::current_dir()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|_| ".".to_string());
-                            
-                            app.accepting_file = Some(AcceptingFileOffer {
+                            app.remote_file_request = Some(RemoteFileRequest {
                                 peer_id: peer_id.clone(),
-                                file_id: Uuid::new_v4(),
                                 filename: entry.name.clone(),
                                 filesize: entry.size,
-                                _total_size: entry.size,
+                                remote_path,
                                 save_path_input: save_dir,
-                                is_remote: true,
-                                remote_path: Some(remote_path),
+                                button_focus: 0,
+                                is_path_editing: false,
                             });
+                            return Some(Action::ShowPopup(UIPopup::RemoteFileRequest));
                         }
                     }
                 }
@@ -186,7 +185,7 @@ impl Handler for RemotePanel {
                 Some(Action::None)
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
-                // Show save path popup for fetching folder (treating it as a folder offer)
+                // Show request folder popup
                 if let Some(entry) = app.remote_entries.get(app.remote_selected).cloned() {
                     if entry.is_dir {
                         if let Some(peer_id) = &app.remote_peer {
@@ -196,19 +195,19 @@ impl Handler for RemotePanel {
                                 format!("{}/{}", app.remote_path, entry.name)
                             };
 
-                            let _save_dir = std::env::current_dir()
+                            let save_dir = std::env::current_dir()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|_| ".".to_string());
-
-                            app.accepting_folder = Some(AcceptingFolderOffer {
+                            app.remote_folder_request = Some(RemoteFolderRequest {
                                 peer_id: peer_id.clone(),
-                                folder_id: Uuid::new_v4(),
                                 dirname: entry.name.clone(),
-                                file_count: 0, // Not known for remote folders
                                 total_size: entry.size,
-                                is_remote: true,
-                                remote_path: Some(remote_path),
+                                remote_path,
+                                save_path_input: save_dir,
+                                button_focus: 0,
+                                is_path_editing: false,
                             });
+                            return Some(Action::ShowPopup(UIPopup::RemoteFolderRequest));
                         }
                     }
                 }

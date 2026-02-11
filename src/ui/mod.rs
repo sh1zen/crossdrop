@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod executer;
 pub mod helpers;
 pub mod panels;

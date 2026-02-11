@@ -4,7 +4,9 @@
 //! - File transfer protocol: FileOffer -> FileResponse -> Metadata -> Chunk* -> Hash -> HashResult
 //! - Chunked transfer with ACK, pipelined 8 at a time, SHA3-256 verification
 //! - AES-256-GCM encryption with per-peer keys
+//! - Brotli compression before encryption (File → Compress → Encrypt → Send)
 
+use crate::core::connection::crypto::SessionKeyManager;
 use crate::core::persistence::{Persistence, TransferState};
 use crate::core::transaction::{ResumeInfo, TransactionManifest};
 use aes_gcm::{
@@ -12,17 +14,19 @@ use aes_gcm::{
     Nonce,
 };
 use anyhow::{anyhow, Context, Result};
+use brotli::{CompressorWriter, Decompressor};
 use bytes::{BufMut, Bytes};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -42,12 +46,12 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const CHUNK_SIZE: usize = 48 * 1024; // 48KB chunks - larger for better throughput
+const CHUNK_SIZE: usize = 48 * 1024; // 48KB chunks — safe for SCTP message size limits
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
-const CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
-const PIPELINE_SIZE: usize = 16; // More pipelining for throughput
+const PIPELINE_SIZE: usize = 32; // Larger pipeline — early-chunk buffering prevents stalls
 const MAX_RETRIES: usize = 3;
 
 // ── Binary Frame Format ──────────────────────────────────────────────────────
@@ -169,6 +173,18 @@ pub enum ControlMessage {
     FetchRequest { path: String, is_folder: bool },
     /// Remote access disabled error
     RemoteAccessDisabled,
+    /// Direct (1-to-1) chat message — distinct from room Text.
+    DirectMessage(Vec<u8>),
+    /// Ephemeral typing indicator (no payload needed).
+    Typing,
+    /// Key rotation: peer sends a fresh ephemeral X25519 public key.
+    KeyRotation {
+        ephemeral_pub: Vec<u8>,
+    },
+    /// Heartbeat ping — peer should reply with Pong.
+    Ping,
+    /// Heartbeat pong — reply to a Ping.
+    Pong,
 }
 
 // ── App-facing events ────────────────────────────────────────────────────────
@@ -176,6 +192,10 @@ pub enum ControlMessage {
 #[derive(Debug, Clone)]
 pub enum ConnectionMessage {
     TextReceived(Vec<u8>),
+    /// A direct (1-to-1) message received from a peer.
+    DmReceived(Vec<u8>),
+    /// The peer is currently typing.
+    TypingReceived,
     DisplayNameReceived(String),
     FileSaved {
         file_id: Uuid,
@@ -193,12 +213,16 @@ pub enum ConnectionMessage {
         filename: String,
         received_chunks: u32,
         total_chunks: u32,
+        /// Bytes received on the wire for this progress update (post-compression/encryption).
+        wire_bytes: u64,
     },
     SendProgress {
         file_id: Uuid,
         filename: String,
         sent_chunks: u32,
         total_chunks: u32,
+        /// Bytes sent on the wire for this batch (post-compression/encryption).
+        wire_bytes: u64,
     },
     SendComplete {
         file_id: Uuid,
@@ -233,6 +257,8 @@ pub enum ConnectionMessage {
         path: String,
         is_folder: bool,
     },
+    /// Heartbeat pong received from peer.
+    PongReceived,
     Disconnected,
     Error(String),
     /// Transaction-level events
@@ -288,6 +314,25 @@ struct PendingFolderOffer {
 }
 
 // ── Encryption helpers ───────────────────────────────────────────────────────
+
+/// Compress data with Brotli (quality 4 for speed/ratio balance).
+fn compress_data(data: &[u8]) -> Result<Vec<u8>> {
+    let mut compressed = Vec::new();
+    {
+        // Quality 4: good balance between speed and compression ratio for real-time transfer
+        let mut compressor = CompressorWriter::new(&mut compressed, 4096, 4, 22);
+        compressor.write_all(data)?;
+    }
+    Ok(compressed)
+}
+
+/// Decompress Brotli-compressed data.
+fn decompress_data(data: &[u8]) -> Result<Vec<u8>> {
+    let mut decompressor = Decompressor::new(data, 4096);
+    let mut decompressed = Vec::new();
+    decompressor.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
+}
 
 /// Encrypt data with AES-256-GCM. Returns nonce (12 bytes) || ciphertext.
 fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -348,6 +393,14 @@ fn encode_control_frame(msg: &ControlMessage) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Forward a [`ConnectionMessage`] to the application channel, if present.
+/// No-op when `app_tx` is `None` (e.g. during tests or headless operation).
+fn notify_app(app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>, msg: ConnectionMessage) {
+    if let Some(tx) = app_tx {
+        let _ = tx.send(msg);
+    }
+}
+
 // ── WebRTCConnection ─────────────────────────────────────────────────────────
 
 pub struct WebRTCConnection {
@@ -357,10 +410,14 @@ pub struct WebRTCConnection {
     app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
     send_state: Arc<RwLock<HashMap<Uuid, SendFileState>>>,
     _recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
+    _pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>>,
     pending_offers: Arc<RwLock<HashMap<Uuid, PendingOffer>>>,
     pending_folder_offers: Arc<RwLock<HashMap<Uuid, PendingFolderOffer>>>,
     accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
-    shared_key: [u8; 32],
+    shared_key: Arc<RwLock<[u8; 32]>>,
+    key_manager: Option<SessionKeyManager>,
+    /// Pending local ephemeral keypair for an in-progress key rotation.
+    pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
     _remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
 }
 
@@ -437,7 +494,8 @@ impl WebRTCConnection {
 
     pub async fn create_offer(
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
-        shared_key: [u8; 32],
+        shared_key: Arc<RwLock<[u8; 32]>>,
+        key_manager: Option<SessionKeyManager>,
         remote_access: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(Self, SignalingMessage)> {
         let api = Self::create_webrtc_api().await?;
@@ -449,17 +507,36 @@ impl WebRTCConnection {
             .await?,
         );
 
-        // Monitor for disconnection
+        // Monitor for disconnection.
+        // NOTE: wait_connected() later replaces this callback, so these
+        // handlers are only active during the handshake phase. After the
+        // connection is established, offline detection is done exclusively
+        // via the heartbeat mechanism in spawn_heartbeat().
         if let Some(tx) = &app_tx {
             let tx = tx.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
                 let tx = tx.clone();
                 Box::pin(async move {
                     match s {
-                        RTCPeerConnectionState::Failed
-                        | RTCPeerConnectionState::Disconnected
-                        | RTCPeerConnectionState::Closed => {
+                        RTCPeerConnectionState::Connected => {
+                            info!(event = "webrtc_connected", "WebRTC connection established");
+                        }
+                        RTCPeerConnectionState::Failed => {
+                            // Failed is terminal — connection cannot recover.
+                            error!(event = "webrtc_failed", "WebRTC connection failed");
                             let _ = tx.send(ConnectionMessage::Disconnected);
+                        }
+                        RTCPeerConnectionState::Disconnected => {
+                            // Disconnected is TRANSIENT — ICE may recover.
+                            // Log but do NOT fire Disconnected immediately.
+                            // The heartbeat will detect true failures.
+                            warn!(event = "webrtc_disconnected", "WebRTC transient disconnect (ICE may recover)");
+                        }
+                        RTCPeerConnectionState::Closed => {
+                            // Closed is always caused by US calling close().
+                            // Do NOT send Disconnected — the caller that invoked
+                            // close() is responsible for any cleanup.
+                            info!(event = "webrtc_closed", "WebRTC connection closed (locally initiated)");
                         }
                         _ => {}
                     }
@@ -471,9 +548,14 @@ impl WebRTCConnection {
         let data_channel_lock = Arc::new(RwLock::new(None));
         let send_state = Arc::new(RwLock::new(HashMap::new()));
         let recv_state = Arc::new(RwLock::new(HashMap::new()));
+        let pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let pending_offers = Arc::new(RwLock::new(HashMap::new()));
         let pending_folder_offers = Arc::new(RwLock::new(HashMap::new()));
         let accepted_destinations = Arc::new(RwLock::new(HashMap::new()));
+
+        let pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>> =
+            Arc::new(RwLock::new(None));
 
         let cdc = pc.create_data_channel("control", None).await?;
         let ra = Arc::new(remote_access);
@@ -481,12 +563,15 @@ impl WebRTCConnection {
             &cdc,
             send_state.clone(),
             recv_state.clone(),
+            pending_chunks.clone(),
             pending_offers.clone(),
             pending_folder_offers.clone(),
             accepted_destinations.clone(),
             app_tx.clone(),
-            shared_key,
+            shared_key.clone(),
             ra.clone(),
+            key_manager.clone(),
+            pending_rotation.clone(),
         )
         .await;
         *control_channel_lock.write().await = Some(cdc);
@@ -496,12 +581,15 @@ impl WebRTCConnection {
             &ddc,
             send_state.clone(),
             recv_state.clone(),
+            pending_chunks.clone(),
             pending_offers.clone(),
             pending_folder_offers.clone(),
             accepted_destinations.clone(),
             app_tx.clone(),
-            shared_key,
+            shared_key.clone(),
             ra.clone(),
+            key_manager.clone(),
+            pending_rotation.clone(),
         )
         .await;
         *data_channel_lock.write().await = Some(ddc);
@@ -518,10 +606,13 @@ impl WebRTCConnection {
                 app_tx,
                 send_state,
                 _recv_state: recv_state,
+                _pending_chunks: pending_chunks,
                 pending_offers,
                 pending_folder_offers,
                 accepted_destinations,
                 shared_key,
+                key_manager,
+                pending_rotation,
                 _remote_access: ra,
             },
             SignalingMessage::Offer(gathered_sdp),
@@ -531,7 +622,8 @@ impl WebRTCConnection {
     pub async fn accept_offer(
         offer: SignalingMessage,
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
-        shared_key: [u8; 32],
+        shared_key: Arc<RwLock<[u8; 32]>>,
+        key_manager: Option<SessionKeyManager>,
         remote_access: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(Self, SignalingMessage)> {
         let api = Self::create_webrtc_api().await?;
@@ -543,17 +635,29 @@ impl WebRTCConnection {
             .await?,
         );
 
-        // Monitor for disconnection
+        // Monitor for disconnection.
+        // NOTE: wait_connected() later replaces this callback, so these
+        // handlers are only active during the handshake phase.
         if let Some(tx) = &app_tx {
             let tx = tx.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
                 let tx = tx.clone();
                 Box::pin(async move {
                     match s {
-                        RTCPeerConnectionState::Failed
-                        | RTCPeerConnectionState::Disconnected
-                        | RTCPeerConnectionState::Closed => {
+                        RTCPeerConnectionState::Connected => {
+                            info!(event = "webrtc_connected", "WebRTC connection established (answerer)");
+                        }
+                        RTCPeerConnectionState::Failed => {
+                            error!(event = "webrtc_failed", "WebRTC connection failed (answerer)");
                             let _ = tx.send(ConnectionMessage::Disconnected);
+                        }
+                        RTCPeerConnectionState::Disconnected => {
+                            // Transient — ICE may recover, do not fire disconnect.
+                            warn!(event = "webrtc_disconnected", "WebRTC transient disconnect (answerer, ICE may recover)");
+                        }
+                        RTCPeerConnectionState::Closed => {
+                            // Locally initiated close — do nothing.
+                            info!(event = "webrtc_closed", "WebRTC connection closed (answerer, locally initiated)");
                         }
                         _ => {}
                     }
@@ -565,6 +669,8 @@ impl WebRTCConnection {
         let data_channel_lock = Arc::new(RwLock::new(None));
         let send_state = Arc::new(RwLock::new(HashMap::new()));
         let recv_state = Arc::new(RwLock::new(HashMap::new()));
+        let pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let pending_offers = Arc::new(RwLock::new(HashMap::new()));
         let pending_folder_offers = Arc::new(RwLock::new(HashMap::new()));
         let accepted_destinations = Arc::new(RwLock::new(HashMap::new()));
@@ -574,24 +680,35 @@ impl WebRTCConnection {
             let dl = data_channel_lock.clone();
             let ss = send_state.clone();
             let rs = recv_state.clone();
+            let pc_chunks = pending_chunks.clone();
             let po = pending_offers.clone();
             let pfo = pending_folder_offers.clone();
             let ad = accepted_destinations.clone();
             let atx = app_tx.clone();
             let ra = Arc::new(remote_access);
             let ra_outer = ra.clone();
+            let pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>> =
+                Arc::new(RwLock::new(None));
+            let pending_rotation_outer = pending_rotation.clone();
+            let sk = shared_key.clone();
+            let km = key_manager.clone();
+            let pr = pending_rotation.clone();
             pc.on_data_channel(Box::new(move |dc| {
                 let cl = cl.clone();
                 let dl = dl.clone();
                 let ss = ss.clone();
                 let rs = rs.clone();
+                let pc_chunks = pc_chunks.clone();
                 let po = po.clone();
                 let pfo = pfo.clone();
                 let ad = ad.clone();
                 let atx = atx.clone();
                 let ra = ra.clone();
+                let sk = sk.clone();
+                let km = km.clone();
+                let pr = pr.clone();
                 Box::pin(async move {
-                    Self::attach_dc_handlers(&dc, ss, rs, po, pfo, ad, atx, shared_key, ra).await;
+                    Self::attach_dc_handlers(&dc, ss, rs, pc_chunks, po, pfo, ad, atx, sk, ra, km, pr).await;
                     let label = dc.label().to_string();
                     if label == "control" {
                         *cl.write().await = Some(dc);
@@ -620,10 +737,13 @@ impl WebRTCConnection {
                     app_tx,
                     send_state,
                     _recv_state: recv_state,
+                    _pending_chunks: pending_chunks,
                     pending_offers,
                     pending_folder_offers,
                     accepted_destinations,
                     shared_key,
+                    key_manager,
+                    pending_rotation: pending_rotation_outer,
                     _remote_access: ra_outer,
                 },
                 SignalingMessage::Answer(gathered_sdp),
@@ -713,17 +833,27 @@ impl WebRTCConnection {
     // ── Send helpers ─────────────────────────────────────────────────────────
 
     /// Send an encrypted frame on the given data channel.
+    /// Pipeline: plaintext → compress → encrypt → send
     async fn send_encrypted(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
         plaintext: &[u8],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if dc.ready_state() != RTCDataChannelState::Open {
+            warn!(event = "send_channel_not_open", state = ?dc.ready_state(), "Attempted send on non-open data channel");
             return Err(anyhow!("Data channel not open: {:?}", dc.ready_state()));
         }
-        let encrypted = encrypt(key, plaintext)?;
+        let compressed = compress_data(plaintext).map_err(|e| {
+            error!(event = "compress_failure", bytes = plaintext.len(), error = %e, "Compression failed before send");
+            e
+        })?;
+        let encrypted = encrypt(key, &compressed).map_err(|e| {
+            error!(event = "encrypt_failure", bytes = compressed.len(), error = %e, "Encryption failed before send");
+            e
+        })?;
+        let wire_bytes = encrypted.len();
         dc.send(&Bytes::from(encrypted)).await?;
-        Ok(())
+        Ok(wire_bytes)
     }
 
     /// Send a control message on the control channel.
@@ -735,7 +865,9 @@ impl WebRTCConnection {
             .clone()
             .ok_or_else(|| anyhow!("Control channel not available"))?;
         let frame = encode_control_frame(msg)?;
-        Self::send_encrypted(&dc, &self.shared_key, &frame).await
+        let key = *self.shared_key.read().await;
+        Self::send_encrypted(&dc, &key, &frame).await?;
+        Ok(())
     }
 
     /// Send a control message on a specific data channel (static version).
@@ -745,17 +877,19 @@ impl WebRTCConnection {
         msg: &ControlMessage,
     ) -> Result<()> {
         let frame = encode_control_frame(msg)?;
-        Self::send_encrypted(dc, key, &frame).await
+        Self::send_encrypted(dc, key, &frame).await?;
+        Ok(())
     }
 
     /// Send a binary chunk frame on the data channel.
+    /// Returns the number of bytes sent on the wire (post-compression, post-encryption).
     async fn send_chunk(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
         file_id: Uuid,
         seq: u32,
         payload: &[u8],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let frame = encode_chunk_frame(file_id, seq, payload);
         Self::send_encrypted(dc, key, &frame).await
     }
@@ -768,14 +902,25 @@ impl WebRTCConnection {
         seq: u32,
     ) -> Result<()> {
         let frame = encode_ack_frame(file_id, seq);
-        Self::send_encrypted(dc, key, &frame).await
+        Self::send_encrypted(dc, key, &frame).await?;
+        Ok(())
     }
 
     // ── Public send API ──────────────────────────────────────────────────────
 
-    /// Send a chat message (encrypted).
+    /// Send a chat message (encrypted) — broadcast / room.
     pub async fn send_message(&self, bytes: Vec<u8>) -> Result<()> {
         self.send_control(&ControlMessage::Text(bytes)).await
+    }
+
+    /// Send a direct (1-to-1) chat message (encrypted).
+    pub async fn send_dm(&self, bytes: Vec<u8>) -> Result<()> {
+        self.send_control(&ControlMessage::DirectMessage(bytes)).await
+    }
+
+    /// Send an ephemeral typing indicator.
+    pub async fn send_typing(&self) -> Result<()> {
+        self.send_control(&ControlMessage::Typing).await
     }
 
     /// Send display name to peer.
@@ -862,6 +1007,18 @@ impl WebRTCConnection {
         file_bytes: Vec<u8>,
         filename: impl Into<String>,
     ) -> Result<()> {
+        self.send_file_resuming(file_id, file_bytes, filename, 0).await
+    }
+
+    /// Send file bytes, skipping the first `start_chunk` chunks (for resume).
+    /// Chunks 0..start_chunk are still hashed but NOT transmitted.
+    pub async fn send_file_resuming(
+        &self,
+        file_id: Uuid,
+        file_bytes: Vec<u8>,
+        filename: impl Into<String>,
+        start_chunk: u32,
+    ) -> Result<()> {
         let filename = filename.into();
         self.wait_data_channels_open().await?;
 
@@ -875,7 +1032,8 @@ impl WebRTCConnection {
         let filesize = file_bytes.len() as u64;
         let total_chunks = ((filesize as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
 
-        // Send metadata on control channel
+        // Send metadata on control channel first — receiver needs this
+        // to create ReceiveFileState before chunks arrive.
         self.send_control(&ControlMessage::Metadata {
             file_id,
             total_chunks,
@@ -884,14 +1042,21 @@ impl WebRTCConnection {
         })
         .await?;
 
+        // Short sleep to give the Metadata frame a head-start on the control channel.
+        // The receiver also buffers early-arriving chunks, so this is best-effort.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         let send_state = SendFileState {
             pending_acks: HashMap::with_capacity(total_chunks as usize),
         };
         self.send_state.write().await.insert(file_id, send_state);
 
         let mut hasher = Sha3_256::new();
-        let mut sent_chunks: u32 = 0;
-        let key = self.shared_key;
+        info!(event = "file_send_start", file_id = %file_id, filename = %filename, filesize, total_chunks, start_chunk, "Starting file send");
+
+        let mut sent_chunks: u32 = start_chunk;
+        let mut _total_wire_bytes: u64 = 0;
+        let key_lock = self.shared_key.clone();
 
         for chunk_batch in (0..total_chunks).collect::<Vec<_>>().chunks(PIPELINE_SIZE) {
             let mut chunks_data: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -901,14 +1066,18 @@ impl WebRTCConnection {
                 let end = std::cmp::min(start + CHUNK_SIZE, file_bytes.len());
                 let chunk = file_bytes[start..end].to_vec();
                 hasher.update(&chunk);
-                chunks_data.push((seq, chunk));
+                // Skip already-received chunks (for resume)
+                if seq >= start_chunk {
+                    chunks_data.push((seq, chunk));
+                }
             }
 
             let mut remaining = chunks_data;
             let mut retries = 0;
+            let mut batch_wire_bytes: u64 = 0;
 
             while !remaining.is_empty() && retries < MAX_RETRIES {
-                let mut tasks: Vec<(u32, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
+                let mut tasks: Vec<(u32, tokio::task::JoinHandle<Result<usize>>)> = Vec::new();
 
                 for (seq, chunk) in &remaining {
                     let (ack_tx, ack_rx) = oneshot::channel();
@@ -920,15 +1089,17 @@ impl WebRTCConnection {
                     }
 
                     let dc_c = dc.clone();
+                    let kl = key_lock.clone();
                     tasks.push((
                         seq,
                         tokio::spawn(async move {
-                            Self::send_chunk(&dc_c, &key, file_id, seq, &chunk).await?;
+                            let key = *kl.read().await;
+                            let wb = Self::send_chunk(&dc_c, &key, file_id, seq, &chunk).await?;
                             timeout(CHUNK_ACK_TIMEOUT, ack_rx)
                                 .await
                                 .map_err(|_| anyhow!("ACK timeout for chunk {}", seq))?
                                 .map_err(|_| anyhow!("ACK channel closed for chunk {}", seq))?;
-                            Ok(())
+                            Ok(wb)
                         }),
                     ));
                 }
@@ -936,7 +1107,9 @@ impl WebRTCConnection {
                 let mut failed: Vec<u32> = Vec::new();
                 for (seq, task) in tasks {
                     match task.await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(wb)) => {
+                            batch_wire_bytes += wb as u64;
+                        }
                         Ok(Err(e)) => {
                             warn!(
                                 "Chunk {} failed: {}, retry {}/{}",
@@ -967,19 +1140,24 @@ impl WebRTCConnection {
             }
 
             if !remaining.is_empty() {
+                error!(event = "chunk_send_exhausted", file_id = %file_id, retries = MAX_RETRIES, failed_chunks = remaining.len(), "Chunk send failed after max retries");
                 return Err(anyhow!(
                     "Failed to send chunks after {} retries",
                     MAX_RETRIES
                 ));
             }
 
-            sent_chunks += chunk_batch.len() as u32;
+            _total_wire_bytes += batch_wire_bytes;
+            // Only count chunks that were actually sent (not skipped)
+            let sent_in_batch = chunk_batch.iter().filter(|&&s| s >= start_chunk).count() as u32;
+            sent_chunks += sent_in_batch;
             if let Some(tx) = &self.app_tx {
                 let _ = tx.send(ConnectionMessage::SendProgress {
                     file_id,
                     filename: filename.clone(),
                     sent_chunks,
                     total_chunks,
+                    wire_bytes: batch_wire_bytes,
                 });
             }
         }
@@ -1055,6 +1233,7 @@ impl WebRTCConnection {
         folder_id: Uuid,
         files: Vec<(String, Vec<u8>)>,
     ) -> Result<()> {
+        // Stream files: send each as it arrives, no buffering of all files
         for (relative_path, file_bytes) in files {
             let file_id = Uuid::new_v4();
             self.send_file(file_id, file_bytes, relative_path).await?;
@@ -1127,50 +1306,97 @@ impl WebRTCConnection {
             .insert(file_id, dest_path);
     }
 
+    /// Initiate a key rotation by generating a fresh ephemeral keypair,
+    /// storing it in `pending_rotation`, and sending the public key to the peer.
+    pub async fn initiate_key_rotation(&self) -> Result<()> {
+        use crate::core::connection::crypto;
+
+        if self.key_manager.is_none() {
+            return Err(anyhow!("No SessionKeyManager — cannot rotate keys"));
+        }
+        let eph = crypto::prepare_rotation();
+        let pub_bytes = eph.public.to_vec();
+        *self.pending_rotation.write().await = Some(eph);
+        self.send_control(&ControlMessage::KeyRotation {
+            ephemeral_pub: pub_bytes,
+        })
+        .await?;
+        info!(event = "key_rotation_initiated", "Sent ephemeral public key for rotation");
+        Ok(())
+    }
+
+    /// Access the `SessionKeyManager` if one was established during handshake.
+    #[allow(dead_code)]
+    pub fn key_manager(&self) -> Option<&SessionKeyManager> {
+        self.key_manager.as_ref()
+    }
+
     // ── Data channel message handler ─────────────────────────────────────────
 
     async fn attach_dc_handlers(
         dc: &Arc<RTCDataChannel>,
         send_state: Arc<RwLock<HashMap<Uuid, SendFileState>>>,
         recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
+        pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>>,
         pending_offers: Arc<RwLock<HashMap<Uuid, PendingOffer>>>,
         pending_folder_offers: Arc<RwLock<HashMap<Uuid, PendingFolderOffer>>>,
         accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
-        shared_key: [u8; 32],
+        shared_key: Arc<RwLock<[u8; 32]>>,
         remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
+        key_manager: Option<SessionKeyManager>,
+        pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
     ) {
         let dc_clone = dc.clone();
         let ss = send_state;
         let rs = recv_state;
+        let pc = pending_chunks;
         let po = pending_offers;
         let pfo = pending_folder_offers;
         let ad = accepted_destinations;
         let atx = app_tx;
+        let sk = shared_key;
+        let km = key_manager;
+        let pr = pending_rotation;
         let ra = remote_access;
 
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let ss = ss.clone();
             let rs = rs.clone();
+            let pc = pc.clone();
             let po = po.clone();
             let pfo = pfo.clone();
             let ad = ad.clone();
             let atx = atx.clone();
             let dc = dc_clone.clone();
+            let sk = sk.clone();
+            let km = km.clone();
+            let pr = pr.clone();
             let ra = ra.clone();
 
             Box::pin(async move {
                 // Decrypt
-                let plaintext = match decrypt(&shared_key, &msg.data) {
+                let key = *sk.read().await;
+                let decrypted = match decrypt(&key, &msg.data) {
                     Ok(p) => p,
                     Err(e) => {
-                        if let Some(tx) = &atx {
-                            let _ =
-                                tx.send(ConnectionMessage::Error(format!("Decrypt error: {}", e)));
-                        }
+                        error!(event = "decrypt_failure", bytes = msg.data.len(), error = %e, "Decryption failed on incoming frame");
+                        notify_app(&atx, ConnectionMessage::Error(format!("Decrypt error: {}", e)));
                         return;
                     }
                 };
+
+                // Decompress (Receive → Decrypt → Decompress → Process)
+                let plaintext = match decompress_data(&decrypted) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(event = "decompress_failure", bytes = decrypted.len(), error = %e, "Decompression failed on incoming frame");
+                        notify_app(&atx, ConnectionMessage::Error(format!("Decompress error: {}", e)));
+                        return;
+                    }
+                };
+
+                let wire_bytes = msg.data.len() as u64;
 
                 if plaintext.is_empty() {
                     return;
@@ -1187,39 +1413,37 @@ impl WebRTCConnection {
                                 ctrl,
                                 ss,
                                 rs,
+                                pc,
                                 po,
                                 pfo,
                                 ad,
                                 atx.clone(),
-                                shared_key,
+                                sk.clone(),
                                 ra.clone(),
+                                km.clone(),
+                                pr.clone(),
                             )
                             .await
                             {
-                                if let Some(tx) = &atx {
-                                    let _ = tx.send(ConnectionMessage::Error(format!(
-                                        "Control error: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(tx) = &atx {
-                                let _ = tx.send(ConnectionMessage::Error(format!(
-                                    "Control decode error: {}",
+                                error!(event = "control_handle_error", error = %e, "Error handling control message");
+                                notify_app(&atx, ConnectionMessage::Error(format!(
+                                    "Control error: {}",
                                     e
                                 )));
                             }
+                        }
+                        Err(e) => {
+                            error!(event = "control_decode_error", bytes = payload.len(), error = %e, "Failed to decode control message");
+                            notify_app(&atx, ConnectionMessage::Error(format!(
+                                "Control decode error: {}",
+                                e
+                            )));
                         }
                     },
                     FRAME_CHUNK => {
                         // Binary: 16 bytes uuid + 4 bytes seq + payload
                         if payload.len() < 20 {
-                            if let Some(tx) = &atx {
-                                let _ = tx
-                                    .send(ConnectionMessage::Error("Chunk frame too short".into()));
-                            }
+                            notify_app(&atx, ConnectionMessage::Error("Chunk frame too short".into()));
                             return;
                         }
                         let file_id = Uuid::from_bytes(payload[..16].try_into().unwrap());
@@ -1256,17 +1480,25 @@ impl WebRTCConnection {
                                         filename: state.filename.clone(),
                                         received_chunks: state.received_chunks,
                                         total_chunks: state.total_chunks,
+                                        wire_bytes,
                                     });
                                 }
                             } else {
                                 error!("Chunk {} for {} out of bounds", seq, file_id);
                             }
-                        }
-                        drop(map);
 
-                        // Send ACK
-                        if let Err(e) = Self::send_ack(&dc, &shared_key, file_id, seq).await {
-                            warn!("Failed to send ACK for chunk {}: {}", seq, e);
+                            // Only ACK if we actually tracked this chunk
+                            drop(map);
+                            let ack_key = *sk.read().await;
+                            if let Err(e) = Self::send_ack(&dc, &ack_key, file_id, seq).await {
+                                warn!("Failed to send ACK for chunk {}: {}", seq, e);
+                            }
+                        } else {
+                            // Chunk arrived before Metadata — buffer it and ACK later
+                            drop(map);
+                            tracing::debug!("Chunk {} for file {} buffered — Metadata not yet received", seq, file_id);
+                            let mut pending = pc.write().await;
+                            pending.entry(file_id).or_default().push((seq, chunk_data.to_vec()));
                         }
                     }
                     FRAME_ACK => {
@@ -1284,12 +1516,10 @@ impl WebRTCConnection {
                         }
                     }
                     _ => {
-                        if let Some(tx) = &atx {
-                            let _ = tx.send(ConnectionMessage::Debug(format!(
-                                "Unknown frame type: 0x{:02x}",
-                                frame_type
-                            )));
-                        }
+                        notify_app(&atx, ConnectionMessage::Debug(format!(
+                            "Unknown frame type: 0x{:02x}",
+                            frame_type
+                        )));
                     }
                 }
             })
@@ -1302,23 +1532,39 @@ impl WebRTCConnection {
         msg: ControlMessage,
         _send_state: Arc<RwLock<HashMap<Uuid, SendFileState>>>,
         recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
+        pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>>,
         pending_offers: Arc<RwLock<HashMap<Uuid, PendingOffer>>>,
         pending_folder_offers: Arc<RwLock<HashMap<Uuid, PendingFolderOffer>>>,
         accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
-        shared_key: [u8; 32],
+        shared_key: Arc<RwLock<[u8; 32]>>,
         remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
+        key_manager: Option<SessionKeyManager>,
+        pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
     ) -> Result<()> {
+        let key = *shared_key.read().await;
         match msg {
             ControlMessage::Text(data) => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::TextReceived(data));
-                }
+                notify_app(&app_tx, ConnectionMessage::TextReceived(data));
+            }
+            ControlMessage::DirectMessage(data) => {
+                notify_app(&app_tx, ConnectionMessage::DmReceived(data));
+            }
+            ControlMessage::Typing => {
+                notify_app(&app_tx, ConnectionMessage::TypingReceived);
             }
             ControlMessage::DisplayName(name) => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::DisplayNameReceived(name));
+                notify_app(&app_tx, ConnectionMessage::DisplayNameReceived(name));
+            }
+            ControlMessage::Ping => {
+                // Auto-reply with Pong
+                let key = *shared_key.read().await;
+                if let Err(e) = Self::send_control_on(dc, &key, &ControlMessage::Pong).await {
+                    warn!(event = "pong_send_failed", error = %e, "Failed to send pong");
                 }
+            }
+            ControlMessage::Pong => {
+                notify_app(&app_tx, ConnectionMessage::PongReceived);
             }
             ControlMessage::FileOffer {
                 file_id,
@@ -1326,14 +1572,12 @@ impl WebRTCConnection {
                 filesize,
                 total_size,
             } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::FileOffered {
-                        file_id,
-                        filename,
-                        filesize,
-                        total_size,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::FileOffered {
+                    file_id,
+                    filename,
+                    filesize,
+                    total_size,
+                });
             }
             ControlMessage::FileResponse {
                 file_id,
@@ -1351,6 +1595,7 @@ impl WebRTCConnection {
                 filesize,
             } => {
                 if filesize == 0 {
+                    warn!(event = "zero_size_file", file_id = %file_id, filename = %filename, "Rejected file with zero size");
                     return Err(anyhow!("Cannot receive file with zero size"));
                 }
                 let dest_path = accepted_destinations.write().await.remove(&file_id);
@@ -1399,6 +1644,50 @@ impl WebRTCConnection {
                 };
                 recv_state.write().await.insert(file_id, st);
 
+                // Process any chunks that arrived before this Metadata frame
+                let buffered = {
+                    let mut pending = pending_chunks.write().await;
+                    pending.remove(&file_id).unwrap_or_default()
+                };
+                if !buffered.is_empty() {
+                    tracing::debug!(
+                        "Processing {} buffered chunks for file {}",
+                        buffered.len(),
+                        file_id
+                    );
+                    let mut map = recv_state.write().await;
+                    if let Some(state) = map.get_mut(&file_id) {
+                        for (seq, chunk_data) in &buffered {
+                            let start = (*seq as usize) * CHUNK_SIZE;
+                            let end = start + chunk_data.len();
+                            if end <= state.buffer.len() {
+                                state.buffer[start..end].copy_from_slice(chunk_data);
+                                state.received_chunks += 1;
+                                if let Some(tx) = &app_tx {
+                                    let _ = tx.send(ConnectionMessage::FileProgress {
+                                        file_id,
+                                        filename: state.filename.clone(),
+                                        received_chunks: state.received_chunks,
+                                        total_chunks: state.total_chunks,
+                                        wire_bytes: 0, // buffered chunks: wire bytes already counted
+                                    });
+                                }
+                            } else {
+                                error!("Buffered chunk {} for {} out of bounds", seq, file_id);
+                            }
+                        }
+                    }
+                    drop(map);
+                    // Now send ACKs for all buffered chunks
+                    for (seq, _) in &buffered {
+                        if let Err(e) =
+                            Self::send_ack(dc, &key, file_id, *seq).await
+                        {
+                            warn!("Failed to send ACK for buffered chunk {}: {}", seq, e);
+                        }
+                    }
+                }
+
                 if let Some(tx) = &app_tx {
                     let _ = tx.send(ConnectionMessage::Debug(format!(
                         "Receiving: {} ({} bytes, {} chunks)",
@@ -1415,6 +1704,7 @@ impl WebRTCConnection {
                     let ok = local_hash.as_slice() == sha3_256.as_slice();
 
                     if ok {
+                        info!(event = "file_recv_verified", file_id = %file_id, filename = %state.filename, bytes = state.buffer.len(), "File received and hash verified");
                         if let Ok(mut p) = Persistence::load() {
                             p.transfers.remove(&file_id);
                             let _ = p.save();
@@ -1445,17 +1735,20 @@ impl WebRTCConnection {
                                 path: save_path.to_string_lossy().to_string(),
                             });
                         }
-                    } else if let Some(tx) = &app_tx {
-                        let _ = tx.send(ConnectionMessage::Error(format!(
-                            "Hash mismatch for {}",
-                            state.filename
-                        )));
+                    } else {
+                        error!(event = "file_integrity_failure", file_id = %file_id, filename = %state.filename, "File integrity check failed: hash mismatch");
+                        if let Some(tx) = &app_tx {
+                            let _ = tx.send(ConnectionMessage::Error(format!(
+                                "Hash mismatch for {}",
+                                state.filename
+                            )));
+                        }
                     }
 
                     // Send hash result back on control channel
                     Self::send_control_on(
                         dc,
-                        &shared_key,
+                        &key,
                         &ControlMessage::HashResult { file_id, ok },
                     )
                     .await?;
@@ -1463,16 +1756,14 @@ impl WebRTCConnection {
             }
             ControlMessage::HashResult { file_id, ok } => {
                 if ok {
-                    tracing::info!("File send complete: {} (verified)", file_id);
+                    info!(event = "file_send_verified", file_id = %file_id, "File send complete: hash verified");
                 } else {
-                    tracing::warn!("File send failed: {} (hash mismatch)", file_id);
+                    error!(event = "file_integrity_failure", file_id = %file_id, "File send failed: hash mismatch");
                 }
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::SendComplete {
-                        file_id,
-                        success: ok,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::SendComplete {
+                    file_id,
+                    success: ok,
+                });
             }
             ControlMessage::FolderOffer {
                 folder_id,
@@ -1480,14 +1771,12 @@ impl WebRTCConnection {
                 file_count,
                 total_size,
             } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::FolderOffered {
-                        folder_id,
-                        dirname,
-                        file_count,
-                        total_size,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::FolderOffered {
+                    folder_id,
+                    dirname,
+                    file_count,
+                    total_size,
+                });
             }
             ControlMessage::FolderResponse {
                 folder_id,
@@ -1498,24 +1787,19 @@ impl WebRTCConnection {
                 }
             }
             ControlMessage::FolderComplete { folder_id } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::FolderComplete { folder_id });
-                }
+                notify_app(&app_tx, ConnectionMessage::FolderComplete { folder_id });
             }
             ControlMessage::ResumeRequest { file_id, received_file_ids } => {
-                if let Some(tx) = &app_tx {
-                    // Send resume request info to app
-                    let _ = tx.send(ConnectionMessage::Debug(format!(
-                        "Resume requested for file {}, {} files already received",
-                        file_id,
-                        received_file_ids.len()
-                    )));
-                }
+                notify_app(&app_tx, ConnectionMessage::Debug(format!(
+                    "Resume requested for file {}, {} files already received",
+                    file_id,
+                    received_file_ids.len()
+                )));
             }
             ControlMessage::LsRequest { path } => {
                 tracing::info!("Remote ls request: {}", path);
                 if !*remote_access.borrow() {
-                    Self::send_control_on(dc, &shared_key, &ControlMessage::RemoteAccessDisabled)
+                    Self::send_control_on(dc, &key, &ControlMessage::RemoteAccessDisabled)
                         .await?;
                 } else {
                     let mut entries = Vec::new();
@@ -1532,49 +1816,39 @@ impl WebRTCConnection {
                     }
                     Self::send_control_on(
                         dc,
-                        &shared_key,
+                        &key,
                         &ControlMessage::LsResponse { path, entries },
                     )
                     .await?;
                 }
             }
             ControlMessage::LsResponse { path, entries } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::LsResponse { path, entries });
-                }
+                notify_app(&app_tx, ConnectionMessage::LsResponse { path, entries });
             }
             ControlMessage::FetchRequest { path, is_folder } => {
                 tracing::info!("Remote fetch request: {} (folder: {})", path, is_folder);
                 if !*remote_access.borrow() {
-                    Self::send_control_on(dc, &shared_key, &ControlMessage::RemoteAccessDisabled)
+                    Self::send_control_on(dc, &key, &ControlMessage::RemoteAccessDisabled)
                         .await?;
                 } else {
-                    if let Some(tx) = &app_tx {
-                        let _ = tx.send(ConnectionMessage::RemoteFetchRequest { path, is_folder });
-                    }
+                    notify_app(&app_tx, ConnectionMessage::RemoteFetchRequest { path, is_folder });
                 }
             }
             ControlMessage::RemoteAccessDisabled => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::RemoteAccessDisabled);
-                }
+                notify_app(&app_tx, ConnectionMessage::RemoteAccessDisabled);
             }
             ControlMessage::FileComplete { file_id, filename } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::FileCompleted {
-                        file_id,
-                        filename,
-                        path: String::new(), // Path is set by receiver
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::FileCompleted {
+                    file_id,
+                    filename,
+                    path: String::new(), // Path is set by receiver
+                });
             }
             ControlMessage::TransferRejected { file_id, reason } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::FileRejected {
-                        file_id,
-                        reason,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::FileRejected {
+                    file_id,
+                    reason,
+                });
                 // Clean up pending offer
                 pending_offers.write().await.remove(&file_id);
             }
@@ -1585,14 +1859,12 @@ impl WebRTCConnection {
                 manifest,
                 total_size,
             } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::TransactionRequested {
-                        transaction_id,
-                        display_name,
-                        manifest,
-                        total_size,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::TransactionRequested {
+                    transaction_id,
+                    display_name,
+                    manifest,
+                    total_size,
+                });
             }
             ControlMessage::TransactionResponse {
                 transaction_id,
@@ -1600,49 +1872,77 @@ impl WebRTCConnection {
                 dest_path,
                 reject_reason,
             } => {
-                if let Some(tx) = &app_tx {
-                    if accepted {
-                        let _ = tx.send(ConnectionMessage::TransactionAccepted {
-                            transaction_id,
-                            dest_path,
-                        });
-                    } else {
-                        let _ = tx.send(ConnectionMessage::TransactionRejected {
-                            transaction_id,
-                            reason: reject_reason,
-                        });
-                    }
+                if accepted {
+                    notify_app(&app_tx, ConnectionMessage::TransactionAccepted {
+                        transaction_id,
+                        dest_path,
+                    });
+                } else {
+                    notify_app(&app_tx, ConnectionMessage::TransactionRejected {
+                        transaction_id,
+                        reason: reject_reason,
+                    });
                 }
             }
             ControlMessage::TransactionComplete { transaction_id } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::TransactionCompleted {
-                        transaction_id,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::TransactionCompleted {
+                    transaction_id,
+                });
             }
             ControlMessage::TransactionCancel { transaction_id, reason } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::TransactionCancelled {
-                        transaction_id,
-                        reason,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::TransactionCancelled {
+                    transaction_id,
+                    reason,
+                });
             }
             ControlMessage::TransactionResumeRequest { resume_info } => {
-                if let Some(tx) = &app_tx {
-                    let _ = tx.send(ConnectionMessage::TransactionResumeRequested {
-                        resume_info,
-                    });
-                }
+                notify_app(&app_tx, ConnectionMessage::TransactionResumeRequested {
+                    resume_info,
+                });
             }
             ControlMessage::TransactionResumeResponse { transaction_id, accepted } => {
                 if accepted {
-                    if let Some(tx) = &app_tx {
-                        let _ = tx.send(ConnectionMessage::TransactionResumeAccepted {
-                            transaction_id,
-                        });
+                    notify_app(&app_tx, ConnectionMessage::TransactionResumeAccepted {
+                        transaction_id,
+                    });
+                }
+            }
+            ControlMessage::KeyRotation { ephemeral_pub } => {
+                use crate::core::connection::crypto;
+
+                let peer_pub: [u8; 32] = ephemeral_pub
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid ephemeral public key length for rotation"))?;
+
+                if let Some(ref km) = key_manager {
+                    // Check if we have a pending rotation (we initiated)
+                    let our_eph = pending_rotation.write().await.take();
+
+                    if let Some(local_eph) = our_eph {
+                        // We initiated the rotation — complete it with peer's response
+                        let new_key = crypto::complete_rotation(km, &local_eph, &peer_pub).await;
+                        info!(event = "key_rotated_initiator", new_key_prefix = ?&new_key[..4], "Session key rotated (initiator side)");
+                    } else {
+                        // Peer initiated — generate our own ephemeral, respond, then rotate
+                        let local_eph = crypto::prepare_rotation();
+                        let response_key = *shared_key.read().await;
+                        Self::send_control_on(
+                            dc,
+                            &response_key,
+                            &ControlMessage::KeyRotation {
+                                ephemeral_pub: local_eph.public.to_vec(),
+                            },
+                        )
+                        .await?;
+                        let new_key = crypto::complete_rotation(km, &local_eph, &peer_pub).await;
+                        info!(event = "key_rotated_responder", new_key_prefix = ?&new_key[..4], "Session key rotated (responder side)");
                     }
+
+                    notify_app(&app_tx, ConnectionMessage::Debug(
+                        "Session key rotated successfully".into(),
+                    ));
+                } else {
+                    warn!(event = "key_rotation_no_manager", "Received KeyRotation but no SessionKeyManager is available");
                 }
             }
         }

@@ -1,4 +1,18 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
+
+/// Formats the current wall-clock time as an absolute `HH:MM` (UTC) string.
+///
+/// The timestamp is computed once at call time and stored — it is never
+/// re-derived at render time.
+pub fn format_timestamp_now() -> String {
+    let duration = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    format!("{:02}:{:02}", hours, mins)
+}
 
 /// Formats elapsed time since an instant in human-readable format (Xs, Xm, Xh)
 pub fn format_elapsed(timestamp: Instant) -> String {

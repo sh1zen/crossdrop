@@ -1,3 +1,4 @@
+pub mod crypto;
 mod iroh;
 mod ticket;
 pub mod webrtc;

@@ -1,6 +1,6 @@
 use crate::core::initializer::PeerNode;
 use crate::core::transaction::{TransactionDirection, TransactionState};
-use crate::ui::helpers::{get_display_name, truncate_filename};
+use crate::ui::helpers::{format_file_size, get_display_name, truncate_filename};
 use crate::ui::traits::{Action, Component, Handler};
 use crate::ui::widgets::ProgressBar;
 use crate::workers::app::{App, Mode};
@@ -97,11 +97,19 @@ impl Component for SendPanel {
 
         // Transaction-level progress (from engine — authoritative)
         for txn in app.engine.transactions().active.values() {
-            if txn.state != TransactionState::Active {
+            // Show Active and Pending transactions
+            if txn.state.is_terminal() {
                 continue;
             }
             let (transferred, total) = txn.progress_chunks();
-            let bar = self.progress_bar.render(transferred, total, Color::Magenta);
+
+            let (bar_color, state_info) = match txn.state {
+                TransactionState::Pending => (Color::Yellow, " [waiting]"),
+                TransactionState::Interrupted => (Color::Red, " [interrupted]"),
+                _ => (Color::Magenta, ""),
+            };
+
+            let bar = self.progress_bar.render(transferred, total, bar_color);
             let short_name = truncate_filename(&txn.display_name, 20);
 
             let arrow = match txn.direction {
@@ -115,12 +123,13 @@ impl Component for SendPanel {
 
             let file_info = if txn.total_file_count() > 1 {
                 format!(
-                    " ({}/{} files)",
+                    " ({}/{} files, {})",
                     txn.completed_file_count(),
-                    txn.total_file_count()
+                    txn.total_file_count(),
+                    format_file_size(txn.total_size)
                 )
             } else {
-                String::new()
+                format!(" ({})", format_file_size(txn.total_size))
             };
 
             progress_items.push(ListItem::new(Line::from(vec![
@@ -137,6 +146,7 @@ impl Component for SendPanel {
                 bar.spans[2].clone(),
                 bar.spans[3].clone(),
                 Span::styled(file_info, Style::default().fg(Color::DarkGray)),
+                Span::styled(state_info, Style::default().fg(Color::Yellow)),
             ])));
         }
 

@@ -6,14 +6,22 @@
 //! - Progress calculation (aggregated over all files)
 //! - ACK / resume / cancellation logic
 //! - Control-channel coordination
+//! - Secure manifest integration (cryptographic signing, Merkle roots)
+//! - Chunk bitmap tracking for resume
+//! - Replay protection via monotonic counters
 //!
 //! There is exactly one Transaction per transfer request.
 
+use crate::core::pipeline::chunk::ChunkBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
+
+/// Canonical chunk size in bytes. Must match the constant in webrtc.rs.
+/// Every module that computes total_chunks or byte offsets MUST use this.
+pub const CHUNK_SIZE: usize = 48 * 1024;
 
 // ── Transaction State Machine ────────────────────────────────────────────────
 
@@ -34,6 +42,8 @@ pub enum TransactionState {
     Failed,
     /// Transfer paused / interrupted, eligible for resume.
     Interrupted,
+    /// Transfer paused and persisted, eligible for resume with security state.
+    Resumable,
 }
 
 impl TransactionState {
@@ -77,12 +87,18 @@ pub struct TransactionFile {
     pub completed: bool,
     /// Optional SHA3-256 hash once verified.
     pub verified: Option<bool>,
+    /// Chunk completion bitmap for resume support.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    pub chunk_bitmap: Option<ChunkBitmap>,
+    /// Merkle root for integrity verification.
+    #[serde(default)]
+    pub merkle_root: Option<[u8; 32]>,
 }
 
 impl TransactionFile {
     pub fn new(file_id: Uuid, relative_path: String, filesize: u64) -> Self {
-        let chunk_size = 48 * 1024; // matches CHUNK_SIZE in webrtc.rs
-        let total_chunks = ((filesize as f64) / (chunk_size as f64)).ceil().max(1.0) as u32;
+        let total_chunks = ((filesize as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
         Self {
             file_id,
             relative_path,
@@ -91,6 +107,8 @@ impl TransactionFile {
             transferred_chunks: 0,
             completed: false,
             verified: None,
+            chunk_bitmap: Some(ChunkBitmap::new(total_chunks)),
+            merkle_root: None,
         }
     }
 }
@@ -112,6 +130,12 @@ pub struct ManifestEntry {
     pub file_id: Uuid,
     pub relative_path: String,
     pub filesize: u64,
+    /// Merkle root of all chunk hashes (for integrity verification).
+    #[serde(default)]
+    pub merkle_root: Option<[u8; 32]>,
+    /// Total number of chunks.
+    #[serde(default)]
+    pub total_chunks: Option<u32>,
 }
 
 // ── Resume info ──────────────────────────────────────────────────────────────
@@ -127,6 +151,15 @@ pub struct ResumeInfo {
     pub partial_offsets: HashMap<Uuid, u64>,
     /// Optional per-file checksums for partial verification.
     pub partial_checksums: HashMap<Uuid, Vec<u8>>,
+    /// Per-file chunk bitmaps for precise resume (serialized).
+    #[serde(default)]
+    pub chunk_bitmaps: HashMap<Uuid, Vec<u8>>,
+    /// HMAC for resume request authentication.
+    #[serde(default)]
+    pub hmac: Option<[u8; 32]>,
+    /// Receiver's signature on this resume request.
+    #[serde(default)]
+    pub receiver_signature: Option<[u8; 32]>,
 }
 
 // ── Transaction ──────────────────────────────────────────────────────────────
@@ -134,7 +167,6 @@ pub struct ResumeInfo {
 /// A Transaction represents a single transfer request (one or many files).
 /// There is exactly one Transaction per transfer request.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Transaction {
     /// Unique transaction ID.
     pub id: Uuid,
@@ -156,8 +188,6 @@ pub struct Transaction {
     pub file_order: Vec<Uuid>,
     /// Destination path (receiver side).
     pub dest_path: Option<PathBuf>,
-    /// Local source path (sender side, for outbound transfers).
-    pub source_path: Option<PathBuf>,
     /// When the transaction reached a terminal state (if ever).
     pub finished_at: Option<Instant>,
     /// Rejection reason (if rejected).
@@ -199,7 +229,6 @@ impl Transaction {
             files: file_map,
             file_order,
             dest_path: None,
-            source_path: None,
             finished_at: None,
             reject_reason: None,
             resume_count: 0,
@@ -240,7 +269,6 @@ impl Transaction {
             files: file_map,
             file_order,
             dest_path: None,
-            source_path: None,
             finished_at: None,
             reject_reason: None,
             resume_count: 0,
@@ -251,7 +279,10 @@ impl Transaction {
 
     /// Transition to Active state (transfer accepted and started).
     pub fn activate(&mut self) {
-        if self.state == TransactionState::Pending || self.state == TransactionState::Interrupted {
+        if self.state == TransactionState::Pending
+            || self.state == TransactionState::Interrupted
+            || self.state == TransactionState::Resumable
+        {
             self.state = TransactionState::Active;
         }
     }
@@ -271,26 +302,79 @@ impl Transaction {
         }
     }
 
-    /// Mark the transaction as failed.
-    #[allow(dead_code)]
-    pub fn fail(&mut self, reason: Option<String>) {
-        if !self.state.is_terminal() {
-            self.state = TransactionState::Failed;
-            self.reject_reason = reason;
-            self.finished_at = Some(Instant::now());
-        }
-    }
-
-    /// Whether the transaction is currently active.
-    #[allow(dead_code)]
-    pub fn is_active(&self) -> bool {
-        self.state == TransactionState::Active
-    }
-
     /// Mark the transaction as interrupted (eligible for resume).
     pub fn interrupt(&mut self) {
         if self.state == TransactionState::Active {
             self.state = TransactionState::Interrupted;
+        }
+    }
+
+    /// Mark the transaction as resumable (persisted state).
+    #[allow(dead_code)]
+    pub fn make_resumable(&mut self) {
+        if self.state == TransactionState::Active || self.state == TransactionState::Interrupted {
+            self.state = TransactionState::Resumable;
+        }
+    }
+
+    /// Mark a specific chunk as received for a file.
+    #[allow(dead_code)]
+    pub fn mark_chunk_received(&mut self, file_id: Uuid, chunk_index: u32) {
+        if let Some(file) = self.files.get_mut(&file_id) {
+            if let Some(ref mut bitmap) = file.chunk_bitmap {
+                if !bitmap.is_set(chunk_index) {
+                    bitmap.set(chunk_index);
+                    file.transferred_chunks = bitmap.received_count();
+                }
+            }
+        }
+    }
+
+    /// Get missing chunks for a file.
+    #[allow(dead_code)]
+    pub fn missing_chunks(&self, file_id: &Uuid) -> Vec<u32> {
+        self.files
+            .get(file_id)
+            .and_then(|f| f.chunk_bitmap.as_ref())
+            .map(|bm| bm.missing_chunks())
+            .unwrap_or_default()
+    }
+
+    /// Build a resume info from the current transaction state.
+    #[allow(dead_code)]
+    pub fn build_resume_info(&self) -> ResumeInfo {
+        let completed_files: Vec<Uuid> = self
+            .files
+            .values()
+            .filter(|f| f.completed)
+            .map(|f| f.file_id)
+            .collect();
+
+        let partial_offsets: HashMap<Uuid, u64> = self
+            .files
+            .values()
+            .filter(|f| !f.completed)
+            .map(|f| (f.file_id, f.transferred_chunks as u64 * CHUNK_SIZE as u64))
+            .collect();
+
+        let chunk_bitmaps: HashMap<Uuid, Vec<u8>> = self
+            .files
+            .values()
+            .filter_map(|f| {
+                f.chunk_bitmap
+                    .as_ref()
+                    .map(|bm| (f.file_id, bm.to_bytes()))
+            })
+            .collect();
+
+        ResumeInfo {
+            transaction_id: self.id,
+            completed_files,
+            partial_offsets,
+            partial_checksums: HashMap::new(),
+            chunk_bitmaps,
+            hmac: None,
+            receiver_signature: None,
         }
     }
 
@@ -353,13 +437,116 @@ impl Transaction {
                 file.completed = true;
                 file.transferred_chunks = file.total_chunks;
                 file.verified = Some(true);
-            } else if let Some(&offset) = info.partial_offsets.get(file_id) {
-                let chunk_size: u64 = 48 * 1024;
-                file.transferred_chunks = (offset / chunk_size) as u32;
+            } else {
+                // Reset progress for incomplete files — the sender will
+                // re-send ALL chunks from 0 because the receiver's
+                // in-memory buffer is lost on reconnect.  Keeping the
+                // old transferred_chunks would cause the sender to skip
+                // chunks that the receiver no longer has.
+                file.transferred_chunks = 0;
             }
         }
 
         self.state = TransactionState::Active;
+    }
+
+    // ── Snapshot (persistence) ─────────────────────────────────────────────
+
+    /// Create a serializable snapshot of this transaction for persistence.
+    /// `source_path`: the local source path for outbound transfers.
+    pub fn to_snapshot_with_source(&self, source_path: Option<&str>) -> TransactionSnapshot {
+        let files: Vec<TransactionFileSnapshot> = self
+            .file_order
+            .iter()
+            .filter_map(|id| self.files.get(id))
+            .map(|f| TransactionFileSnapshot {
+                file_id: f.file_id,
+                relative_path: f.relative_path.clone(),
+                filesize: f.filesize,
+                total_chunks: f.total_chunks,
+                transferred_chunks: f.transferred_chunks,
+                completed: f.completed,
+                verified: f.verified,
+                chunk_bitmap_bytes: f.chunk_bitmap.as_ref().map(|bm| bm.to_bytes()),
+                merkle_root: f.merkle_root,
+            })
+            .collect();
+
+        let manifest = Some(self.build_manifest());
+
+        TransactionSnapshot {
+            id: self.id,
+            state: self.state,
+            direction: self.direction,
+            peer_id: self.peer_id.clone(),
+            display_name: self.display_name.clone(),
+            parent_dir: self.parent_dir.clone(),
+            total_size: self.total_size,
+            files,
+            dest_path: self.dest_path.clone(),
+            reject_reason: self.reject_reason.clone(),
+            resume_count: self.resume_count,
+            expiration_time: None,
+            last_counter: None,
+            source_path: source_path.map(|s| s.to_string()),
+            manifest,
+        }
+    }
+
+    /// Create a serializable snapshot (convenience, no source_path).
+    pub fn to_snapshot(&self) -> TransactionSnapshot {
+        self.to_snapshot_with_source(None)
+    }
+
+    /// Restore a Transaction from a persisted snapshot.
+    pub fn from_snapshot(snap: &TransactionSnapshot) -> Self {
+        let mut file_map = HashMap::new();
+        let mut file_order = Vec::new();
+
+        for fs in &snap.files {
+            let bitmap = fs
+                .chunk_bitmap_bytes
+                .as_ref()
+                .and_then(|b| ChunkBitmap::from_bytes(b))
+                .unwrap_or_else(|| {
+                    let mut bm = ChunkBitmap::new(fs.total_chunks);
+                    // Mark already-transferred chunks as received
+                    for i in 0..fs.transferred_chunks {
+                        bm.set(i);
+                    }
+                    bm
+                });
+
+            let tf = TransactionFile {
+                file_id: fs.file_id,
+                relative_path: fs.relative_path.clone(),
+                filesize: fs.filesize,
+                total_chunks: fs.total_chunks,
+                transferred_chunks: fs.transferred_chunks,
+                completed: fs.completed,
+                verified: fs.verified,
+                chunk_bitmap: Some(bitmap),
+                merkle_root: fs.merkle_root,
+            };
+            file_map.insert(fs.file_id, tf);
+            file_order.push(fs.file_id);
+        }
+
+        Self {
+            id: snap.id,
+            state: snap.state,
+            direction: snap.direction,
+            peer_id: snap.peer_id.clone(),
+            display_name: snap.display_name.clone(),
+            parent_dir: snap.parent_dir.clone(),
+            total_size: snap.total_size,
+            files: file_map,
+            file_order,
+            dest_path: snap.dest_path.clone(),
+            finished_at: None,
+            reject_reason: snap.reject_reason.clone(),
+            resume_count: snap.resume_count,
+        }
     }
 
     // ── Manifest generation ──────────────────────────────────────────────
@@ -374,6 +561,8 @@ impl Transaction {
                 file_id: f.file_id,
                 relative_path: f.relative_path.clone(),
                 filesize: f.filesize,
+                merkle_root: f.merkle_root,
+                total_chunks: Some(f.total_chunks),
             })
             .collect();
 
@@ -508,6 +697,18 @@ pub struct TransactionSnapshot {
     pub dest_path: Option<PathBuf>,
     pub reject_reason: Option<String>,
     pub resume_count: u32,
+    /// Transaction expiration time (Unix timestamp seconds).
+    #[serde(default)]
+    pub expiration_time: Option<u64>,
+    /// Last replay counter seen.
+    #[serde(default)]
+    pub last_counter: Option<u64>,
+    /// Source path for outbound transfers (absolute path on sender's disk).
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// Manifest snapshot for the transaction (immutable after creation).
+    #[serde(default)]
+    pub manifest: Option<TransactionManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,4 +720,10 @@ pub struct TransactionFileSnapshot {
     pub transferred_chunks: u32,
     pub completed: bool,
     pub verified: Option<bool>,
+    /// Serialized chunk bitmap for resume.
+    #[serde(default)]
+    pub chunk_bitmap_bytes: Option<Vec<u8>>,
+    /// Merkle root for integrity verification.
+    #[serde(default)]
+    pub merkle_root: Option<[u8; 32]>,
 }

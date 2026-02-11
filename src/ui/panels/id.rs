@@ -29,8 +29,22 @@ impl Component for IdPanel {
     fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(3),
+            ])
             .split(area);
+
+        let peer_id_widget = Paragraph::new(app.peer_id.as_str())
+            .block(
+                Block::default()
+                    .title(" Your Peer ID ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+            .style(Style::default().fg(Color::Cyan));
+        f.render_widget(peer_id_widget, chunks[0]);
 
         let ticket_widget = Paragraph::new(app.ticket.as_str())
             .block(
@@ -41,7 +55,7 @@ impl Component for IdPanel {
             )
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::Green));
-        f.render_widget(ticket_widget, chunks[0]);
+        f.render_widget(ticket_widget, chunks[1]);
 
         let hint = Paragraph::new(Line::from(vec![
             Span::raw("  Press "),
@@ -55,7 +69,7 @@ impl Component for IdPanel {
             Span::raw(" to copy ticket to clipboard"),
         ]))
         .block(Block::default().borders(Borders::NONE));
-        f.render_widget(hint, chunks[1]);
+        f.render_widget(hint, chunks[2]);
     }
 }
 

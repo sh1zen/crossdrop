@@ -61,7 +61,7 @@ impl Component for HomePanel {
                     Span::styled(" 💬  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),
                     Span::styled(
-                        format!(" ({})", app.chat_history.len()),
+                        format!(" ({})", app.messages.messages_for(&crate::workers::app::ChatTarget::Room).len()),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])),

@@ -11,10 +11,6 @@ use std::str::FromStr;
 #[command(author, version, about = "Crossdrop - P2P file sharing and chat")]
 #[command(propagate_version = true)]
 pub struct Args {
-    /// Path to a config file (TOML)
-    #[clap(long)]
-    pub config: Option<PathBuf>,
-
     /// The IPv4 address that socket will listen on.
     #[clap(long)]
     pub ipv4_addr: Option<SocketAddrV4>,
@@ -37,10 +33,6 @@ pub struct Args {
     #[clap(long)]
     pub show_secret: bool,
 
-    /// Path to file storing persistent secret key.
-    #[clap(long)]
-    pub secret_file: Option<PathBuf>,
-
     /// Remote access allowed
     #[clap(long)]
     pub remote_access: bool,
@@ -48,20 +40,21 @@ pub struct Args {
     /// Display name for this peer.
     #[clap(long)]
     pub display_name: Option<String>,
+
+    /// Directory for all persistent data (secret keys, identity, transfers, peers).
+    /// Defaults to ~/.crossdrop/
+    #[clap(long)]
+    pub conf: Option<PathBuf>,
 }
 
 impl Args {
     /// Load Args from CLI + TOML file (if it exists).
     /// CLI values override those from the file.
     pub fn load() -> Self {
-        let cli_args = Args::parse();
+        let mut cli_args = Args::parse();
 
-        if let Some(config_path) = &cli_args.config
-            && let Some(mut file_args) = Self::from_file(config_path)
-        {
-            file_args = Self::merge(file_args, cli_args);
-            return file_args;
-        }
+        // Resolve relative paths to absolute before any working directory change
+        cli_args.conf = cli_args.conf.map(Self::resolve_path);
 
         let default_path = PathBuf::from("config.toml");
         if let Some(mut file_args) = Self::from_file(&default_path) {
@@ -70,6 +63,15 @@ impl Args {
         }
 
         cli_args
+    }
+
+    /// Resolve a potentially relative path to an absolute one.
+    fn resolve_path(p: PathBuf) -> PathBuf {
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        }
     }
 
     fn from_file(path: &Path) -> Option<Self> {
@@ -87,12 +89,6 @@ impl Args {
         if cli.ipv6_addr.is_some() {
             file.ipv6_addr = cli.ipv6_addr;
         }
-        if cli.config.is_some() {
-            file.config = cli.config;
-        }
-        if cli.secret_file.is_some() {
-            file.secret_file = cli.secret_file;
-        }
         if cli.verbose > 0 {
             file.verbose = cli.verbose;
         }
@@ -107,6 +103,9 @@ impl Args {
         }
         if cli.remote_access {
             file.remote_access = true;
+        }
+        if cli.conf.is_some() {
+            file.conf = cli.conf;
         }
         file.relay = cli.relay;
         file

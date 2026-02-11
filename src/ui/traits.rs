@@ -1,5 +1,6 @@
 use crate::core::engine::EngineAction;
 use crate::core::initializer::PeerNode;
+use crate::ui::executer::UIPopup;
 use crate::workers::app::{App, Mode};
 use crossterm::event::KeyCode;
 use ratatui::{layout::Rect, Frame};
@@ -55,6 +56,8 @@ pub enum Action {
     SetStatus(String),
     /// Engine actions that need async execution by the UIExecuter.
     EngineActions(Vec<EngineAction>),
+    /// Show a popup (e.g. file/folder offer confirmation).
+    ShowPopup(UIPopup),
     None,
 }
 
