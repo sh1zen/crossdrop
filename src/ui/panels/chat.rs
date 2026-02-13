@@ -1,4 +1,5 @@
 use crate::core::initializer::PeerNode;
+use crate::core::persistence::{ChatSenderSnapshot, ChatTargetSnapshot};
 use crate::ui::commands::{parse_command, ChatCommand, COMMAND_HELP};
 use crate::ui::helpers::{format_timestamp_now, get_display_name};
 use crate::ui::traits::{Action, Component, Handler};
@@ -280,8 +281,12 @@ impl Handler for ChatPanel {
                         app.input.clear();
                         match cmd_result {
                             Ok(ChatCommand::Clear) => {
+                                let target_snap = match &app.chat_target {
+                                    ChatTarget::Room => ChatTargetSnapshot::Room,
+                                    ChatTarget::Peer(pid) => ChatTargetSnapshot::Peer(pid.clone()),
+                                };
                                 app.messages.clear_target(&app.chat_target);
-                                return Some(Action::None);
+                                return Some(Action::PersistClearChat(target_snap));
                             }
                             Ok(ChatCommand::Help) => {
                                 // Insert an ephemeral help message (local only)
@@ -316,6 +321,7 @@ impl Handler for ChatPanel {
                     let msg_len = msg.len() as u64;
                     let target = app.chat_target.clone();
                     let msg_id = Uuid::new_v4();
+                    let timestamp = format_timestamp_now();
 
                     match &target {
                         ChatTarget::Room => {
@@ -324,7 +330,7 @@ impl Handler for ChatPanel {
                                 id: msg_id,
                                 sender: MessageSender::Me,
                                 text: msg.clone(),
-                                timestamp: format_timestamp_now(),
+                                timestamp: timestamp.clone(),
                                 target: ChatTarget::Room,
                                 recipients: app.peers.clone(),
                                 created_at: Instant::now(),
@@ -340,6 +346,15 @@ impl Handler for ChatPanel {
                                     tracing::error!("Broadcast failed: {e}");
                                 }
                             });
+
+                            app.input.clear();
+                            return Some(Action::PersistChat {
+                                id: msg_id.to_string(),
+                                sender: ChatSenderSnapshot::Me,
+                                text: msg,
+                                timestamp,
+                                target: ChatTargetSnapshot::Room,
+                            });
                         }
                         ChatTarget::Peer(peer_id) => {
                             // DM: one message, one peer, only in this chat view
@@ -347,7 +362,7 @@ impl Handler for ChatPanel {
                                 id: msg_id,
                                 sender: MessageSender::Me,
                                 text: msg.clone(),
-                                timestamp: format_timestamp_now(),
+                                timestamp: timestamp.clone(),
                                 target: ChatTarget::Peer(peer_id.clone()),
                                 recipients: vec![peer_id.clone()],
                                 created_at: Instant::now(),
@@ -363,10 +378,18 @@ impl Handler for ChatPanel {
                                     tracing::error!("DM failed: {e}");
                                 }
                             });
+
+                            let target_snap = ChatTargetSnapshot::Peer(peer_id.clone());
+                            app.input.clear();
+                            return Some(Action::PersistChat {
+                                id: msg_id.to_string(),
+                                sender: ChatSenderSnapshot::Me,
+                                text: msg,
+                                timestamp,
+                                target: target_snap,
+                            });
                         }
                     }
-
-                    app.input.clear();
                 }
                 Some(Action::None)
             }

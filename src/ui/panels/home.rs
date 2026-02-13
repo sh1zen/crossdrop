@@ -57,14 +57,25 @@ impl Component for HomePanel {
         let items: Vec<ListItem> = MENU_ORDER
             .iter()
             .map(|mode| match mode {
-                Mode::Chat => ListItem::new(Line::from(vec![
-                    Span::styled(" 💬  ".to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw(mode.label()),
-                    Span::styled(
-                        format!(" ({})", app.messages.messages_for(&crate::workers::app::ChatTarget::Room).len()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])),
+                Mode::Chat => {
+                    let unread = app.total_unread();
+                    let badge = if unread > 0 {
+                        Span::styled(
+                            format!(" ({})", unread),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::styled(
+                            String::new(),
+                            Style::default(),
+                        )
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(" 💬  ".to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(mode.label()),
+                        badge,
+                    ]))
+                }
                 Mode::Send => ListItem::new(Line::from(vec![
                     Span::styled(" 🛜  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),

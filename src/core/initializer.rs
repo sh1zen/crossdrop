@@ -149,6 +149,9 @@ pub struct PeerNode {
     public_key: iroh::PublicKey,
     remote_access_tx: Arc<tokio::sync::watch::Sender<bool>>,
     remote_access_rx: tokio::sync::watch::Receiver<bool>,
+    /// Current display name, updated from Settings panel.
+    display_name_tx: Arc<tokio::sync::watch::Sender<String>>,
+    display_name_rx: tokio::sync::watch::Receiver<String>,
 }
 
 // ── Key derivation ───────────────────────────────────────────────────────────
@@ -346,6 +349,8 @@ impl PeerNode {
         );
 
         let (remote_access_tx, remote_access_rx) = tokio::sync::watch::channel(args.remote_access);
+        let initial_name = args.display_name.clone().unwrap_or_default();
+        let (display_name_tx, display_name_rx) = tokio::sync::watch::channel(initial_name);
 
         Ok(Self {
             sos,
@@ -358,6 +363,8 @@ impl PeerNode {
             public_key,
             remote_access_tx: Arc::new(remote_access_tx),
             remote_access_rx,
+            display_name_tx: Arc::new(display_name_tx),
+            display_name_rx,
         })
     }
 
@@ -557,8 +564,11 @@ impl PeerNode {
 
         self.connecting_notify(&peer_id, "Data channels open (control + data)");
 
-        if let Some(name) = &self.args.display_name {
-            let _ = webrtc_conn.send_display_name(name.clone()).await;
+        {
+            let name = self.current_display_name();
+            if !name.is_empty() {
+                let _ = webrtc_conn.send_display_name(name).await;
+            }
         }
 
         // Spawn heartbeat monitor
@@ -693,8 +703,11 @@ impl PeerNode {
             );
         }
 
-        if let Some(name) = &self.args.display_name {
-            let _ = webrtc_conn.send_display_name(name.clone()).await;
+        {
+            let name = self.current_display_name();
+            if !name.is_empty() {
+                let _ = webrtc_conn.send_display_name(name).await;
+            }
         }
 
         // Spawn heartbeat monitor
@@ -813,12 +826,25 @@ impl PeerNode {
 
     /// Broadcast display name to all connected peers.
     pub async fn broadcast_display_name(&self, name: String) {
+        // Update the shared state so new connections get the latest name
+        let _ = self.display_name_tx.send(name.clone());
         let peers = self.peers.lock().await;
         for (peer_id, entry) in peers.iter() {
             if let Err(e) = entry.connection.send_display_name(name.clone()).await {
                 warn!(event = "display_name_send_failure", peer = %short_id(peer_id), error = %e, "Failed to send display name");
             }
         }
+    }
+
+    /// Update the current display name (called from Settings panel).
+    /// Does NOT broadcast — call `broadcast_display_name` separately if needed.
+    pub fn set_display_name(&self, name: String) {
+        let _ = self.display_name_tx.send(name);
+    }
+
+    /// Get the current display name.
+    pub fn current_display_name(&self) -> String {
+        self.display_name_rx.borrow().clone()
     }
 
     // ── Direct file send (Transaction protocol) ─────────────────────────
@@ -1101,6 +1127,21 @@ impl PeerNode {
                     transaction_id,
                 },
             )
+            .await
+    }
+
+    /// Send a TransactionCancel to the peer.
+    pub async fn send_transaction_cancel(
+        &self,
+        peer_id: &str,
+        transaction_id: Uuid,
+    ) -> Result<()> {
+        let peers = self.peers.lock().await;
+        peers
+            .get(peer_id)
+            .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
+            .connection
+            .send_transaction_cancel(transaction_id, Some("User cancelled".to_string()))
             .await
     }
 

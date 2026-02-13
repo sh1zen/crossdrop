@@ -1,6 +1,7 @@
+use crate::core::engine::EngineAction;
 use crate::core::initializer::PeerNode;
 use crate::core::transaction::{TransactionDirection, TransactionState};
-use crate::ui::helpers::{format_elapsed, format_file_size, get_display_name, truncate_filename};
+use crate::ui::helpers::{format_file_size, get_display_name, truncate_filename};
 use crate::ui::traits::{Action, Component, Handler};
 use crate::ui::widgets::ProgressBar;
 use crate::workers::app::{App, Mode};
@@ -71,17 +72,27 @@ impl Component for FilesPanel {
         if has_active {
             let mut progress_items: Vec<ListItem> = Vec::new();
 
-            for txn in app.engine.transactions().active.values() {
-                if txn.state != TransactionState::Active && txn.state != TransactionState::Pending {
-                    continue;
-                }
+            // Collect active transfer IDs for selection tracking
+            let active_ids: Vec<uuid::Uuid> = app.engine.transactions().active.values()
+                .filter(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending)
+                .map(|t| t.id)
+                .collect();
+            let selected_idx = app.active_transfer_idx.min(active_ids.len().saturating_sub(1));
+
+            for (idx, txn) in app.engine.transactions().active.values()
+                .filter(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending)
+                .enumerate()
+            {
                 let (transferred, total) = txn.progress_chunks();
                 let bar = self.progress_bar.render(transferred, total, Color::Magenta);
                 let short_name = truncate_filename(&txn.display_name, 20);
 
+                let is_selected = idx == selected_idx;
+                let marker = if is_selected { "▶ " } else { "  " };
+
                 let arrow = match txn.direction {
-                    TransactionDirection::Outbound => " -> ",
-                    TransactionDirection::Inbound => " <- ",
+                    TransactionDirection::Outbound => "-> ",
+                    TransactionDirection::Inbound => "<- ",
                 };
                 let arrow_color = match txn.direction {
                     TransactionDirection::Outbound => Color::Green,
@@ -100,6 +111,11 @@ impl Component for FilesPanel {
                 };
 
                 progress_items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::default()
+                            .fg(if is_selected { Color::Yellow } else { Color::DarkGray }),
+                    ),
                     Span::styled(
                         arrow,
                         Style::default()
@@ -206,7 +222,6 @@ impl Component for FilesPanel {
                 TransactionDirection::Outbound => ("->", Color::Green),
                 TransactionDirection::Inbound => ("<-", Color::Cyan),
             };
-            let time_str = format!("{} ago", format_elapsed(rec.timestamp));
             let file_info = if rec.file_count > 1 {
                 format!(" ({} files, {})", rec.file_count, format_file_size(rec.total_size))
             } else {
@@ -228,7 +243,7 @@ impl Component for FilesPanel {
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(
-                    format!("  {}", time_str),
+                    format!("  {}", rec.timestamp),
                     Style::default().fg(Color::Indexed(240)),
                 ),
             ])));
@@ -268,6 +283,14 @@ impl Handler for FilesPanel {
                 app.history_scroll += 1;
                 Some(Action::None)
             }
+            KeyCode::Left => {
+                app.active_transfer_idx = app.active_transfer_idx.saturating_sub(1);
+                Some(Action::None)
+            }
+            KeyCode::Right => {
+                app.active_transfer_idx += 1;
+                Some(Action::None)
+            }
             KeyCode::Tab => {
                 if !app.peers.is_empty() {
                     app.files_peer_idx = (app.files_peer_idx + 1) % app.peers.len();
@@ -292,7 +315,24 @@ impl Handler for FilesPanel {
                 }
                 Some(Action::None)
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('x') | KeyCode::Char('X') => {
+                // Cancel the selected active transfer
+                let active_ids: Vec<uuid::Uuid> = app.engine.transactions().active.values()
+                    .filter(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending)
+                    .map(|t| t.id)
+                    .collect();
+                if active_ids.is_empty() {
+                    return Some(Action::None);
+                }
+                let idx = app.active_transfer_idx.min(active_ids.len().saturating_sub(1));
+                let txn_id = active_ids[idx];
+                let outcome = app.engine.cancel_active_transfer(&txn_id);
+                if let Some(status) = outcome.status {
+                    return Some(Action::SetStatus(status));
+                }
+                if !outcome.actions.is_empty() {
+                    return Some(Action::EngineActions(outcome.actions));
+                }
                 Some(Action::None)
             }
             KeyCode::Char(c) => {

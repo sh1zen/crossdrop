@@ -13,7 +13,7 @@
 
 use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES, TRANSACTION_TIMEOUT};
 use crate::core::initializer::AppEvent;
-use crate::core::persistence::Persistence;
+use crate::core::persistence::{Persistence, TransferRecordSnapshot};
 use crate::core::protocol::coordinator::TransferCoordinator;
 use crate::core::security::identity::PeerIdentity;
 use crate::core::security::replay::ReplayGuard;
@@ -24,7 +24,6 @@ use crate::core::transaction::{
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -98,6 +97,11 @@ pub enum EngineAction {
         peer_id: String,
         path: String,
         is_folder: bool,
+    },
+    /// Cancel an active transfer and notify the peer.
+    CancelTransaction {
+        peer_id: String,
+        transaction_id: Uuid,
     },
 }
 
@@ -177,7 +181,8 @@ pub struct TransferRecord {
     pub display_name: String,
     pub total_size: u64,
     pub file_count: u32,
-    pub timestamp: Instant,
+    /// Absolute timestamp formatted as "dd-mm-yyyy HH:MM".
+    pub timestamp: String,
 }
 
 // ── TransferEngine ───────────────────────────────────────────────────────────
@@ -212,11 +217,24 @@ impl TransferEngine {
             .as_ref()
             .map(|id| TransferCoordinator::new(id.clone()));
 
+        // Restore transfer history from persistence
+        let transfer_history = match Persistence::load() {
+            Ok(p) => p.transfer_history.iter().map(|snap| TransferRecord {
+                direction: snap.direction,
+                peer_id: snap.peer_id.clone(),
+                display_name: snap.display_name.clone(),
+                total_size: snap.total_size,
+                file_count: snap.file_count,
+                timestamp: snap.timestamp.clone(),
+            }).collect(),
+            Err(_) => Vec::new(),
+        };
+
         Self {
             transactions: TransactionManager::new(),
             stats: DataStats::default(),
             pending_incoming: None,
-            transfer_history: Vec::new(),
+            transfer_history,
             source_paths: HashMap::new(),
             coordinator,
             identity,
@@ -267,6 +285,28 @@ impl TransferEngine {
 
     pub fn can_start_transfer(&self) -> bool {
         self.transactions.active_count() < MAX_CONCURRENT_TRANSACTIONS
+    }
+
+    /// Cancel an active or pending transfer by transaction ID.
+    /// Returns actions to notify the remote peer.
+    pub fn cancel_active_transfer(&mut self, transaction_id: &Uuid) -> EngineOutcome {
+        if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
+            let peer_id = txn.peer_id.clone();
+            let display_name = txn.display_name.clone();
+            txn.cancel();
+            info!(event = "transfer_cancelled_by_user", transaction_id = %transaction_id, name = %display_name, "User cancelled transfer");
+            self.archive_transaction(*transaction_id);
+            self.source_paths.remove(transaction_id);
+            EngineOutcome {
+                actions: vec![EngineAction::CancelTransaction {
+                    peer_id,
+                    transaction_id: *transaction_id,
+                }],
+                status: Some(format!("Cancelled: {}", display_name)),
+            }
+        } else {
+            EngineOutcome::empty()
+        }
     }
 
     // ── Manifest Security ────────────────────────────────────────────────
@@ -1397,14 +1437,31 @@ impl TransferEngine {
     /// Move a transaction from active to history and persist.
     fn archive_transaction(&mut self, txn_id: Uuid) {
         if let Some(txn) = self.transactions.get(&txn_id) {
-            self.transfer_history.push(TransferRecord {
+            let timestamp = crate::ui::helpers::format_absolute_timestamp_now();
+            let record = TransferRecord {
                 direction: txn.direction,
                 peer_id: txn.peer_id.clone(),
                 display_name: txn.display_name.clone(),
                 total_size: txn.total_size,
                 file_count: txn.total_file_count(),
-                timestamp: Instant::now(),
-            });
+                timestamp: timestamp.clone(),
+            };
+            self.transfer_history.push(record);
+
+            // Persist history record immediately
+            let snapshot = TransferRecordSnapshot {
+                direction: txn.direction,
+                peer_id: txn.peer_id.clone(),
+                display_name: txn.display_name.clone(),
+                total_size: txn.total_size,
+                file_count: txn.total_file_count(),
+                timestamp,
+            };
+            if let Ok(mut p) = Persistence::load() {
+                if let Err(e) = p.push_transfer_record(snapshot) {
+                    warn!(event = "history_persist_failure", error = %e, "Failed to persist transfer history record");
+                }
+            }
         }
         self.transactions.archive(&txn_id);
 

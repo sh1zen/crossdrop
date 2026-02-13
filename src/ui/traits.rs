@@ -58,6 +58,16 @@ pub enum Action {
     EngineActions(Vec<EngineAction>),
     /// Show a popup (e.g. file/folder offer confirmation).
     ShowPopup(UIPopup),
+    /// Persist a chat message to disk (sender, text, timestamp, target).
+    PersistChat {
+        id: String,
+        sender: crate::core::persistence::ChatSenderSnapshot,
+        text: String,
+        timestamp: String,
+        target: crate::core::persistence::ChatTargetSnapshot,
+    },
+    /// Clear persisted chat history for a target.
+    PersistClearChat(crate::core::persistence::ChatTargetSnapshot),
     None,
 }
 

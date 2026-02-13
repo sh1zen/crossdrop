@@ -1,6 +1,9 @@
 use crate::core::engine::EngineAction;
 use crate::core::initializer::{AppEvent, PeerNode};
 use crate::core::peer_registry::PeerRegistry;
+use crate::core::persistence::{
+    ChatMessageSnapshot, ChatSenderSnapshot, ChatTargetSnapshot, Persistence,
+};
 use crate::ui::helpers::{format_file_size, get_display_name, render_loading_frame};
 use crate::ui::panels::{
     ChatPanel, ConnectPanel, FilesPanel, HomePanel, IdPanel, LogsPanel, PeersPanel, RemotePanel,
@@ -102,6 +105,9 @@ pub struct UIExecuter {
 
     // Peer registry for auto-reconnection
     peer_registry: PeerRegistry,
+
+    // Chat persistence
+    persistence: Persistence,
 }
 
 pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow::Result<()> {
@@ -167,8 +173,42 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
     }
 
     let peer_id = node.peer_id();
-    let app = App::new(peer_id, ticket, args.display_name.clone());
+    let mut app = App::new(peer_id, ticket, args.display_name.clone());
+
+    // Restore persisted display name if no CLI override was provided
+    if args.display_name.is_none() {
+        if let Ok(p) = crate::core::persistence::Persistence::load() {
+            if let Some(ref name) = p.display_name {
+                if !name.is_empty() {
+                    app.display_name = name.clone();
+                    node.set_display_name(name.clone());
+                }
+            }
+        }
+    }
+
     let mut executer = UIExecuter::new(app, terminal, node.clone(), log_buffer);
+
+    // Restore chat history from persistence
+    for snap in &executer.persistence.chat_history {
+        let sender = match &snap.sender {
+            ChatSenderSnapshot::Me => MessageSender::Me,
+            ChatSenderSnapshot::Peer(id) => MessageSender::Peer(id.clone()),
+        };
+        let target = match &snap.target {
+            ChatTargetSnapshot::Room => ChatTarget::Room,
+            ChatTargetSnapshot::Peer(id) => ChatTarget::Peer(id.clone()),
+        };
+        executer.app.messages.insert(Message {
+            id: uuid::Uuid::parse_str(&snap.id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            sender,
+            text: snap.text.clone(),
+            timestamp: snap.timestamp.clone(),
+            target,
+            recipients: vec![],
+            created_at: Instant::now(),
+        });
+    }
 
     // Auto-reconnect to known peers from the registry
     {
@@ -270,6 +310,7 @@ impl UIExecuter {
         node: PeerNode,
         log_buffer: LogBuffer,
     ) -> Self {
+        let persistence = Persistence::load().unwrap_or_default();
         Self {
             app,
             terminal,
@@ -288,6 +329,7 @@ impl UIExecuter {
             remote_panel: RemotePanel::new(),
             save_path_popup: SavePathPopup::new(),
             peer_registry: PeerRegistry::load(),
+            persistence,
         }
     }
 
@@ -421,7 +463,7 @@ impl UIExecuter {
             Mode::Send => "Enter: send file/folder | Tab/Up/Down: peer | Esc: back",
             Mode::Connect => "Enter: connect | Esc: back",
             Mode::Peers => "Up/Down: navigate | d: disconnect | e/Enter: explore | Esc: back",
-            Mode::Files => "Esc: back",
+            Mode::Files => "Left/Right: select active | x: cancel transfer | Up/Down: scroll history | Esc: back",
             Mode::Logs => "Up/Down: scroll | d: clear | Esc: back",
             Mode::Id => "c: copy to clipboard | Esc: back",
             Mode::Settings => "Tab: switch focus | Enter: save | Esc: back",
@@ -526,6 +568,18 @@ impl UIExecuter {
                         }
                         Action::ShowPopup(popup) => {
                             self.context.active_popup = popup;
+                        }
+                        Action::PersistChat { id, sender, text, timestamp, target } => {
+                            let _ = self.persistence.push_chat_message(ChatMessageSnapshot {
+                                id,
+                                sender,
+                                text,
+                                timestamp,
+                                target,
+                            });
+                        }
+                        Action::PersistClearChat(target) => {
+                            let _ = self.persistence.clear_chat_target(&target);
                         }
                         Action::None => {}
                     }
@@ -1054,15 +1108,27 @@ impl UIExecuter {
                 // Clear typing indicator — peer just sent a message
                 self.app.typing.clear(&peer_id);
 
+                let msg_id = uuid::Uuid::new_v4();
+                let timestamp = crate::ui::helpers::format_timestamp_now();
+
                 // Room message
                 self.app.messages.insert(Message {
-                    id: uuid::Uuid::new_v4(),
+                    id: msg_id,
                     sender: MessageSender::Peer(peer_id.clone()),
-                    text,
-                    timestamp: crate::ui::helpers::format_timestamp_now(),
+                    text: text.clone(),
+                    timestamp: timestamp.clone(),
                     target: ChatTarget::Room,
                     recipients: vec![],
                     created_at: Instant::now(),
+                });
+
+                // Persist to disk
+                let _ = self.persistence.push_chat_message(ChatMessageSnapshot {
+                    id: msg_id.to_string(),
+                    sender: ChatSenderSnapshot::Peer(peer_id.clone()),
+                    text,
+                    timestamp,
+                    target: ChatTargetSnapshot::Room,
                 });
 
                 // Increment unread unless the user is looking at Room right now
@@ -1078,16 +1144,28 @@ impl UIExecuter {
                 // Clear typing indicator
                 self.app.typing.clear(&peer_id);
 
+                let msg_id = uuid::Uuid::new_v4();
+                let timestamp = crate::ui::helpers::format_timestamp_now();
+
                 // Peer-chat isolation: DM only appears in the dedicated peer chat
                 let target = ChatTarget::Peer(peer_id.clone());
                 self.app.messages.insert(Message {
-                    id: uuid::Uuid::new_v4(),
+                    id: msg_id,
                     sender: MessageSender::Peer(peer_id.clone()),
-                    text,
-                    timestamp: crate::ui::helpers::format_timestamp_now(),
+                    text: text.clone(),
+                    timestamp: timestamp.clone(),
                     target: target.clone(),
                     recipients: vec![],
                     created_at: Instant::now(),
+                });
+
+                // Persist to disk
+                let _ = self.persistence.push_chat_message(ChatMessageSnapshot {
+                    id: msg_id.to_string(),
+                    sender: ChatSenderSnapshot::Peer(peer_id.clone()),
+                    text,
+                    timestamp,
+                    target: ChatTargetSnapshot::Peer(peer_id.clone()),
                 });
 
                 // Increment unread unless user is viewing this exact DM
@@ -1482,6 +1560,17 @@ impl UIExecuter {
                     } else {
                         tracing::warn!("Resume: no source path for transaction {}", transaction_id);
                     }
+                }
+                EngineAction::CancelTransaction {
+                    peer_id,
+                    transaction_id,
+                } => {
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = node.send_transaction_cancel(&peer_id, transaction_id).await {
+                            tracing::error!("Failed to send cancel for {}: {}", transaction_id, e);
+                        }
+                    });
                 }
                 EngineAction::HandleRemoteFetch {
                     peer_id,

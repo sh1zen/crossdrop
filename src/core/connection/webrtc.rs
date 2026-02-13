@@ -7,6 +7,7 @@
 //! - Brotli compression before encryption (File → Compress → Encrypt → Send)
 
 use crate::core::connection::crypto::SessionKeyManager;
+use crate::core::security::message_auth::{AuthenticatedMessage, MessageAuthenticator};
 use crate::core::transaction::{ResumeInfo, TransactionManifest};
 use aes_gcm::{
     aead::{Aead, KeyInit}, Aes256Gcm,
@@ -68,6 +69,20 @@ use crate::core::config::{
 const FRAME_CONTROL: u8 = 0x01;
 const FRAME_CHUNK: u8 = 0x02;
 const FRAME_ACK: u8 = 0x03;
+
+/// Well-known channel ID used as `transaction_id` in [`AuthenticatedMessage`]
+/// for chat HMAC authentication. Provides domain separation from file-transfer
+/// HMACs which use real transaction UUIDs.
+const CHAT_HMAC_CHANNEL: Uuid = Uuid::from_bytes([
+    0xC0, 0xDE, 0xCA, 0xFE, 0x00, 0x00, 0x40, 0x00,
+    0x80, 0x00, 0x00, 0x00, 0x00, 0xC4, 0xA7, 0x01,
+]);
+
+/// Derive a separate HMAC key from the shared encryption key.
+/// Prevents key-reuse between AES-256-GCM encryption and HMAC-SHA3-256.
+fn derive_chat_hmac_key(shared_key: &[u8; 32]) -> [u8; 32] {
+    crate::utils::crypto::hmac_sha3_256(shared_key, b"crossdrop-chat-hmac-v1")
+}
 
 // ── Signaling (exchanged via Iroh, not on data channel) ──────────────────────
 
@@ -144,6 +159,10 @@ pub enum ControlMessage {
     DirectMessage(Vec<u8>),
     /// Ephemeral typing indicator (no payload needed).
     Typing,
+    /// Authenticated room chat message (HMAC + monotonic counter protected).
+    AuthenticatedText(Vec<u8>),
+    /// Authenticated direct message (HMAC + monotonic counter protected).
+    AuthenticatedDm(Vec<u8>),
     /// Key rotation: peer sends a fresh ephemeral X25519 public key.
     KeyRotation {
         ephemeral_pub: Vec<u8>,
@@ -353,6 +372,10 @@ pub struct WebRTCConnection {
     /// Pending local ephemeral keypair for an in-progress key rotation.
     pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
     _remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
+    /// Outgoing chat message counter (monotonically increasing, shared by room + DM).
+    chat_send_counter: Arc<RwLock<u64>>,
+    /// Last seen incoming chat counter (replay protection).
+    chat_recv_counter: Arc<RwLock<u64>>,
 }
 
 impl WebRTCConnection {
@@ -489,6 +512,9 @@ impl WebRTCConnection {
         let pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>> =
             Arc::new(RwLock::new(None));
 
+        let chat_send_counter = Arc::new(RwLock::new(0u64));
+        let chat_recv_counter = Arc::new(RwLock::new(0u64));
+
         let cdc = pc.create_data_channel("control", None).await?;
         let ra = Arc::new(remote_access);
         Self::attach_dc_handlers(
@@ -502,6 +528,7 @@ impl WebRTCConnection {
             ra.clone(),
             key_manager.clone(),
             pending_rotation.clone(),
+            chat_recv_counter.clone(),
         )
         .await;
         *control_channel_lock.write().await = Some(cdc);
@@ -518,6 +545,7 @@ impl WebRTCConnection {
             ra.clone(),
             key_manager.clone(),
             pending_rotation.clone(),
+            chat_recv_counter.clone(),
         )
         .await;
         *data_channel_lock.write().await = Some(ddc);
@@ -540,6 +568,8 @@ impl WebRTCConnection {
                 key_manager,
                 pending_rotation,
                 _remote_access: ra,
+                chat_send_counter,
+                chat_recv_counter,
             },
             SignalingMessage::Offer(gathered_sdp),
         ))
@@ -612,6 +642,9 @@ impl WebRTCConnection {
             let pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>> =
                 Arc::new(RwLock::new(None));
             let pending_rotation_outer = pending_rotation.clone();
+            let chat_send_counter = Arc::new(RwLock::new(0u64));
+            let chat_recv_counter = Arc::new(RwLock::new(0u64));
+            let crc = chat_recv_counter.clone();
             let sk = shared_key.clone();
             let km = key_manager.clone();
             let pr = pending_rotation.clone();
@@ -627,8 +660,9 @@ impl WebRTCConnection {
                 let sk = sk.clone();
                 let km = km.clone();
                 let pr = pr.clone();
+                let crc = crc.clone();
                 Box::pin(async move {
-                    Self::attach_dc_handlers(&dc, ss, rs, pc_chunks, ad, atx, sk, ra, km, pr).await;
+                    Self::attach_dc_handlers(&dc, ss, rs, pc_chunks, ad, atx, sk, ra, km, pr, crc).await;
                     let label = dc.label().to_string();
                     if label == "control" {
                         *cl.write().await = Some(dc);
@@ -663,6 +697,8 @@ impl WebRTCConnection {
                     key_manager,
                     pending_rotation: pending_rotation_outer,
                     _remote_access: ra_outer,
+                    chat_send_counter,
+                    chat_recv_counter,
                 },
                 SignalingMessage::Answer(gathered_sdp),
             ))
@@ -826,14 +862,32 @@ impl WebRTCConnection {
 
     // ── Public send API ──────────────────────────────────────────────────────
 
-    /// Send a chat message (encrypted) — broadcast / room.
+    /// Send a chat message (HMAC + counter authenticated, encrypted) — broadcast / room.
     pub async fn send_message(&self, bytes: Vec<u8>) -> Result<()> {
-        self.send_control(&ControlMessage::Text(bytes)).await
+        let key = *self.shared_key.read().await;
+        let hmac_key = derive_chat_hmac_key(&key);
+        let counter = {
+            let mut c = self.chat_send_counter.write().await;
+            *c += 1;
+            *c
+        };
+        let auth_msg = MessageAuthenticator::create(&hmac_key, CHAT_HMAC_CHANNEL, counter, bytes);
+        let envelope = serde_json::to_vec(&auth_msg)?;
+        self.send_control(&ControlMessage::AuthenticatedText(envelope)).await
     }
 
-    /// Send a direct (1-to-1) chat message (encrypted).
+    /// Send a direct (1-to-1) chat message (HMAC + counter authenticated, encrypted).
     pub async fn send_dm(&self, bytes: Vec<u8>) -> Result<()> {
-        self.send_control(&ControlMessage::DirectMessage(bytes)).await
+        let key = *self.shared_key.read().await;
+        let hmac_key = derive_chat_hmac_key(&key);
+        let counter = {
+            let mut c = self.chat_send_counter.write().await;
+            *c += 1;
+            *c
+        };
+        let auth_msg = MessageAuthenticator::create(&hmac_key, CHAT_HMAC_CHANNEL, counter, bytes);
+        let envelope = serde_json::to_vec(&auth_msg)?;
+        self.send_control(&ControlMessage::AuthenticatedDm(envelope)).await
     }
 
     /// Send an ephemeral typing indicator.
@@ -1069,6 +1123,18 @@ impl WebRTCConnection {
         .await
     }
 
+    pub async fn send_transaction_cancel(
+        &self,
+        transaction_id: Uuid,
+        reason: Option<String>,
+    ) -> Result<()> {
+        self.send_control(&ControlMessage::TransactionCancel {
+            transaction_id,
+            reason,
+        })
+        .await
+    }
+
     pub async fn close(&self) -> Result<()> {
         self.peer_connection.close().await?;
         Ok(())
@@ -1116,6 +1182,7 @@ impl WebRTCConnection {
         remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
         key_manager: Option<SessionKeyManager>,
         pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
+        chat_recv_counter: Arc<RwLock<u64>>,
     ) {
         let dc_clone = dc.clone();
         let ss = send_state;
@@ -1127,6 +1194,7 @@ impl WebRTCConnection {
         let km = key_manager;
         let pr = pending_rotation;
         let ra = remote_access;
+        let crc = chat_recv_counter;
 
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let ss = ss.clone();
@@ -1139,6 +1207,7 @@ impl WebRTCConnection {
             let km = km.clone();
             let pr = pr.clone();
             let ra = ra.clone();
+            let crc = crc.clone();
 
             Box::pin(async move {
                 // Decrypt
@@ -1186,6 +1255,7 @@ impl WebRTCConnection {
                                 ra.clone(),
                                 km.clone(),
                                 pr.clone(),
+                                crc.clone(),
                             )
                             .await
                             {
@@ -1287,6 +1357,7 @@ impl WebRTCConnection {
         remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
         key_manager: Option<SessionKeyManager>,
         pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
+        chat_recv_counter: Arc<RwLock<u64>>,
     ) -> Result<()> {
         let key = *shared_key.read().await;
         match msg {
@@ -1298,6 +1369,50 @@ impl WebRTCConnection {
             }
             ControlMessage::Typing => {
                 notify_app(&app_tx, ConnectionMessage::TypingReceived);
+            }
+            ControlMessage::AuthenticatedText(envelope) => {
+                let hmac_key = derive_chat_hmac_key(&key);
+                match serde_json::from_slice::<AuthenticatedMessage>(&envelope) {
+                    Ok(auth_msg) => {
+                        if !MessageAuthenticator::verify(&hmac_key, &auth_msg) {
+                            warn!(event = "chat_hmac_invalid", "Rejected room chat: HMAC verification failed");
+                            return Ok(());
+                        }
+                        let mut counter = chat_recv_counter.write().await;
+                        if auth_msg.counter <= *counter {
+                            warn!(event = "chat_replay_detected", counter = auth_msg.counter, last_seen = *counter, "Rejected room chat: replay detected");
+                            return Ok(());
+                        }
+                        *counter = auth_msg.counter;
+                        drop(counter);
+                        notify_app(&app_tx, ConnectionMessage::TextReceived(auth_msg.payload));
+                    }
+                    Err(e) => {
+                        warn!(event = "chat_auth_decode_error", error = %e, "Failed to decode authenticated room chat");
+                    }
+                }
+            }
+            ControlMessage::AuthenticatedDm(envelope) => {
+                let hmac_key = derive_chat_hmac_key(&key);
+                match serde_json::from_slice::<AuthenticatedMessage>(&envelope) {
+                    Ok(auth_msg) => {
+                        if !MessageAuthenticator::verify(&hmac_key, &auth_msg) {
+                            warn!(event = "dm_hmac_invalid", "Rejected DM: HMAC verification failed");
+                            return Ok(());
+                        }
+                        let mut counter = chat_recv_counter.write().await;
+                        if auth_msg.counter <= *counter {
+                            warn!(event = "dm_replay_detected", counter = auth_msg.counter, last_seen = *counter, "Rejected DM: replay detected");
+                            return Ok(());
+                        }
+                        *counter = auth_msg.counter;
+                        drop(counter);
+                        notify_app(&app_tx, ConnectionMessage::DmReceived(auth_msg.payload));
+                    }
+                    Err(e) => {
+                        warn!(event = "dm_auth_decode_error", error = %e, "Failed to decode authenticated DM");
+                    }
+                }
             }
             ControlMessage::DisplayName(name) => {
                 notify_app(&app_tx, ConnectionMessage::DisplayNameReceived(name));

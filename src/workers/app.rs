@@ -185,6 +185,11 @@ impl UnreadTracker {
     pub fn remove_peer(&mut self, peer_id: &str) {
         self.peers.remove(peer_id);
     }
+
+    /// Total unread messages across room + all peer DMs.
+    pub fn total(&self) -> usize {
+        self.room + self.peers.values().sum::<usize>()
+    }
 }
 
 // ── Typing State ─────────────────────────────────────────────────────────────
@@ -304,6 +309,8 @@ pub struct App {
     pub history_scroll: usize,
     pub files_peer_idx: usize,
     pub files_search: String,
+    /// Index of the selected active transfer (for cancel).
+    pub active_transfer_idx: usize,
 
     // Settings
     pub display_name: String,
@@ -358,7 +365,8 @@ impl App {
             history_scroll: 0,
             files_peer_idx: 0,
             files_search: String::new(),
-            display_name: display_name.unwrap_or_else(|| "Anonymous".to_string()),
+            active_transfer_idx: 0,
+            display_name: display_name.unwrap_or_default(),
             // Remote access is disabled by default per security spec.
             remote_access: false,
             remote_peer: None,
@@ -471,5 +479,10 @@ impl App {
     /// Count unread DM messages for a specific peer.
     pub fn unread_dm_count(&self, peer_id: &str) -> usize {
         self.unread.peer_count(peer_id)
+    }
+
+    /// Total unread messages across all chat channels.
+    pub fn total_unread(&self) -> usize {
+        self.unread.total()
     }
 }

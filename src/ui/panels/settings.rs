@@ -147,14 +147,25 @@ impl Handler for SettingsPanel {
             KeyCode::Enter => {
                 // Save display name
                 let name = app.input.trim().to_string();
-                if !name.is_empty() && name != app.display_name {
+                if name != app.display_name {
                     app.display_name = name.clone();
-                    app.set_status(format!("Display name set to: {}", name));
+                    if name.is_empty() {
+                        app.set_status("Display name cleared".to_string());
+                    } else {
+                        app.set_status(format!("Display name set to: {}", name));
+                    }
 
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        node.broadcast_display_name(name).await;
-                    });
+                    // Persist to disk
+                    if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                        let _ = p.save_display_name(&name);
+                    }
+
+                    if !name.is_empty() {
+                        let node = node.clone();
+                        tokio::spawn(async move {
+                            node.broadcast_display_name(name).await;
+                        });
+                    }
                 }
                 app.input.clear();
                 return Some(Action::SwitchMode(crate::workers::app::Mode::Home));
