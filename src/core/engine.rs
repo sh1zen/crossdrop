@@ -11,14 +11,16 @@
 //! The UI layer reads state and dispatches commands; the transport layer
 //! sends/receives raw frames. All coordination happens here.
 
-use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES, TRANSACTION_TIMEOUT};
+use crate::core::config::{
+    CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES, TRANSACTION_TIMEOUT,
+};
 use crate::core::initializer::AppEvent;
 use crate::core::persistence::{Persistence, TransferRecordSnapshot};
 use crate::core::security::identity::PeerIdentity;
 use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
-    ResumeInfo, Transaction, TransactionDirection, TransactionManifest,
-    TransactionManager, TransactionState,
+    ResumeInfo, Transaction, TransactionDirection, TransactionManager, TransactionManifest,
+    TransactionState,
 };
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -40,8 +42,6 @@ pub enum EngineAction {
         display_name: String,
         manifest: TransactionManifest,
         total_size: u64,
-        /// Source path for computing Merkle roots before sending.
-        source_path: Option<String>,
     },
     /// Send a TransactionResponse (accept / reject).
     SendTransactionResponse {
@@ -212,14 +212,18 @@ impl TransferEngine {
 
         // Restore transfer history from persistence
         let transfer_history = match Persistence::load() {
-            Ok(p) => p.transfer_history.iter().map(|snap| TransferRecord {
-                direction: snap.direction,
-                peer_id: snap.peer_id.clone(),
-                display_name: snap.display_name.clone(),
-                total_size: snap.total_size,
-                file_count: snap.file_count,
-                timestamp: snap.timestamp.clone(),
-            }).collect(),
+            Ok(p) => p
+                .transfer_history
+                .iter()
+                .map(|snap| TransferRecord {
+                    direction: snap.direction,
+                    peer_id: snap.peer_id.clone(),
+                    display_name: snap.display_name.clone(),
+                    total_size: snap.total_size,
+                    file_count: snap.file_count,
+                    timestamp: snap.timestamp.clone(),
+                })
+                .collect(),
             Err(_) => Vec::new(),
         };
 
@@ -232,11 +236,6 @@ impl TransferEngine {
             identity,
             replay_guard: ReplayGuard::new(),
         }
-    }
-
-    /// Access our peer identity.
-    pub fn identity(&self) -> Option<&PeerIdentity> {
-        self.identity.as_ref()
     }
 
     // ── Queries (read-only, for UI rendering) ────────────────────────────
@@ -315,10 +314,7 @@ impl TransferEngine {
     /// Returns true if the signature is valid or if no signature is present
     /// (backward compatibility during upgrade window).
     pub fn validate_manifest_signature(&self, manifest: &TransactionManifest) -> bool {
-        match (
-            &manifest.sender_id,
-            &manifest.signature,
-        ) {
+        match (&manifest.sender_id, &manifest.signature) {
             (Some(sender_id), Some(signature)) => {
                 // Check expiration
                 if let Some(exp) = manifest.expiration_time {
@@ -352,12 +348,8 @@ impl TransferEngine {
             .unwrap_or_default()
             .as_secs()
             + TRANSACTION_TIMEOUT.as_secs();
-        self.replay_guard.register_transaction(transaction_id, expiration);
-    }
-
-    /// Get the identity's public key (for wire messages).
-    pub fn identity_public_key(&self) -> Option<[u8; 32]> {
-        self.identity.as_ref().map(|id| id.public_key)
+        self.replay_guard
+            .register_transaction(transaction_id, expiration);
     }
 
     // ── Initiating Outbound Transfers ────────────────────────────────────
@@ -372,7 +364,12 @@ impl TransferEngine {
         file_path: &str,
     ) -> Result<EngineOutcome> {
         if !self.can_start_transfer() {
-            warn!(event = "transfer_limit_reached", active = self.transactions.active_count(), limit = MAX_CONCURRENT_TRANSACTIONS, "File send blocked: concurrent transaction limit");
+            warn!(
+                event = "transfer_limit_reached",
+                active = self.transactions.active_count(),
+                limit = MAX_CONCURRENT_TRANSACTIONS,
+                "File send blocked: concurrent transaction limit"
+            );
             return Err(anyhow!(
                 "Maximum concurrent transactions ({}) reached",
                 MAX_CONCURRENT_TRANSACTIONS
@@ -410,7 +407,6 @@ impl TransferEngine {
                 display_name: filename.to_string(),
                 manifest,
                 total_size,
-                source_path: Some(file_path.to_string()),
             }],
             status: Some(format!("Sending {}...", filename)),
         })
@@ -426,7 +422,12 @@ impl TransferEngine {
         folder_path: &str,
     ) -> Result<EngineOutcome> {
         if !self.can_start_transfer() {
-            warn!(event = "transfer_limit_reached", active = self.transactions.active_count(), limit = MAX_CONCURRENT_TRANSACTIONS, "Folder send blocked: concurrent transaction limit");
+            warn!(
+                event = "transfer_limit_reached",
+                active = self.transactions.active_count(),
+                limit = MAX_CONCURRENT_TRANSACTIONS,
+                "Folder send blocked: concurrent transaction limit"
+            );
             return Err(anyhow!(
                 "Maximum concurrent transactions ({}) reached",
                 MAX_CONCURRENT_TRANSACTIONS
@@ -470,7 +471,6 @@ impl TransferEngine {
                 display_name: dirname.to_string(),
                 manifest,
                 total_size,
-                source_path: Some(folder_path.to_string()),
             }],
             status: Some(format!("Sending folder {}...", dirname)),
         })
@@ -594,8 +594,7 @@ impl TransferEngine {
                     .active
                     .iter()
                     .filter(|(_, t)| {
-                        t.peer_id == *peer_id
-                            && t.state == TransactionState::Interrupted
+                        t.peer_id == *peer_id && t.state == TransactionState::Interrupted
                     })
                     .map(|(id, _)| *id)
                     .collect();
@@ -608,7 +607,13 @@ impl TransferEngine {
                     if let Err(e) = persistence.save() {
                         error!(event = "persistence_save_failure", error = %e, "Failed to persist transaction state on disconnect");
                     } else {
-                        info!(event = "transactions_persisted", count = txn_ids.len(), "Persisted {} transactions for peer {}", txn_ids.len(), peer_id);
+                        info!(
+                            event = "transactions_persisted",
+                            count = txn_ids.len(),
+                            "Persisted {} transactions for peer {}",
+                            txn_ids.len(),
+                            peer_id
+                        );
                     }
                 }
 
@@ -632,11 +637,9 @@ impl TransferEngine {
             }
 
             // ── File-level progress (from transport) ─────────────────────
-
             AppEvent::FileProgress {
                 file_id,
                 received_chunks,
-                total_chunks: _,
                 wire_bytes,
                 ..
             } => {
@@ -786,7 +789,6 @@ impl TransferEngine {
             }
 
             // ── Transaction-level events ─────────────────────────────────
-
             AppEvent::TransactionRequested {
                 peer_id,
                 transaction_id,
@@ -884,9 +886,7 @@ impl TransferEngine {
                             .file_order
                             .iter()
                             .filter_map(|fid| {
-                                txn.files
-                                    .get(fid)
-                                    .map(|f| (*fid, f.relative_path.clone()))
+                                txn.files.get(fid).map(|f| (*fid, f.relative_path.clone()))
                             })
                             .collect();
                         vec![EngineAction::SendFolderData {
@@ -937,9 +937,7 @@ impl TransferEngine {
                 ))
             }
 
-            AppEvent::TransactionCompleted {
-                transaction_id,
-            } => {
+            AppEvent::TransactionCompleted { transaction_id } => {
                 if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
                     let file_ids: Vec<Uuid> = txn.file_order.clone();
                     for fid in file_ids {
@@ -1002,10 +1000,9 @@ impl TransferEngine {
 
                 if let Some(txn) = self.transactions.get_active_mut(&txn_id) {
                     // Centralized validation of resume request preconditions
-                    if let Err(reason) = txn.validate_resume_request(
-                        resume_info,
-                        MAX_TRANSACTION_RETRIES as u32,
-                    ) {
+                    if let Err(reason) =
+                        txn.validate_resume_request(resume_info, MAX_TRANSACTION_RETRIES as u32)
+                    {
                         warn!(
                             event = "resume_rejected",
                             transaction_id = %txn_id,
@@ -1042,13 +1039,14 @@ impl TransferEngine {
                     }
                 } else {
                     warn!(event = "resume_rejected_unknown", transaction_id = %txn_id, "Resume rejected: transaction not found");
-                    EngineOutcome::with_status(format!("Resume rejected: unknown transaction {}", txn_id))
+                    EngineOutcome::with_status(format!(
+                        "Resume rejected: unknown transaction {}",
+                        txn_id
+                    ))
                 }
             }
 
-            AppEvent::TransactionResumeAccepted {
-                transaction_id, ..
-            } => {
+            AppEvent::TransactionResumeAccepted { transaction_id, .. } => {
                 if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
                     txn.activate();
                     let peer_id = txn.peer_id.clone();
@@ -1069,10 +1067,7 @@ impl TransferEngine {
                         let files = Self::incomplete_file_destinations(txn);
                         if !files.is_empty() {
                             return EngineOutcome {
-                                actions: vec![EngineAction::PrepareReceive {
-                                    peer_id,
-                                    files,
-                                }],
+                                actions: vec![EngineAction::PrepareReceive { peer_id, files }],
                                 status: Some("Resume accepted".to_string()),
                             };
                         }
@@ -1084,7 +1079,6 @@ impl TransferEngine {
             }
 
             // ── Remote fetch requests ────────────────────────────────────
-
             AppEvent::RemoteFetchRequest {
                 peer_id,
                 path,
@@ -1146,7 +1140,9 @@ impl TransferEngine {
             .filter(|(_, t)| {
                 t.peer_id == peer_id
                     && t.state == TransactionState::Active
-                    && !t.resumed_at.map_or(false, |at| at.elapsed() < recently_resumed_cutoff)
+                    && !t
+                        .resumed_at
+                        .map_or(false, |at| at.elapsed() < recently_resumed_cutoff)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1285,15 +1281,27 @@ impl TransferEngine {
 
         if actions.is_empty() {
             // Log WHY we found nothing — helps debug "not trying to resume"
-            let all_for_peer: Vec<_> = self.transactions.active.values()
+            let all_for_peer: Vec<_> = self
+                .transactions
+                .active
+                .values()
                 .filter(|t| t.peer_id == peer_id)
-                .map(|t| format!("{}({:?}/{:?})", &t.id.to_string()[..8], t.state, t.direction))
+                .map(|t| {
+                    format!(
+                        "{}({:?}/{:?})",
+                        &t.id.to_string()[..8],
+                        t.state,
+                        t.direction
+                    )
+                })
                 .collect();
             if all_for_peer.is_empty() {
                 info!(event = "resume_no_transactions", peer = %peer_id, "No transactions found for peer (none in memory)");
                 // Also check persistence
                 if let Ok(persistence) = Persistence::load() {
-                    let persisted: Vec<_> = persistence.transactions.keys()
+                    let persisted: Vec<_> = persistence
+                        .transactions
+                        .keys()
                         .filter(|_| true) // show all
                         .map(|id| id.to_string()[..8].to_string())
                         .collect();

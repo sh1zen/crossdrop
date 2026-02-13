@@ -156,53 +156,35 @@ The TUI launches with a home screen. Navigate between panels using the keyboard.
 
 ### CLI Options
 
-| Flag | Description |
-|------|-------------|
-| `--config <PATH>` | Path to a TOML config file |
-| `-p, --port <PORT>` | UDP port to bind (0 = auto, default: 0) |
-| `-v` | Verbosity: `-v` info, `-vv` debug, `-vvv` trace |
-| `--relay <MODE>` | `default`, `disabled`, or a custom relay URL |
-| `--display-name <NAME>` | Display name shown to peers |
-| `--remote-access` | Allow peers to browse your filesystem |
-| `--secret-file <PATH>` | Path to persistent secret key file |
-| `--show-secret` | Print secret key to stderr on startup |
-| `--ipv4-addr <ADDR>` | IPv4 socket address to bind |
-| `--ipv6-addr <ADDR>` | IPv6 socket address to bind |
-
-### Configuration File
-
-All CLI options can also be set in a TOML file. CLI values take precedence.
-
-```toml
-port = 4200
-display_name = "my-laptop"
-remote_access = false
-relay = "default"
-verbose = 1
-```
-
-Load it with:
-
-```bash
-crossdrop --config my_config.toml
-```
+| Flag                    | Description                                     |
+|-------------------------|-------------------------------------------------|
+| `--config <PATH>`       | Path to a TOML config file                      |
+| `-p, --port <PORT>`     | UDP port to bind (0 = auto, default: 0)         |
+| `-v`                    | Verbosity: `-v` info, `-vv` debug, `-vvv` trace |
+| `--relay <MODE>`        | `default`, `disabled`, or a custom relay URL    |
+| `--display-name <NAME>` | Display name shown to peers                     |
+| `--remote-access`       | Allow peers to browse your filesystem           |
+| `--secret-file <PATH>`  | Path to persistent secret key file              |
+| `--show-secret`         | Print secret key to stderr on startup           |
+| `--ipv4-addr <ADDR>`    | IPv4 socket address to bind                     |
+| `--ipv6-addr <ADDR>`    | IPv6 socket address to bind                     |
 
 ---
 
 ## TUI Panels
 
-| Panel | Key | Description |
-|-------|-----|-------------|
-| **Home** | — | Main menu with navigation to all panels |
-| **Chat** | `c` | Broadcast room + per-peer DMs with unread counters |
-| **Send** | `s` | Send files or folders to a connected peer |
-| **Connect** | `n` | Paste a peer's ticket to establish a connection |
-| **Peers** | `p` | List connected peers (online/offline status) and access remote browse |
-| **My ID** | `i` | Show and copy your connection ticket |
-| **Files** | `f` | Transfer history with search and per-peer filtering |
-| **Settings** | `o` | Change display name, toggle remote access |
-| **Logs** | `l` | Live application logs with scroll |
-| **Remote** | — | Browse a peer's filesystem (requires remote access) |
+| Panel        | Key   | Description                                                           |
+|--------------|-------|-----------------------------------------------------------------------|
+| **Home**     | —     | Main menu with navigation to all panels                               |
+| **Chat**     | `c`   | Broadcast room + per-peer DMs with unread counters                    |
+| **Send**     | `s`   | Send files or folders to a connected peer                             |
+| **Connect**  | `n`   | Paste a peer's ticket to establish a connection                       |
+| **Peers**    | `p`   | List connected peers (online/offline status) and access remote browse |
+| **My ID**    | `i`   | Show and copy your connection ticket                                  |
+| **Files**    | `f`   | Transfer history with search and per-peer filtering                   |
+| **Settings** | `o`   | Change display name, toggle remote access                             |
+| **Logs**     | `l`   | Live application logs with scroll                                     |
+| **Remote**   | —     | Browse a peer's filesystem (requires remote access)                   |
 
 ---
 
@@ -303,21 +285,21 @@ crossdrop/
 
 ### Directory Purposes
 
-| Directory | Role |
-|-----------|------|
-| `src/core/` | All networking, cryptography, and transfer logic. Zero UI dependencies. Contains the engine state machine, peer lifecycle, transport (Iroh + WebRTC), security primitives, async pipeline, and protocol coordination. |
-| `src/core/connection/` | Transport layer: Iroh endpoint management, WebRTC data channel setup, ticket encoding, and X25519 key exchange with session key rotation. |
-| `src/core/security/` | Security primitives: persistent peer identity, per-transaction sessions with nonce derivation, monotonic-counter replay protection, and HMAC-authenticated message envelopes. |
-| `src/core/pipeline/` | High-performance async multi-stage pipeline for chunked file transfers. Handles chunking, Brotli compression, AES-256-GCM encryption, Merkle trees, bitmap tracking, and backpressure. |
-| `src/core/protocol/` | Secure transfer protocol: cryptographically signed immutable manifests and the `TransferCoordinator` that integrates security, pipeline, and transaction state. |
-| `src/ui/` | Terminal UI built with Ratatui + Crossterm. Strictly a presentation layer — reads state from the engine and dispatches `EngineAction` values. No transfer or crypto logic. |
-| `src/ui/panels/` | Ten independent TUI panels, each implementing `Component` (render) and `Handler` (keyboard input) traits. |
-| `src/ui/popups/` | Modal dialog overlays (e.g., save-path selection for incoming offers). |
-| `src/ui/widgets/` | Reusable custom Ratatui widgets (progress bar). |
-| `src/ui/helpers/` | Pure formatting functions: file sizes, timestamps, display names, loading animation. |
-| `src/utils/` | Cross-cutting utilities: clipboard access, data directory management, string compression, log buffering, and shutdown signaling. |
-| `src/workers/` | Application-level state model (`App`, `Mode`, `MessageTable`, `UnreadTracker`, `TypingState`) and CLI argument parsing with TOML config merging. |
-| `~/.crossdrop/` | Runtime data directory (configurable via `--conf`): `secret.key`, `identity.key`, `transfers.json`, `peers.json`. |
+| Directory              | Role                                                                                                                                                                                                                  |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `src/core/`            | All networking, cryptography, and transfer logic. Zero UI dependencies. Contains the engine state machine, peer lifecycle, transport (Iroh + WebRTC), security primitives, async pipeline, and protocol coordination. |
+| `src/core/connection/` | Transport layer: Iroh endpoint management, WebRTC data channel setup, ticket encoding, and X25519 key exchange with session key rotation.                                                                             |
+| `src/core/security/`   | Security primitives: persistent peer identity, per-transaction sessions with nonce derivation, monotonic-counter replay protection, and HMAC-authenticated message envelopes.                                         |
+| `src/core/pipeline/`   | High-performance async multi-stage pipeline for chunked file transfers. Handles chunking, Brotli compression, AES-256-GCM encryption, Merkle trees, bitmap tracking, and backpressure.                                |
+| `src/core/protocol/`   | Secure transfer protocol: cryptographically signed immutable manifests and the `TransferCoordinator` that integrates security, pipeline, and transaction state.                                                       |
+| `src/ui/`              | Terminal UI built with Ratatui + Crossterm. Strictly a presentation layer — reads state from the engine and dispatches `EngineAction` values. No transfer or crypto logic.                                            |
+| `src/ui/panels/`       | Ten independent TUI panels, each implementing `Component` (render) and `Handler` (keyboard input) traits.                                                                                                             |
+| `src/ui/popups/`       | Modal dialog overlays (e.g., save-path selection for incoming offers).                                                                                                                                                |
+| `src/ui/widgets/`      | Reusable custom Ratatui widgets (progress bar).                                                                                                                                                                       |
+| `src/ui/helpers/`      | Pure formatting functions: file sizes, timestamps, display names, loading animation.                                                                                                                                  |
+| `src/utils/`           | Cross-cutting utilities: clipboard access, data directory management, string compression, log buffering, and shutdown signaling.                                                                                      |
+| `src/workers/`         | Application-level state model (`App`, `Mode`, `MessageTable`, `UnreadTracker`, `TypingState`) and CLI argument parsing with TOML config merging.                                                                      |
+| `~/.crossdrop/`        | Runtime data directory (configurable via `--conf`): `secret.key`, `identity.key`, `transfers.json`, `peers.json`.                                                                                                     |
 
 ---
 
@@ -555,22 +537,22 @@ Mixing the previous key into the salt ensures **forward secrecy**: compromising 
 
 ### Technology Stack
 
-| Category | Technology | Purpose |
-|----------|-----------|---------|
-| **Language** | Rust 2024 edition | Memory-safe systems programming |
-| **Async runtime** | Tokio | Async I/O, task spawning, timers, channels |
-| **P2P networking** | Iroh 0.96 | Endpoint discovery (DNS + pkarr), relay fallback, NAT traversal |
-| **Data transport** | WebRTC (webrtc 0.17) | SCTP-based data channels for direct P2P communication |
-| **Encryption** | AES-256-GCM (aes-gcm) | Authenticated encryption of all data channel frames |
-| **Key exchange** | X25519 (x25519-dalek) | Ephemeral ECDH key agreement per session |
-| **Hashing** | SHA3-256 (sha3) | Chunk hashing, Merkle trees, HMAC, identity derivation |
-| **Compression** | Brotli (brotli) | Pre-encryption frame compression (quality 4 for data, 11 for tickets) |
-| **Serialization** | Serde + serde_json, TOML | JSON for wire protocol and persistence, TOML for config |
-| **TUI** | Ratatui 0.30 + Crossterm 0.29 | Terminal rendering, raw mode, alternate screen |
-| **CLI** | Clap 4.5 (derive) | Argument parsing with TOML config merging |
-| **Logging** | tracing + tracing-subscriber | Structured logging with in-memory ring buffer |
-| **Error handling** | anyhow | Context-rich error propagation |
-| **IDs** | uuid v4 | Transaction, file, and message identifiers |
+| Category           | Technology                    | Purpose                                                               |
+|--------------------|-------------------------------|-----------------------------------------------------------------------|
+| **Language**       | Rust 2024 edition             | Memory-safe systems programming                                       |
+| **Async runtime**  | Tokio                         | Async I/O, task spawning, timers, channels                            |
+| **P2P networking** | Iroh 0.96                     | Endpoint discovery (DNS + pkarr), relay fallback, NAT traversal       |
+| **Data transport** | WebRTC (webrtc 0.17)          | SCTP-based data channels for direct P2P communication                 |
+| **Encryption**     | AES-256-GCM (aes-gcm)         | Authenticated encryption of all data channel frames                   |
+| **Key exchange**   | X25519 (x25519-dalek)         | Ephemeral ECDH key agreement per session                              |
+| **Hashing**        | SHA3-256 (sha3)               | Chunk hashing, Merkle trees, HMAC, identity derivation                |
+| **Compression**    | Brotli (brotli)               | Pre-encryption frame compression (quality 4 for data, 11 for tickets) |
+| **Serialization**  | Serde + serde_json, TOML      | JSON for wire protocol and persistence, TOML for config               |
+| **TUI**            | Ratatui 0.30 + Crossterm 0.29 | Terminal rendering, raw mode, alternate screen                        |
+| **CLI**            | Clap 4.5 (derive)             | Argument parsing with TOML config merging                             |
+| **Logging**        | tracing + tracing-subscriber  | Structured logging with in-memory ring buffer                         |
+| **Error handling** | anyhow                        | Context-rich error propagation                                        |
+| **IDs**            | uuid v4                       | Transaction, file, and message identifiers                            |
 
 ### Architectural Pattern
 
@@ -652,16 +634,6 @@ cargo test
 
 # Generate documentation
 cargo doc --open
-```
-
-The release profile in `Cargo.toml` produces a compact, optimized single binary:
-
-```toml
-[profile.release]
-strip = true          # Strip debug symbols
-lto = true            # Link-time optimization (full)
-codegen-units = 1     # Single codegen unit for maximum optimization
-panic = "abort"       # Abort on panic (smaller binary, no unwinding)
 ```
 
 **Deployment** is a single static binary with no external dependencies — copy the `crossdrop` executable to the target machine. All persistent state is stored in `~/.crossdrop/` (or the path specified via `--conf`).

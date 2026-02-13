@@ -11,4 +11,3 @@
 pub mod identity;
 pub mod message_auth;
 pub mod replay;
-pub mod session;

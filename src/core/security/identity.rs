@@ -94,16 +94,6 @@ impl PeerIdentity {
         hmac_sign(&self.secret, data)
     }
 
-    /// Create a `SignedPayload` from raw bytes.
-    pub fn sign_payload(&self, data: Vec<u8>) -> SignedPayload {
-        let signature = self.sign(&data);
-        SignedPayload {
-            data,
-            signature,
-            signer: self.public_key,
-        }
-    }
-
     /// Verify a signed payload against a known public key.
     ///
     /// **Security note**: This scheme uses HMAC(secret, data) for signing.
@@ -119,21 +109,6 @@ impl PeerIdentity {
     /// checks against the expected public key derivation.
     pub fn verify_signed(payload: &SignedPayload, expected_signer: &[u8; 32]) -> bool {
         crate::utils::crypto::constant_time_eq(&payload.signer, expected_signer)
-    }
-
-    /// Verify a signed payload when the signer's secret key is available.
-    ///
-    /// This performs **full HMAC verification**: recomputes HMAC(secret, data)
-    /// and compares using constant-time equality.  Use this when you hold the
-    /// secret (e.g. verifying your own prior signatures, or in test).
-    pub fn verify_with_secret(payload: &SignedPayload, secret: &[u8; 32]) -> bool {
-        let expected_sig = hmac_sign(secret, &payload.data);
-        crate::utils::crypto::constant_time_eq(&expected_sig, &payload.signature)
-    }
-
-    /// Secret key reference (for session key derivation).
-    pub fn secret(&self) -> &[u8; 32] {
-        &self.secret
     }
 }
 
@@ -157,7 +132,12 @@ mod tests {
     fn test_sign_and_verify() {
         let id = PeerIdentity::generate();
         let data = b"test payload";
-        let signed = id.sign_payload(data.to_vec());
+        let signature = id.sign(data);
+        let signed = SignedPayload {
+            data: data.to_vec(),
+            signature,
+            signer: id.public_key,
+        };
         assert!(PeerIdentity::verify_signed(&signed, &id.public_key));
         assert!(!PeerIdentity::verify_signed(&signed, &[0u8; 32]));
     }

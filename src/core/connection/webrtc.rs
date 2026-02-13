@@ -375,7 +375,7 @@ pub struct WebRTCConnection {
     /// Outgoing chat message counter (monotonically increasing, shared by room + DM).
     chat_send_counter: Arc<RwLock<u64>>,
     /// Last seen incoming chat counter (replay protection).
-    chat_recv_counter: Arc<RwLock<u64>>,
+    _chat_recv_counter: Arc<RwLock<u64>>,
 }
 
 impl WebRTCConnection {
@@ -576,7 +576,7 @@ impl WebRTCConnection {
                 pending_rotation,
                 _remote_access: ra,
                 chat_send_counter,
-                chat_recv_counter,
+                _chat_recv_counter: chat_recv_counter,
             },
             SignalingMessage::Offer(gathered_sdp),
         ))
@@ -719,7 +719,7 @@ impl WebRTCConnection {
                     pending_rotation: pending_rotation_outer,
                     _remote_access: ra_outer,
                     chat_send_counter,
-                    chat_recv_counter,
+                    _chat_recv_counter: chat_recv_counter,
                 },
                 SignalingMessage::Answer(gathered_sdp),
             ))

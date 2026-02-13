@@ -22,9 +22,6 @@ pub const PIPELINE_SIZE: usize = 32;
 
 // ── Safety / Abuse Prevention ────────────────────────────────────────────────
 
-/// Maximum retries per chunk before giving up.
-pub const MAX_CHUNK_RETRIES: usize = 3;
-
 /// Maximum total retries per transaction.
 pub const MAX_TRANSACTION_RETRIES: usize = 100;
 

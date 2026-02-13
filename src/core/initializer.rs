@@ -42,31 +42,31 @@ pub enum AppEvent {
     FileProgress {
         _peer_id: String,
         file_id: Uuid,
-        filename: String,
+        _filename: String,
         received_chunks: u32,
-        total_chunks: u32,
+        _total_chunks: u32,
         /// Bytes received on the wire (post-compression/encryption).
         wire_bytes: u64,
     },
     SendProgress {
         _peer_id: String,
         file_id: Uuid,
-        filename: String,
+        _filename: String,
         sent_chunks: u32,
-        total_chunks: u32,
+        _total_chunks: u32,
         /// Bytes sent on the wire (post-compression/encryption).
         wire_bytes: u64,
     },
     SendComplete {
-        peer_id: String,
+        _peer_id: String,
         file_id: Uuid,
         success: bool,
     },
     FileComplete {
-        peer_id: String,
+        _peer_id: String,
         file_id: Uuid,
         filename: String,
-        path: String,
+        _path: String,
         /// Merkle root computed from received chunk hashes.
         merkle_root: [u8; 32],
     },
@@ -138,7 +138,7 @@ struct PeerEntry {
 #[derive(Clone)]
 pub struct PeerNode {
     sos: SignalOfStop,
-    args: Args,
+    _args: Args,
     iroh: Arc<Iroh>,
     peers: Arc<Mutex<HashMap<String, PeerEntry>>>,
     /// Stores the ticket string used/generated for each peer connection.
@@ -216,10 +216,10 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             path,
             merkle_root,
         } => AppEvent::FileComplete {
-            peer_id: pid.to_string(),
+            _peer_id: pid.to_string(),
             file_id,
             filename,
-            path,
+            _path: path,
             merkle_root,
         },
         ConnectionMessage::FileProgress {
@@ -231,9 +231,9 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         } => AppEvent::FileProgress {
             _peer_id: pid.to_string(),
             file_id,
-            filename,
+            _filename: filename,
             received_chunks,
-            total_chunks,
+            _total_chunks: total_chunks,
             wire_bytes,
         },
         ConnectionMessage::SendProgress {
@@ -245,13 +245,13 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         } => AppEvent::SendProgress {
             _peer_id: pid.to_string(),
             file_id,
-            filename,
+            _filename: filename,
             sent_chunks,
-            total_chunks,
+            _total_chunks: total_chunks,
             wire_bytes,
         },
         ConnectionMessage::SendComplete { file_id, success } => AppEvent::SendComplete {
-            peer_id: pid.to_string(),
+            _peer_id: pid.to_string(),
             file_id,
             success,
         },
@@ -357,7 +357,7 @@ impl PeerNode {
 
         Ok(Self {
             sos,
-            args,
+            _args: args,
             iroh,
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
@@ -1021,7 +1021,7 @@ impl PeerNode {
                         file_id
                     );
                     let _ = self.event_tx.send(AppEvent::SendComplete {
-                        peer_id: peer_id_owned.clone(),
+                        _peer_id: peer_id_owned.clone(),
                         file_id,
                         success: false,
                     });
@@ -1044,7 +1044,7 @@ impl PeerNode {
                         // Notify engine about the failure so the transaction
                         // does not hang waiting for this file.
                         let _ = self.event_tx.send(AppEvent::SendComplete {
-                            peer_id: peer_id_owned.clone(),
+                            _peer_id: peer_id_owned.clone(),
                             file_id,
                             success: false,
                         });

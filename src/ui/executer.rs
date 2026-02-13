@@ -1377,7 +1377,6 @@ impl UIExecuter {
                     display_name,
                     mut manifest,
                     total_size,
-                    source_path,
                 } => {
                     // Merkle roots are now computed per-file during send
                     // (in send_file_resuming) — no upfront computation needed.
