@@ -1,9 +1,9 @@
+use crate::core::config::TYPING_TIMEOUT_SECS;
 use crate::core::engine::TransferEngine;
 use crate::ui::notify::NotifyManager;
 use std::collections::HashMap;
 use std::time::Instant;
 use uuid::Uuid;
-use crate::core::config::TYPING_TIMEOUT_SECS;
 
 /// Connectivity state of a peer — orthogonal to identity and chat state.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -127,7 +127,10 @@ impl MessageTable {
 
     /// All messages for a given chat target, in insertion order.
     pub fn messages_for(&self, target: &ChatTarget) -> Vec<&Message> {
-        self.messages.iter().filter(|m| &m.target == target).collect()
+        self.messages
+            .iter()
+            .filter(|m| &m.target == target)
+            .collect()
     }
 
     /// Clear messages for a target (`/clear` command).
@@ -420,7 +423,8 @@ impl App {
     /// Preserves identity, chat history, display name, and keys.
     /// Does NOT remove the peer from the list.
     pub fn set_peer_offline(&mut self, peer_id: &str) {
-        self.peer_status.insert(peer_id.to_string(), PeerStatus::Offline);
+        self.peer_status
+            .insert(peer_id.to_string(), PeerStatus::Offline);
 
         // Clean up ephemeral typing indicator
         self.typing.remove_peer(peer_id);

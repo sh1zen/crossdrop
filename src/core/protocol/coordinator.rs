@@ -10,8 +10,7 @@
 //! the manifest and security constraints.
 
 use crate::core::config::{
-    MAX_CHUNK_RETRIES, MAX_TRANSACTION_RETRIES,
-    TRANSACTION_TIMEOUT as DEFAULT_TRANSACTION_TIMEOUT,
+    MAX_CHUNK_RETRIES, MAX_TRANSACTION_RETRIES, TRANSACTION_TIMEOUT as DEFAULT_TRANSACTION_TIMEOUT,
 };
 use crate::core::pipeline::chunk::ChunkBitmap;
 use crate::core::pipeline::sender::{RetryTracker, SenderConfig};
@@ -261,10 +260,7 @@ impl TransferCoordinator {
             .ok_or_else(|| anyhow!("Unknown transaction: {}", transaction_id))?;
 
         if ctx.state != SecureTransferState::AwaitingAck {
-            return Err(anyhow!(
-                "Cannot activate transfer in state {:?}",
-                ctx.state
-            ));
+            return Err(anyhow!("Cannot activate transfer in state {:?}", ctx.state));
         }
 
         ctx.state = SecureTransferState::Active;
@@ -275,11 +271,7 @@ impl TransferCoordinator {
     // ── Manifest Authorization ───────────────────────────────────────────
 
     /// Validate that a file_id is within the manifest for a transaction.
-    pub fn validate_file_request(
-        &self,
-        transaction_id: &Uuid,
-        file_id: &Uuid,
-    ) -> Result<()> {
+    pub fn validate_file_request(&self, transaction_id: &Uuid, file_id: &Uuid) -> Result<()> {
         let ctx = self
             .transfers
             .get(transaction_id)
@@ -327,11 +319,7 @@ impl TransferCoordinator {
     }
 
     /// Validate an incoming message counter.
-    pub fn validate_counter(
-        &mut self,
-        transaction_id: &Uuid,
-        counter: u64,
-    ) -> Result<()> {
+    pub fn validate_counter(&mut self, transaction_id: &Uuid, counter: u64) -> Result<()> {
         self.replay_guard
             .validate_incoming(transaction_id, counter)
             .map_err(|e| anyhow!("Replay check failed: {}", e))
@@ -372,11 +360,7 @@ impl TransferCoordinator {
     }
 
     /// Mark a file's Merkle root as verified.
-    pub fn mark_merkle_verified(
-        &mut self,
-        transaction_id: &Uuid,
-        file_id: &Uuid,
-    ) -> Result<()> {
+    pub fn mark_merkle_verified(&mut self, transaction_id: &Uuid, file_id: &Uuid) -> Result<()> {
         let ctx = self
             .transfers
             .get_mut(transaction_id)
@@ -393,13 +377,11 @@ impl TransferCoordinator {
 
     /// Check if all files in a transaction are completed and verified.
     pub fn is_transfer_complete(&self, transaction_id: &Uuid) -> bool {
-        self.transfers
-            .get(transaction_id)
-            .is_some_and(|ctx| {
-                ctx.file_states
-                    .values()
-                    .all(|f| f.completed && f.merkle_verified)
-            })
+        self.transfers.get(transaction_id).is_some_and(|ctx| {
+            ctx.file_states
+                .values()
+                .all(|f| f.completed && f.merkle_verified)
+        })
     }
 
     /// Complete a transfer.
@@ -547,12 +529,7 @@ impl TransferCoordinator {
     // ── Retry Tracking ───────────────────────────────────────────────────
 
     /// Record a retry for a chunk. Returns false if limit exceeded.
-    pub fn record_retry(
-        &mut self,
-        transaction_id: &Uuid,
-        file_id: Uuid,
-        chunk_index: u32,
-    ) -> bool {
+    pub fn record_retry(&mut self, transaction_id: &Uuid, file_id: Uuid, chunk_index: u32) -> bool {
         self.transfers
             .get_mut(transaction_id)
             .is_some_and(|ctx| ctx.retry_tracker.record_retry(file_id, chunk_index))
@@ -654,13 +631,25 @@ mod tests {
         let session_key = [1u8; 32];
 
         let _manifest = coordinator
-            .start_transfer(txn_id, receiver_id, vec![test_manifest_entry()], None, session_key)
+            .start_transfer(
+                txn_id,
+                receiver_id,
+                vec![test_manifest_entry()],
+                None,
+                session_key,
+            )
             .unwrap();
 
-        assert_eq!(coordinator.transfer_state(&txn_id), Some(SecureTransferState::AwaitingAck));
+        assert_eq!(
+            coordinator.transfer_state(&txn_id),
+            Some(SecureTransferState::AwaitingAck)
+        );
 
         coordinator.activate_transfer(&txn_id).unwrap();
-        assert_eq!(coordinator.transfer_state(&txn_id), Some(SecureTransferState::Active));
+        assert_eq!(
+            coordinator.transfer_state(&txn_id),
+            Some(SecureTransferState::Active)
+        );
     }
 
     #[test]
@@ -676,7 +665,11 @@ mod tests {
             .unwrap();
 
         assert!(coordinator.validate_file_request(&txn_id, &file_id).is_ok());
-        assert!(coordinator.validate_file_request(&txn_id, &Uuid::new_v4()).is_err());
+        assert!(
+            coordinator
+                .validate_file_request(&txn_id, &Uuid::new_v4())
+                .is_err()
+        );
     }
 
     #[test]
@@ -686,7 +679,13 @@ mod tests {
         let txn_id = Uuid::new_v4();
 
         coordinator
-            .start_transfer(txn_id, [0u8; 32], vec![test_manifest_entry()], None, [1u8; 32])
+            .start_transfer(
+                txn_id,
+                [0u8; 32],
+                vec![test_manifest_entry()],
+                None,
+                [1u8; 32],
+            )
             .unwrap();
 
         assert_eq!(coordinator.next_counter(&txn_id), Some(1));
@@ -704,7 +703,13 @@ mod tests {
         let txn_id = Uuid::new_v4();
 
         coordinator
-            .start_transfer(txn_id, [0u8; 32], vec![test_manifest_entry()], None, [1u8; 32])
+            .start_transfer(
+                txn_id,
+                [0u8; 32],
+                vec![test_manifest_entry()],
+                None,
+                [1u8; 32],
+            )
             .unwrap();
         coordinator.activate_transfer(&txn_id).unwrap();
 
@@ -714,6 +719,9 @@ mod tests {
         // Create a new coordinator and restore
         let mut coordinator2 = TransferCoordinator::new(identity);
         coordinator2.restore_transfer(snapshot, [1u8; 32]).unwrap();
-        assert_eq!(coordinator2.transfer_state(&txn_id), Some(SecureTransferState::Resumable));
+        assert_eq!(
+            coordinator2.transfer_state(&txn_id),
+            Some(SecureTransferState::Resumable)
+        );
     }
 }

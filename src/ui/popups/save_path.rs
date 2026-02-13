@@ -142,7 +142,14 @@ impl SavePathPopup {
                 height,
                 button_focus,
                 border_color,
-                Self::build_remote_file_text(name, size_str, remote_path, save_path, is_editing, button_focus),
+                Self::build_remote_file_text(
+                    name,
+                    size_str,
+                    remote_path,
+                    save_path,
+                    is_editing,
+                    button_focus,
+                ),
                 " Request File ",
             ),
             OfferContext::RemoteFolder {
@@ -158,11 +165,17 @@ impl SavePathPopup {
                 height,
                 button_focus,
                 border_color,
-                Self::build_remote_folder_text(name, size_str, remote_path, save_path, is_editing, button_focus),
+                Self::build_remote_folder_text(
+                    name,
+                    size_str,
+                    remote_path,
+                    save_path,
+                    is_editing,
+                    button_focus,
+                ),
                 " Request Folder ",
             ),
         };
-
 
         let popup_area = Rect {
             x: area.width / 4,
@@ -192,7 +205,11 @@ impl SavePathPopup {
         Self::build_buttons_with_labels(button_focus, " Request ", " Cancel ")
     }
 
-    fn build_buttons_with_labels(button_focus: usize, accept_label: &str, cancel_label: &str) -> Vec<Span<'static>> {
+    fn build_buttons_with_labels(
+        button_focus: usize,
+        accept_label: &str,
+        cancel_label: &str,
+    ) -> Vec<Span<'static>> {
         let download_style = if button_focus == 0 {
             Style::default()
                 .fg(Color::Black)
@@ -268,10 +285,7 @@ impl SavePathPopup {
         if let Some(dir) = parent_dir {
             lines.push(Line::from(vec![
                 Span::styled("  Folder: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    dir.to_string(),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(dir.to_string(), Style::default().fg(Color::Yellow)),
             ]));
         }
 
@@ -286,7 +300,10 @@ impl SavePathPopup {
             Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
         ]));
 
-        lines.push(Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            hint_text,
+            Style::default().fg(Color::DarkGray),
+        )));
         lines.push(Line::from(""));
         lines.push(Line::from(Self::build_buttons(button_focus)));
 
@@ -348,7 +365,10 @@ impl SavePathPopup {
                 Span::styled(save_path.to_string(), path_style),
                 Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
             ]),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            )),
             Line::from(""),
             Line::from(Self::build_request_buttons(button_focus)),
         ]
@@ -409,7 +429,10 @@ impl SavePathPopup {
                 Span::styled(save_path.to_string(), path_style),
                 Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
             ]),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            )),
             Line::from(""),
             Line::from(Self::build_request_buttons(button_focus)),
         ]

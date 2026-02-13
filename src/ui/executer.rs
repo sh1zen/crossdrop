@@ -74,9 +74,17 @@ impl UIContext {
 /// Buttons are indexed 0, 1, 2 in a circular sequence.
 fn cycle_focus(current: usize, forward: bool) -> usize {
     if forward {
-        match current { 0 => 1, 1 => 2, _ => 0 }
+        match current {
+            0 => 1,
+            1 => 2,
+            _ => 0,
+        }
     } else {
-        match current { 0 => 2, 1 => 0, _ => 1 }
+        match current {
+            0 => 2,
+            1 => 0,
+            _ => 1,
+        }
     }
 }
 
@@ -210,24 +218,56 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
         });
     }
 
+    // Seed peer list from registry so saved offline peers are visible
+    for record in executer.peer_registry.all_peers() {
+        if !record.removed {
+            if let Some(ref name) = record.display_name {
+                executer
+                    .app
+                    .peer_names
+                    .insert(record.peer_id.clone(), name.clone());
+            }
+            if !executer.app.peers.contains(&record.peer_id) {
+                executer.app.peers.push(record.peer_id.clone());
+                executer.app.peer_status.insert(
+                    record.peer_id.clone(),
+                    crate::workers::app::PeerStatus::Offline,
+                );
+            }
+        }
+    }
+
     // Auto-reconnect to known peers from the registry
     {
-        let peers_to_reconnect: Vec<_> = executer.peer_registry.reconnectable_peers()
+        let peers_to_reconnect: Vec<_> = executer
+            .peer_registry
+            .reconnectable_peers()
             .into_iter()
             .map(|p| (p.peer_id.clone(), p.ticket.clone(), p.display_name.clone()))
             .collect();
 
         if !peers_to_reconnect.is_empty() {
-            info!(event = "auto_reconnect_start", count = peers_to_reconnect.len(), "Attempting to reconnect to known peers");
+            info!(
+                event = "auto_reconnect_start",
+                count = peers_to_reconnect.len(),
+                "Attempting to reconnect to known peers"
+            );
             executer.app.set_status(format!(
                 "Resuming {} connection{}...",
                 peers_to_reconnect.len(),
-                if peers_to_reconnect.len() == 1 { "" } else { "s" }
+                if peers_to_reconnect.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
             for (peer_id, ticket, display_name) in peers_to_reconnect {
                 // Pre-populate display name if we have one from last session
                 if let Some(name) = &display_name {
-                    executer.app.peer_names.insert(peer_id.clone(), name.clone());
+                    executer
+                        .app
+                        .peer_names
+                        .insert(peer_id.clone(), name.clone());
                 }
                 let node_clone = node.clone();
                 let pid = peer_id.clone();
@@ -243,7 +283,10 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
 
                     for attempt in 0..=MAX_RETRIES {
                         if attempt > 0 {
-                            let delay = RETRY_DELAYS.get((attempt - 1) as usize).copied().unwrap_or(30);
+                            let delay = RETRY_DELAYS
+                                .get((attempt - 1) as usize)
+                                .copied()
+                                .unwrap_or(30);
                             info!(
                                 event = "auto_reconnect_retry",
                                 peer = %crate::core::initializer::short_id_pub(&pid),
@@ -468,7 +511,9 @@ impl UIExecuter {
             Mode::Send => "Enter: send file/folder | Tab/Up/Down: peer | Esc: back",
             Mode::Connect => "Enter: connect | Esc: back",
             Mode::Peers => "Up/Down: navigate | d: disconnect | e/Enter: explore | Esc: back",
-            Mode::Files => "Left/Right: select active | x: cancel transfer | Up/Down: scroll history | Esc: back",
+            Mode::Files => {
+                "Left/Right: select active | x: cancel transfer | Up/Down: scroll history | Esc: back"
+            }
             Mode::Logs => "Up/Down: scroll | d: clear | Esc: back",
             Mode::Id => "c: copy to clipboard | Esc: back",
             Mode::Settings => "Tab: switch focus | Enter: save | Esc: back",
@@ -513,7 +558,10 @@ impl UIExecuter {
                 Style::default().fg(Color::DarkGray),
             ),
             // Show compression ratio if meaningful data has been transferred
-            if stats.raw_bytes_sent > 0 && stats.bytes_sent > 0 && stats.raw_bytes_sent != stats.bytes_sent {
+            if stats.raw_bytes_sent > 0
+                && stats.bytes_sent > 0
+                && stats.raw_bytes_sent != stats.bytes_sent
+            {
                 Span::styled(
                     format!(
                         "  | ratio: {:.0}%",
@@ -574,7 +622,13 @@ impl UIExecuter {
                         Action::ShowPopup(popup) => {
                             self.context.active_popup = popup;
                         }
-                        Action::PersistChat { id, sender, text, timestamp, target } => {
+                        Action::PersistChat {
+                            id,
+                            sender,
+                            text,
+                            timestamp,
+                            target,
+                        } => {
                             let _ = self.persistence.push_chat_message(ChatMessageSnapshot {
                                 id,
                                 sender,
@@ -585,6 +639,42 @@ impl UIExecuter {
                         }
                         Action::PersistClearChat(target) => {
                             let _ = self.persistence.clear_chat_target(&target);
+                        }
+                        Action::RemoveSavedPeer(peer_id) => {
+                            let display = crate::ui::helpers::get_display_name(&self.app, &peer_id);
+                            self.app.remove_peer(&peer_id);
+                            self.peer_registry.remove_single(&peer_id);
+                            self.app
+                                .notify
+                                .warn(format!("Removed saved peer: {}", display));
+                        }
+                        Action::ClearSavedPeers => {
+                            // Disconnect all online peers first
+                            let online_peers: Vec<String> = self
+                                .app
+                                .peers
+                                .iter()
+                                .filter(|p| self.app.is_peer_online(p))
+                                .cloned()
+                                .collect();
+                            for peer_id in &online_peers {
+                                let node_c = node.clone();
+                                let pid = peer_id.clone();
+                                tokio::spawn(async move {
+                                    node_c.remove_peer(&pid).await;
+                                });
+                            }
+                            // Remove all peers from UI state
+                            let all_peers: Vec<String> = self.app.peers.drain(..).collect();
+                            for pid in &all_peers {
+                                self.app.peer_status.remove(pid);
+                                self.app.peer_names.remove(pid);
+                                self.app.peer_keys.remove(pid);
+                            }
+                            self.app.selected_peer_idx = 0;
+                            // Clear the registry
+                            self.peer_registry.clear();
+                            self.app.notify.warn("Cleared all saved peers".to_string());
                         }
                         Action::None => {}
                     }
@@ -651,7 +741,10 @@ impl UIExecuter {
                     let save_path = req.save_path_input.clone();
                     let peer_display = get_display_name(&self.app, &peer_id).to_string();
                     tokio::spawn(async move {
-                        match node.fetch_remote_path_with_dest(&peer_id, remote_path, false, save_path).await {
+                        match node
+                            .fetch_remote_path_with_dest(&peer_id, remote_path, false, save_path)
+                            .await
+                        {
                             Ok(()) => {
                                 tracing::debug!(
                                     "Remote file '{}' requested from {}",
@@ -669,7 +762,9 @@ impl UIExecuter {
                             }
                         }
                     });
-                    self.app.notify.info(format!("Requesting: {}", req.filename));
+                    self.app
+                        .notify
+                        .info(format!("Requesting: {}", req.filename));
                 } else {
                     self.app.notify.warn(format!("Cancelled: {}", req.filename));
                 }
@@ -738,7 +833,10 @@ impl UIExecuter {
                     let remote_path = req.remote_path.clone();
                     let save_path = req.save_path_input.clone();
                     tokio::spawn(async move {
-                        match node.fetch_remote_path_with_dest(&peer_id, remote_path, true, save_path).await {
+                        match node
+                            .fetch_remote_path_with_dest(&peer_id, remote_path, true, save_path)
+                            .await
+                        {
                             Ok(()) => {
                                 tracing::debug!("Remote folder '{}' requested", dirname);
                             }
@@ -942,7 +1040,11 @@ impl UIExecuter {
         // Closed → Disconnected, which arrives here AFTER the new connection is already
         // established. We must skip the entire event (including engine processing) to
         // avoid transitioning Active transactions back to Resumable.
-        if let AppEvent::PeerDisconnected { ref peer_id, explicit } = event {
+        if let AppEvent::PeerDisconnected {
+            ref peer_id,
+            explicit,
+        } = event
+        {
             if !explicit && node.is_peer_connected(peer_id).await {
                 debug!(event = "stale_disconnect_ignored", peer = %crate::core::initializer::short_id_pub(peer_id), "Ignoring stale PeerDisconnected — peer has an active connection");
                 return;
@@ -998,7 +1100,8 @@ impl UIExecuter {
                         actions = action_count,
                         "Executing resume actions"
                     );
-                    self.execute_engine_actions(node, resume_outcome.actions).await;
+                    self.execute_engine_actions(node, resume_outcome.actions)
+                        .await;
                 }
 
                 info!(event = "peer_online", peer = %crate::core::initializer::short_id_pub(&peer_id), "Peer state: offline → online");
@@ -1054,7 +1157,8 @@ impl UIExecuter {
                                 };
 
                                 for attempt in 0..MAX_RETRIES {
-                                    let delay = RETRY_DELAYS.get(attempt as usize).copied().unwrap_or(30);
+                                    let delay =
+                                        RETRY_DELAYS.get(attempt as usize).copied().unwrap_or(30);
                                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
 
                                     // Check if already reconnected (another inbound
@@ -1195,10 +1299,9 @@ impl UIExecuter {
                     // Store save path for auto-accept: "REMOTE_SAVE_PATH:peer_id:path"
                     let rest = msg.trim_start_matches("REMOTE_SAVE_PATH:");
                     if let Some((peer_id, save_path)) = rest.split_once(':') {
-                        self.app.pending_remote_save_paths.insert(
-                            peer_id.to_string(),
-                            save_path.to_string(),
-                        );
+                        self.app
+                            .pending_remote_save_paths
+                            .insert(peer_id.to_string(), save_path.to_string());
                     }
                 } else {
                     self.app.set_status(msg);
@@ -1252,17 +1355,7 @@ impl UIExecuter {
             }
 
             // Transfer events — already processed by engine.process_event() above
-            AppEvent::SendProgress { .. }
-            | AppEvent::SendComplete { .. }
-            | AppEvent::FileProgress { .. }
-            | AppEvent::FileComplete { .. }
-            | AppEvent::TransactionAccepted { .. }
-            | AppEvent::TransactionRejected { .. }
-            | AppEvent::TransactionCompleted { .. }
-            | AppEvent::TransactionCancelled { .. }
-            | AppEvent::TransactionResumeRequested { .. }
-            | AppEvent::TransactionResumeAccepted { .. }
-            | AppEvent::RemoteFetchRequest { .. } => {
+            _ => {
                 // Already processed by engine.process_event() above
             }
         }
@@ -1286,27 +1379,11 @@ impl UIExecuter {
                     total_size,
                     source_path,
                 } => {
-                    // Compute Merkle roots for all files before sending the manifest.
-                    // This pre-commits the integrity data so the receiver can verify.
-                    if let Some(ref src) = source_path {
-                        use crate::core::pipeline::merkle::compute_file_merkle_root;
-                        let src_path = std::path::Path::new(src);
-                        let is_folder = manifest.parent_dir.is_some();
-                        for entry in &mut manifest.files {
-                            let file_path = if is_folder {
-                                // For folders, source_path is the folder root's parent
-                                src_path.parent().unwrap_or(src_path).join(&entry.relative_path)
-                            } else {
-                                src_path.to_path_buf()
-                            };
-                            if let Ok(data) = tokio::fs::read(&file_path).await {
-                                let root = compute_file_merkle_root(&data, crate::core::config::CHUNK_SIZE);
-                                entry.merkle_root = Some(root);
-                            }
-                        }
-                        // Re-sign the manifest now that Merkle roots are populated
-                        self.app.engine.sign_manifest(&mut manifest);
-                    }
+                    // Merkle roots are now computed per-file during send
+                    // (in send_file_resuming) — no upfront computation needed.
+                    // Sign the manifest (without merkle roots; the sender's
+                    // per-file Merkle root is sent alongside the Hash message).
+                    self.app.engine.sign_manifest(&mut manifest);
 
                     let node = node.clone();
                     let event_tx = node.event_tx().clone();
@@ -1326,9 +1403,10 @@ impl UIExecuter {
                                 transaction_id,
                                 e
                             );
-                            let _ = event_tx.send(AppEvent::Error(
-                                format!("Failed to send transfer request: {}", e),
-                            ));
+                            let _ = event_tx.send(AppEvent::Error(format!(
+                                "Failed to send transfer request: {}",
+                                e
+                            )));
                         }
                     });
                 }
@@ -1365,11 +1443,7 @@ impl UIExecuter {
                     // This prevents a race where the sender starts sending
                     // Metadata frames before we have registered where to save.
                     if let Err(e) = node.prepare_file_reception(&peer_id, files).await {
-                        tracing::error!(
-                            "Failed to prepare file reception for {}: {}",
-                            peer_id,
-                            e
-                        );
+                        tracing::error!("Failed to prepare file reception for {}: {}", peer_id, e);
                     }
                 }
                 EngineAction::SendFileData {
@@ -1388,9 +1462,10 @@ impl UIExecuter {
                             .await
                         {
                             tracing::error!("File send error for {}: {}", filename, e);
-                            let _ = event_tx.send(AppEvent::Error(
-                                format!("File send failed ({}): {}", filename, e),
-                            ));
+                            let _ = event_tx.send(AppEvent::Error(format!(
+                                "File send failed ({}): {}",
+                                filename, e
+                            )));
                         }
                     });
                 }
@@ -1410,9 +1485,8 @@ impl UIExecuter {
                             .await
                         {
                             tracing::error!("Folder send error: {}", e);
-                            let _ = event_tx.send(AppEvent::Error(
-                                format!("Folder send failed: {}", e),
-                            ));
+                            let _ = event_tx
+                                .send(AppEvent::Error(format!("Folder send failed: {}", e)));
                         }
                     });
                 }
@@ -1426,7 +1500,11 @@ impl UIExecuter {
                             .send_transaction_complete(&peer_id, transaction_id)
                             .await
                         {
-                            tracing::error!("Failed to send completion for {}: {}", transaction_id, e);
+                            tracing::error!(
+                                "Failed to send completion for {}: {}",
+                                transaction_id,
+                                e
+                            );
                         }
                     });
                 }
@@ -1440,12 +1518,19 @@ impl UIExecuter {
                         // The resume request can arrive via the data channel
                         // before the connection setup has finished registering
                         // the peer.
-                        if !node.wait_for_peer(&peer_id, std::time::Duration::from_secs(5)).await {
-                            tracing::error!("Failed to accept resume: peer {} not connected after wait", peer_id);
+                        if !node
+                            .wait_for_peer(&peer_id, std::time::Duration::from_secs(5))
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to accept resume: peer {} not connected after wait",
+                                peer_id
+                            );
                             return;
                         }
-                        if let Err(e) =
-                            node.accept_transaction_resume(&peer_id, transaction_id).await
+                        if let Err(e) = node
+                            .accept_transaction_resume(&peer_id, transaction_id)
+                            .await
                         {
                             tracing::error!("Failed to accept resume: {}", e);
                         }
@@ -1510,19 +1595,29 @@ impl UIExecuter {
 
                     if let Some((Some(source_path), file_entries, is_folder)) = txn_data {
                         if file_entries.is_empty() {
-                            tracing::info!("Resume: all files already complete for {}", transaction_id);
+                            tracing::info!(
+                                "Resume: all files already complete for {}",
+                                transaction_id
+                            );
                         } else if is_folder {
                             // Folder resume: re-send incomplete files from the beginning.
                             let node = node.clone();
                             let event_tx = node.event_tx().clone();
                             tracing::info!(
                                 "Resume: re-sending {} folder files for {} (from chunk 0)",
-                                file_entries.len(), transaction_id
+                                file_entries.len(),
+                                transaction_id
                             );
                             tokio::spawn(async move {
                                 // Wait for the peer to appear in the connection map.
-                                if !node.wait_for_peer(&peer_id, std::time::Duration::from_secs(5)).await {
-                                    tracing::error!("Resume folder send error: peer {} not connected after wait", peer_id);
+                                if !node
+                                    .wait_for_peer(&peer_id, std::time::Duration::from_secs(5))
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Resume folder send error: peer {} not connected after wait",
+                                        peer_id
+                                    );
                                     return;
                                 }
                                 if let Err(e) = node
@@ -1530,9 +1625,10 @@ impl UIExecuter {
                                     .await
                                 {
                                     tracing::error!("Resume folder send error: {}", e);
-                                    let _ = event_tx.send(AppEvent::Error(
-                                        format!("Resume folder send failed: {}", e),
-                                    ));
+                                    let _ = event_tx.send(AppEvent::Error(format!(
+                                        "Resume folder send failed: {}",
+                                        e
+                                    )));
                                 }
                             });
                         } else {
@@ -1542,22 +1638,34 @@ impl UIExecuter {
                                 let event_tx = node.event_tx().clone();
                                 tracing::info!(
                                     "Resume: re-sending file '{}' for {} (from chunk 0)",
-                                    filename, transaction_id
+                                    filename,
+                                    transaction_id
                                 );
                                 tokio::spawn(async move {
                                     // Wait for the peer to appear in the connection map.
-                                    if !node.wait_for_peer(&peer_id, std::time::Duration::from_secs(5)).await {
-                                        tracing::error!("Resume file send error: peer {} not connected after wait", peer_id);
+                                    if !node
+                                        .wait_for_peer(&peer_id, std::time::Duration::from_secs(5))
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Resume file send error: peer {} not connected after wait",
+                                            peer_id
+                                        );
                                         return;
                                     }
                                     if let Err(e) = node
                                         .send_file_data(&peer_id, file_id, &source_path, &filename)
                                         .await
                                     {
-                                        tracing::error!("Resume file send error for {}: {}", filename, e);
-                                        let _ = event_tx.send(AppEvent::Error(
-                                            format!("Resume file send failed ({}): {}", filename, e),
-                                        ));
+                                        tracing::error!(
+                                            "Resume file send error for {}: {}",
+                                            filename,
+                                            e
+                                        );
+                                        let _ = event_tx.send(AppEvent::Error(format!(
+                                            "Resume file send failed ({}): {}",
+                                            filename, e
+                                        )));
                                     }
                                 });
                             }
@@ -1572,7 +1680,8 @@ impl UIExecuter {
                 } => {
                     let node = node.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = node.send_transaction_cancel(&peer_id, transaction_id).await {
+                        if let Err(e) = node.send_transaction_cancel(&peer_id, transaction_id).await
+                        {
                             tracing::error!("Failed to send cancel for {}: {}", transaction_id, e);
                         }
                     });
@@ -1589,7 +1698,11 @@ impl UIExecuter {
                                 if files.is_empty() {
                                     tracing::warn!("Remote fetch: folder '{}' is empty", path);
                                 } else {
-                                    match self.app.engine.initiate_folder_send(&peer_id, &dirname, files, &path) {
+                                    match self
+                                        .app
+                                        .engine
+                                        .initiate_folder_send(&peer_id, &dirname, files, &path)
+                                    {
                                         Ok(outcome) => {
                                             if let Some(status) = outcome.status {
                                                 self.app.notify.info(status);
@@ -1599,13 +1712,21 @@ impl UIExecuter {
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::error!("Remote fetch: failed to initiate folder send for '{}': {}", path, e);
+                                            tracing::error!(
+                                                "Remote fetch: failed to initiate folder send for '{}': {}",
+                                                path,
+                                                e
+                                            );
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
-                                tracing::error!("Remote fetch: failed to read folder metadata for '{}': {}", path, e);
+                                tracing::error!(
+                                    "Remote fetch: failed to read folder metadata for '{}': {}",
+                                    path,
+                                    e
+                                );
                             }
                         }
                     } else {
@@ -1616,7 +1737,11 @@ impl UIExecuter {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| "file".to_string());
-                                match self.app.engine.initiate_file_send(&peer_id, &filename, filesize, &path) {
+                                match self
+                                    .app
+                                    .engine
+                                    .initiate_file_send(&peer_id, &filename, filesize, &path)
+                                {
                                     Ok(outcome) => {
                                         if let Some(status) = outcome.status {
                                             self.app.notify.info(status);
@@ -1626,12 +1751,20 @@ impl UIExecuter {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::error!("Remote fetch: failed to initiate file send for '{}': {}", path, e);
+                                        tracing::error!(
+                                            "Remote fetch: failed to initiate file send for '{}': {}",
+                                            path,
+                                            e
+                                        );
                                     }
                                 }
                             }
                             Err(e) => {
-                                tracing::error!("Remote fetch: failed to read file metadata for '{}': {}", path, e);
+                                tracing::error!(
+                                    "Remote fetch: failed to read file metadata for '{}': {}",
+                                    path,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1643,7 +1776,9 @@ impl UIExecuter {
 
 /// Collect folder file metadata (relative paths + sizes) without reading file contents.
 /// Returns `(dirname, Vec<(relative_path, filesize)>)`.
-async fn collect_folder_metadata(folder_path: &str) -> anyhow::Result<(String, Vec<(String, u64)>)> {
+async fn collect_folder_metadata(
+    folder_path: &str,
+) -> anyhow::Result<(String, Vec<(String, u64)>)> {
     use std::path::Path;
 
     let root = Path::new(folder_path).to_path_buf();

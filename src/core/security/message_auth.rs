@@ -56,16 +56,9 @@ impl MessageAuthenticator {
     }
 
     /// Verify an authenticated message.
-    pub fn verify(
-        session_key: &[u8; 32],
-        msg: &AuthenticatedMessage,
-    ) -> bool {
-        let expected = Self::compute_hmac(
-            session_key,
-            &msg.transaction_id,
-            msg.counter,
-            &msg.payload,
-        );
+    pub fn verify(session_key: &[u8; 32], msg: &AuthenticatedMessage) -> bool {
+        let expected =
+            Self::compute_hmac(session_key, &msg.transaction_id, msg.counter, &msg.payload);
         constant_time_eq(&expected, &msg.hmac)
     }
 }

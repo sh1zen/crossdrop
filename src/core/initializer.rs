@@ -210,7 +210,12 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         ConnectionMessage::TypingReceived => AppEvent::TypingReceived {
             peer_id: pid.to_string(),
         },
-        ConnectionMessage::FileSaved { file_id, filename, path, merkle_root } => AppEvent::FileComplete {
+        ConnectionMessage::FileSaved {
+            file_id,
+            filename,
+            path,
+            merkle_root,
+        } => AppEvent::FileComplete {
             peer_id: pid.to_string(),
             file_id,
             filename,
@@ -264,13 +269,11 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         ConnectionMessage::RemoteAccessDisabled => AppEvent::RemoteAccessDisabled {
             peer_id: pid.to_string(),
         },
-        ConnectionMessage::RemoteFetchRequest { path, is_folder } => {
-            AppEvent::RemoteFetchRequest {
-                peer_id: pid.to_string(),
-                path,
-                is_folder,
-            }
-        }
+        ConnectionMessage::RemoteFetchRequest { path, is_folder } => AppEvent::RemoteFetchRequest {
+            peer_id: pid.to_string(),
+            path,
+            is_folder,
+        },
 
         // ── Transaction-level events ─────────────────────────────────────
         ConnectionMessage::TransactionRequested {
@@ -492,22 +495,22 @@ impl PeerNode {
         self.connecting_notify(&peer_id, "Exchanging encryption key...");
 
         // ECDH key exchange: offerer side
-        let key_manager =
-            crate::core::connection::crypto::handshake_offerer(
-                &mut send_stream,
-                &mut recv_stream,
-                &self.public_key,
-                &connection.remote_id(),
-            )
-                .await
-                .context("ECDH handshake failed (offerer)")?;
+        let key_manager = crate::core::connection::crypto::handshake_offerer(
+            &mut send_stream,
+            &mut recv_stream,
+            &self.public_key,
+            &connection.remote_id(),
+        )
+        .await
+        .context("ECDH handshake failed (offerer)")?;
 
         let shared_key = key_manager.inner();
 
         self.connecting_notify(&peer_id, "ECDH handshake complete, session key derived");
 
         let last_pong = Arc::new(Mutex::new(Instant::now()));
-        let conn_tx = Self::create_connection_tx(peer_id.clone(), self.event_tx.clone(), last_pong.clone());
+        let conn_tx =
+            Self::create_connection_tx(peer_id.clone(), self.event_tx.clone(), last_pong.clone());
 
         self.connecting_notify(&peer_id, "Creating WebRTC offer...");
 
@@ -594,9 +597,12 @@ impl PeerNode {
             let pid = peer_id.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(crate::core::connection::crypto::KEY_ROTATION_INTERVAL).await;
+                    tokio::time::sleep(crate::core::connection::crypto::KEY_ROTATION_INTERVAL)
+                        .await;
                     match wc.initiate_key_rotation().await {
-                        Ok(()) => info!(event = "key_rotation_scheduled", peer = %short_id(&pid), "Hourly key rotation initiated"),
+                        Ok(()) => {
+                            info!(event = "key_rotation_scheduled", peer = %short_id(&pid), "Hourly key rotation initiated")
+                        }
                         Err(e) => {
                             warn!(event = "key_rotation_failed", peer = %short_id(&pid), error = %e, "Key rotation failed");
                             break;
@@ -607,7 +613,10 @@ impl PeerNode {
         }
 
         // Store the ticket used for this outbound connection
-        self.peer_tickets.lock().await.insert(peer_id.clone(), ticket_str);
+        self.peer_tickets
+            .lock()
+            .await
+            .insert(peer_id.clone(), ticket_str);
 
         tracing::info!("Peer connected: {}", peer_id);
         self.connecting_notify(&peer_id, "Peer fully connected!");
@@ -644,15 +653,14 @@ impl PeerNode {
                 .context("Failed to accept handshake stream")?;
 
         // ECDH key exchange: answerer side
-        let key_manager =
-            crate::core::connection::crypto::handshake_answerer(
-                &mut send_stream,
-                &mut recv_stream,
-                &self.public_key,
-                &connection.remote_id(),
-            )
-                .await
-                .context("ECDH handshake failed (answerer)")?;
+        let key_manager = crate::core::connection::crypto::handshake_answerer(
+            &mut send_stream,
+            &mut recv_stream,
+            &self.public_key,
+            &connection.remote_id(),
+        )
+        .await
+        .context("ECDH handshake failed (answerer)")?;
 
         let shared_key = key_manager.inner();
 
@@ -673,7 +681,8 @@ impl PeerNode {
 
         let offer_msg: SignalingMessage = serde_json::from_slice(&offer_data)?;
         let last_pong = Arc::new(Mutex::new(Instant::now()));
-        let conn_tx = Self::create_connection_tx(peer_id.clone(), self.event_tx.clone(), last_pong.clone());
+        let conn_tx =
+            Self::create_connection_tx(peer_id.clone(), self.event_tx.clone(), last_pong.clone());
 
         let (webrtc_conn, answer_msg) = WebRTCConnection::accept_offer(
             offer_msg,
@@ -728,8 +737,13 @@ impl PeerNode {
         self.spawn_heartbeat(peer_id.clone(), webrtc_conn, last_pong);
 
         // Generate a minimal ticket from the inbound peer's NodeId for future reconnection
-        if let Some(ticket) = crate::core::peer_registry::PeerRegistry::ticket_from_node_id(&peer_id) {
-            self.peer_tickets.lock().await.insert(peer_id.clone(), ticket);
+        if let Some(ticket) =
+            crate::core::peer_registry::PeerRegistry::ticket_from_node_id(&peer_id)
+        {
+            self.peer_tickets
+                .lock()
+                .await
+                .insert(peer_id.clone(), ticket);
         }
 
         tracing::info!(event = "peer_connected", peer = %short_id(&peer_id), direction = "inbound", "Peer connected (inbound)");
@@ -793,10 +807,7 @@ impl PeerNode {
             .get(peer_id)
             .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?;
         tracing::debug!("Sending DM (direct) to {}: {}", peer_id, message);
-        entry
-            .connection
-            .send_dm(message.as_bytes().to_vec())
-            .await
+        entry.connection.send_dm(message.as_bytes().to_vec()).await
     }
 
     /// Send a typing indicator to a specific peer.
@@ -905,7 +916,7 @@ impl PeerNode {
         folder_path: &str,
         file_entries: Vec<(Uuid, String)>, // (file_id, relative_path)
     ) -> Result<()> {
-        use crate::core::config::{MAX_PREFETCH_FILES, MAX_PREFETCH_BYTES};
+        use crate::core::config::{MAX_PREFETCH_BYTES, MAX_PREFETCH_FILES};
 
         let root = std::path::Path::new(folder_path);
         let root_parent = root.parent().unwrap_or(root);
@@ -1023,10 +1034,7 @@ impl PeerNode {
                         len,
                         file_id
                     );
-                    if let Err(e) = conn
-                        .send_file(file_id, data, relative_path.as_str())
-                        .await
-                    {
+                    if let Err(e) = conn.send_file(file_id, data, relative_path.as_str()).await {
                         tracing::error!(
                             "Failed to send file '{}' [file_id={}]: {}",
                             relative_path,
@@ -1145,11 +1153,7 @@ impl PeerNode {
     }
 
     /// Send a TransactionCancel to the peer.
-    pub async fn send_transaction_cancel(
-        &self,
-        peer_id: &str,
-        transaction_id: Uuid,
-    ) -> Result<()> {
+    pub async fn send_transaction_cancel(&self, peer_id: &str, transaction_id: Uuid) -> Result<()> {
         let peers = self.peers.lock().await;
         peers
             .get(peer_id)
@@ -1206,9 +1210,10 @@ impl PeerNode {
         dest_path: String,
     ) -> Result<()> {
         // Notify the UI to store the save path for auto-accept
-        let _ = self.event_tx.send(AppEvent::Info(
-            format!("REMOTE_SAVE_PATH:{}:{}", peer_id, dest_path),
-        ));
+        let _ = self.event_tx.send(AppEvent::Info(format!(
+            "REMOTE_SAVE_PATH:{}:{}",
+            peer_id, dest_path
+        )));
         self.fetch_remote_path(peer_id, path, is_folder).await
     }
 
@@ -1315,8 +1320,7 @@ impl PeerNode {
         use crate::core::connection::webrtc::ControlMessage;
 
         use crate::core::config::{
-            PING_INTERVAL, PONG_TIMEOUT,
-            MAX_CONSECUTIVE_PING_FAILURES as MAX_CONSECUTIVE_FAILURES,
+            MAX_CONSECUTIVE_PING_FAILURES as MAX_CONSECUTIVE_FAILURES, PING_INTERVAL, PONG_TIMEOUT,
         };
 
         let event_tx = self.event_tx.clone();

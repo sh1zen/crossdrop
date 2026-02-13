@@ -62,13 +62,12 @@ impl Component for HomePanel {
                     let badge = if unread > 0 {
                         Span::styled(
                             format!(" ({})", unread),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         )
                     } else {
-                        Span::styled(
-                            String::new(),
-                            Style::default(),
-                        )
+                        Span::styled(String::new(), Style::default())
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(" 💬  ".to_string(), Style::default().fg(Color::Cyan)),

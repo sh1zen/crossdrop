@@ -206,8 +206,11 @@ impl Component for ChatPanel {
                 let names = typing_peers.join(", ");
                 format!(" {} are typing...", names)
             };
-            let typing_widget = Paragraph::new(typing_text)
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+            let typing_widget = Paragraph::new(typing_text).style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            );
             f.render_widget(typing_widget, right_chunks[1]);
         }
 

@@ -134,6 +134,23 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Returns ALL saved peers (including removed ones).
+    pub fn all_peers(&self) -> Vec<&PeerRecord> {
+        self.peers.values().collect()
+    }
+
+    /// Remove a single peer from the registry entirely.
+    pub fn remove_single(&mut self, peer_id: &str) {
+        self.peers.remove(peer_id);
+        let _ = self.save();
+    }
+
+    /// Clear all saved peers from the registry.
+    pub fn clear(&mut self) {
+        self.peers.clear();
+        let _ = self.save();
+    }
+
     /// Build a ticket string from a peer's NodeId (for inbound connections
     /// where we don't have the original ticket).
     pub fn ticket_from_node_id(peer_id: &str) -> Option<String> {

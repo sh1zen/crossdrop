@@ -234,7 +234,10 @@ pub fn validate_manifest(manifest: &SecureManifest) -> Result<()> {
         // Normalize and validate path
         let normalized = normalize_path(&file.relative_path)?;
         if !seen_paths.insert(normalized.clone()) {
-            return Err(anyhow!("Duplicate path in manifest: {}", file.relative_path));
+            return Err(anyhow!(
+                "Duplicate path in manifest: {}",
+                file.relative_path
+            ));
         }
 
         // Validate chunk count matches file size
@@ -250,7 +253,10 @@ pub fn validate_manifest(manifest: &SecureManifest) -> Result<()> {
 
         // Validate file size is not zero
         if file.file_size == 0 {
-            return Err(anyhow!("Zero-size file in manifest: {}", file.relative_path));
+            return Err(anyhow!(
+                "Zero-size file in manifest: {}",
+                file.relative_path
+            ));
         }
     }
 

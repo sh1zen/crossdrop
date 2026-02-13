@@ -94,7 +94,10 @@ mod tests {
 
         atomic_write(&path, b"data").unwrap();
         let tmp = path.with_extension("json.tmp");
-        assert!(!tmp.exists(), "Temp file should not remain after successful write");
+        assert!(
+            !tmp.exists(),
+            "Temp file should not remain after successful write"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

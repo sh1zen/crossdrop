@@ -53,9 +53,9 @@ impl NotifyLevel {
     pub fn icon(self) -> &'static str {
         match self {
             NotifyLevel::Info => "(i)",
-            NotifyLevel::Success => "✓",
-            NotifyLevel::Warning => "⚠",
-            NotifyLevel::Error => "✗",
+            NotifyLevel::Success => "",
+            NotifyLevel::Warning => "(x)",
+            NotifyLevel::Error => "(!)",
         }
     }
 }

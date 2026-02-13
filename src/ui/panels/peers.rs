@@ -1,6 +1,6 @@
 use crate::core::initializer::PeerNode;
-use crate::ui::helpers::{get_display_name, short_peer_id};
 use crate::ui::helpers::formatters::format_cipher_key;
+use crate::ui::helpers::{get_display_name, short_peer_id};
 use crate::ui::traits::{Action, Component, Handler};
 use crate::workers::app::{App, Mode};
 use crossterm::event::KeyCode;
@@ -81,7 +81,11 @@ impl Component for PeersPanel {
                 if let Some(key) = app.peer_keys.get(p) {
                     spans.push(Span::styled(
                         format!(" [key: {}]", format_cipher_key(key)),
-                        Style::default().fg(if is_online { Color::Yellow } else { Color::DarkGray }),
+                        Style::default().fg(if is_online {
+                            Color::Yellow
+                        } else {
+                            Color::DarkGray
+                        }),
                     ));
                 }
 
@@ -121,7 +125,7 @@ impl Component for PeersPanel {
 
         // Hint bar at the bottom
         let hint = if app.peers.is_empty() {
-            Paragraph::new("  No peers connected").style(Style::default().fg(Color::DarkGray))
+            Paragraph::new("  No peers saved").style(Style::default().fg(Color::DarkGray))
         } else {
             Paragraph::new(Line::from(vec![
                 Span::raw("  "),
@@ -132,15 +136,31 @@ impl Component for PeersPanel {
                         .bg(Color::Red)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" disconnect    "),
+                Span::raw(" disconnect  "),
                 Span::styled(
-                    " e/Enter ",
+                    " x ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" remove  "),
+                Span::styled(
+                    " c ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" clear all  "),
+                Span::styled(
+                    " e ",
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" explore    "),
+                Span::raw(" explore  "),
                 Span::styled(
                     " ↑↓ ",
                     Style::default()
@@ -148,7 +168,7 @@ impl Component for PeersPanel {
                         .bg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" navigate    "),
+                Span::raw(" nav  "),
                 Span::styled(
                     " Esc ",
                     Style::default()
@@ -187,17 +207,44 @@ impl Handler for PeersPanel {
                 if let Some(peer_id) = app.peers.get(app.selected_peer_idx) {
                     let peer_id = peer_id.clone();
                     let display_name = get_display_name(app, &peer_id);
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        node.remove_peer(&peer_id).await;
-                    });
-                    Some(Action::SetStatus(format!(
-                        "Disconnecting from {}...",
-                        display_name
-                    )))
+                    if app.is_peer_online(&peer_id) {
+                        // Online peer: disconnect the active connection
+                        let node = node.clone();
+                        let pid = peer_id.clone();
+                        tokio::spawn(async move {
+                            node.remove_peer(&pid).await;
+                        });
+                        Some(Action::SetStatus(format!(
+                            "Disconnecting from {}...",
+                            display_name
+                        )))
+                    } else {
+                        // Offline peer: just remove from the list and registry
+                        Some(Action::RemoveSavedPeer(peer_id))
+                    }
                 } else {
                     Some(Action::None)
                 }
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                // Remove a single saved peer (disconnect if online, remove from registry)
+                if let Some(peer_id) = app.peers.get(app.selected_peer_idx) {
+                    let peer_id = peer_id.clone();
+                    if app.is_peer_online(&peer_id) {
+                        let node = node.clone();
+                        let pid = peer_id.clone();
+                        tokio::spawn(async move {
+                            node.remove_peer(&pid).await;
+                        });
+                    }
+                    Some(Action::RemoveSavedPeer(peer_id))
+                } else {
+                    Some(Action::None)
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                // Clear all saved peers
+                Some(Action::ClearSavedPeers)
             }
             KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter => {
                 // Explore remote file system

@@ -154,7 +154,9 @@ impl ChunkBitmap {
         let mut bits = Vec::with_capacity(expected_words);
         for i in 0..expected_words {
             let offset = 4 + i * 8;
-            bits.push(u64::from_be_bytes(data[offset..offset + 8].try_into().ok()?));
+            bits.push(u64::from_be_bytes(
+                data[offset..offset + 8].try_into().ok()?,
+            ));
         }
         Some(Self { total_chunks, bits })
     }

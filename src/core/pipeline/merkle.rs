@@ -4,8 +4,8 @@
 //! The receiver incrementally reconstructs the tree and validates
 //! the final root against the manifest.
 
-use sha3::{Digest, Sha3_256};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256};
 
 /// A Merkle tree built from chunk hashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]

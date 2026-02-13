@@ -107,27 +107,7 @@ impl SecureSession {
     }
 }
 
-/// Persistent session data (without the session key for security).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionSnapshot {
-    pub transaction_id: Uuid,
-    pub expiration_time: u64,
-    pub nonce_seed: [u8; 32],
-    pub remote_public_key: [u8; 32],
-    pub local_public_key: [u8; 32],
-}
 
-impl From<&SecureSession> for SessionSnapshot {
-    fn from(session: &SecureSession) -> Self {
-        Self {
-            transaction_id: session.transaction_id,
-            expiration_time: session.expiration_time,
-            nonce_seed: session.nonce_seed,
-            remote_public_key: session.remote_public_key,
-            local_public_key: session.local_public_key,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -135,24 +115,14 @@ mod tests {
 
     #[test]
     fn test_session_creation() {
-        let session = SecureSession::new(
-            Uuid::new_v4(),
-            [1u8; 32],
-            [2u8; 32],
-            [3u8; 32],
-        );
+        let session = SecureSession::new(Uuid::new_v4(), [1u8; 32], [2u8; 32], [3u8; 32]);
         assert!(!session.is_expired());
         assert!(session.key().is_some());
     }
 
     #[test]
     fn test_nonce_derivation_deterministic() {
-        let session = SecureSession::new(
-            Uuid::new_v4(),
-            [1u8; 32],
-            [2u8; 32],
-            [3u8; 32],
-        );
+        let session = SecureSession::new(Uuid::new_v4(), [1u8; 32], [2u8; 32], [3u8; 32]);
         let n1 = session.derive_nonce(1);
         let n2 = session.derive_nonce(1);
         assert_eq!(n1, n2);
@@ -160,12 +130,7 @@ mod tests {
 
     #[test]
     fn test_nonce_derivation_unique() {
-        let session = SecureSession::new(
-            Uuid::new_v4(),
-            [1u8; 32],
-            [2u8; 32],
-            [3u8; 32],
-        );
+        let session = SecureSession::new(Uuid::new_v4(), [1u8; 32], [2u8; 32], [3u8; 32]);
         let n1 = session.derive_nonce(1);
         let n2 = session.derive_nonce(2);
         assert_ne!(n1, n2);
@@ -173,13 +138,8 @@ mod tests {
 
     #[test]
     fn test_expired_session() {
-        let session = SecureSession::new(
-            Uuid::new_v4(),
-            [1u8; 32],
-            [2u8; 32],
-            [3u8; 32],
-        )
-        .with_expiration(0);
+        let session =
+            SecureSession::new(Uuid::new_v4(), [1u8; 32], [2u8; 32], [3u8; 32]).with_expiration(0);
         assert!(session.is_expired());
     }
 }

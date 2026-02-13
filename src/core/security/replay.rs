@@ -72,10 +72,8 @@ impl ReplayGuard {
 
     /// Register a new transaction with its expiration time.
     pub fn register_transaction(&mut self, transaction_id: Uuid, expiration_time: u64) {
-        self.transactions.insert(
-            transaction_id,
-            TransactionReplayState::new(expiration_time),
-        );
+        self.transactions
+            .insert(transaction_id, TransactionReplayState::new(expiration_time));
     }
 
     /// Validate an incoming message counter for a transaction.
@@ -108,13 +106,6 @@ impl ReplayGuard {
             .map(|s| s.next_counter())
     }
 
-    /// Get the last seen counter for a transaction.
-    pub fn last_seen_counter(&self, transaction_id: &Uuid) -> Option<u64> {
-        self.transactions
-            .get(transaction_id)
-            .map(|s| s.last_seen_counter)
-    }
-
     /// Remove expired transactions.
     pub fn prune_expired(&mut self) {
         self.transactions.retain(|_, state| !state.is_expired());
@@ -123,13 +114,6 @@ impl ReplayGuard {
     /// Remove a specific transaction.
     pub fn remove_transaction(&mut self, transaction_id: &Uuid) {
         self.transactions.remove(transaction_id);
-    }
-
-    /// Check if a transaction is registered and not expired.
-    pub fn is_valid_transaction(&self, transaction_id: &Uuid) -> bool {
-        self.transactions
-            .get(transaction_id)
-            .is_some_and(|s| !s.is_expired())
     }
 
     /// Get persisted state for a transaction (for resume).

@@ -6,6 +6,5 @@
 //! - Resume protocol with signed requests and bitmap-based chunk tracking
 //! - Abuse controls (retry limits, timeout enforcement, manifest authorization)
 
-pub mod manifest;
 pub mod coordinator;
-
+pub mod manifest;

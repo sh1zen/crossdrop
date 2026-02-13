@@ -17,7 +17,10 @@ use crate::core::config::CHUNK_SIZE;
 use crate::core::pipeline::chunk::compute_chunk_hash;
 use crate::core::pipeline::merkle::MerkleTree;
 use crate::core::transaction::compute_total_chunks;
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit}, Aes256Gcm,
+    Nonce,
+};
 use anyhow::{anyhow, Result};
 use brotli::CompressorWriter;
 use sha3::{Digest, Sha3_256};
@@ -151,12 +154,20 @@ impl SenderPipeline {
 
         for (file_id, file_data) in files {
             let merkle_root = self
-                .process_file(file_id, transaction_id, &file_data, encryption_key, chunk_tx)
+                .process_file(
+                    file_id,
+                    transaction_id,
+                    &file_data,
+                    encryption_key,
+                    chunk_tx,
+                )
                 .await?;
             merkle_roots.insert(file_id, merkle_root);
         }
 
-        chunk_tx.send(SenderEvent::TransactionComplete).await
+        chunk_tx
+            .send(SenderEvent::TransactionComplete)
+            .await
             .map_err(|_| anyhow!("Event channel closed"))?;
 
         Ok(merkle_roots)
@@ -208,8 +219,11 @@ impl SenderPipeline {
             file_hasher.update(raw_chunk);
 
             let pipeline_chunk = build_pipeline_chunk(
-                file_id, chunk_index, raw_chunk,
-                encryption_key, self.config.compression_quality,
+                file_id,
+                chunk_index,
+                raw_chunk,
+                encryption_key,
+                self.config.compression_quality,
             )?;
             chunk_hashes.push(pipeline_chunk.chunk_hash);
 
@@ -267,11 +281,16 @@ impl SenderPipeline {
             let raw_chunk = &file_data[start..end];
 
             let pipeline_chunk = build_pipeline_chunk(
-                file_id, chunk_index, raw_chunk,
-                encryption_key, self.config.compression_quality,
+                file_id,
+                chunk_index,
+                raw_chunk,
+                encryption_key,
+                self.config.compression_quality,
             )?;
 
-            chunk_tx.send(SenderEvent::ChunkReady(pipeline_chunk)).await
+            chunk_tx
+                .send(SenderEvent::ChunkReady(pipeline_chunk))
+                .await
                 .map_err(|_| anyhow!("Chunk channel closed"))?;
         }
 

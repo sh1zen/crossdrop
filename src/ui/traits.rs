@@ -68,6 +68,10 @@ pub enum Action {
     },
     /// Clear persisted chat history for a target.
     PersistClearChat(crate::core::persistence::ChatTargetSnapshot),
+    /// Remove a single saved peer from the registry and the UI list.
+    RemoveSavedPeer(String),
+    /// Clear all saved peers: disconnect everyone, wipe registry.
+    ClearSavedPeers,
     None,
 }
 

@@ -47,9 +47,8 @@ use webrtc::peer_connection::RTCPeerConnection;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 use crate::core::config::{
-    CHUNK_SIZE, CONNECTION_TIMEOUT, DATA_CHANNEL_TIMEOUT,
-    CHUNK_ACK_TIMEOUT, ICE_GATHER_TIMEOUT, PIPELINE_SIZE,
-    MAX_SEND_RETRIES as MAX_RETRIES,
+    CHUNK_ACK_TIMEOUT, CHUNK_SIZE, CONNECTION_TIMEOUT, DATA_CHANNEL_TIMEOUT, ICE_GATHER_TIMEOUT,
+    MAX_SEND_RETRIES as MAX_RETRIES, PIPELINE_SIZE,
 };
 
 // ── Binary Frame Format ──────────────────────────────────────────────────────
@@ -74,8 +73,7 @@ const FRAME_ACK: u8 = 0x03;
 /// for chat HMAC authentication. Provides domain separation from file-transfer
 /// HMACs which use real transaction UUIDs.
 const CHAT_HMAC_CHANNEL: Uuid = Uuid::from_bytes([
-    0xC0, 0xDE, 0xCA, 0xFE, 0x00, 0x00, 0x40, 0x00,
-    0x80, 0x00, 0x00, 0x00, 0x00, 0xC4, 0xA7, 0x01,
+    0xC0, 0xDE, 0xCA, 0xFE, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0xC4, 0xA7, 0x01,
 ]);
 
 /// Derive a separate HMAC key from the shared encryption key.
@@ -108,8 +106,14 @@ pub enum ControlMessage {
         filename: String,
         filesize: u64,
     },
-    /// Final hash for verification
-    Hash { file_id: Uuid, sha3_256: Vec<u8> },
+    /// Final hash for verification (includes Merkle root computed during send)
+    Hash {
+        file_id: Uuid,
+        sha3_256: Vec<u8>,
+        /// Merkle root computed incrementally from per-chunk SHA3-256 hashes.
+        #[serde(default)]
+        merkle_root: Option<[u8; 32]>,
+    },
     /// Hash verification result
     HashResult { file_id: Uuid, ok: bool },
     /// Transaction-level transfer request
@@ -127,18 +131,14 @@ pub enum ControlMessage {
         reject_reason: Option<String>,
     },
     /// Transaction completion confirmation
-    TransactionComplete {
-        transaction_id: Uuid,
-    },
+    TransactionComplete { transaction_id: Uuid },
     /// Transaction cancellation
     TransactionCancel {
         transaction_id: Uuid,
         reason: Option<String>,
     },
     /// Resume request referencing a transaction ID
-    TransactionResumeRequest {
-        resume_info: ResumeInfo,
-    },
+    TransactionResumeRequest { resume_info: ResumeInfo },
     /// Resume response from sender
     TransactionResumeResponse {
         transaction_id: Uuid,
@@ -164,9 +164,7 @@ pub enum ControlMessage {
     /// Authenticated direct message (HMAC + monotonic counter protected).
     AuthenticatedDm(Vec<u8>),
     /// Key rotation: peer sends a fresh ephemeral X25519 public key.
-    KeyRotation {
-        ephemeral_pub: Vec<u8>,
-    },
+    KeyRotation { ephemeral_pub: Vec<u8> },
     /// Heartbeat ping — peer should reply with Pong.
     Ping,
     /// Heartbeat pong — reply to a Ping.
@@ -266,6 +264,8 @@ struct ReceiveFileState {
     received_chunks: u32,
     buffer: Vec<u8>,
     dest_path: Option<PathBuf>,
+    /// Per-chunk SHA3-256 hashes collected incrementally for Merkle tree.
+    chunk_hashes: Vec<Option<[u8; 32]>>,
 }
 
 // ── Encryption helpers ───────────────────────────────────────────────────────
@@ -487,13 +487,19 @@ impl WebRTCConnection {
                             // Disconnected is TRANSIENT — ICE may recover.
                             // Log but do NOT fire Disconnected immediately.
                             // The heartbeat will detect true failures.
-                            warn!(event = "webrtc_disconnected", "WebRTC transient disconnect (ICE may recover)");
+                            warn!(
+                                event = "webrtc_disconnected",
+                                "WebRTC transient disconnect (ICE may recover)"
+                            );
                         }
                         RTCPeerConnectionState::Closed => {
                             // Closed is always caused by US calling close().
                             // Do NOT send Disconnected — the caller that invoked
                             // close() is responsible for any cleanup.
-                            info!(event = "webrtc_closed", "WebRTC connection closed (locally initiated)");
+                            info!(
+                                event = "webrtc_closed",
+                                "WebRTC connection closed (locally initiated)"
+                            );
                         }
                         _ => {}
                     }
@@ -509,8 +515,9 @@ impl WebRTCConnection {
             Arc::new(RwLock::new(HashMap::new()));
         let accepted_destinations = Arc::new(RwLock::new(HashMap::new()));
 
-        let pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>> =
-            Arc::new(RwLock::new(None));
+        let pending_rotation: Arc<
+            RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>,
+        > = Arc::new(RwLock::new(None));
 
         let chat_send_counter = Arc::new(RwLock::new(0u64));
         let chat_recv_counter = Arc::new(RwLock::new(0u64));
@@ -601,19 +608,31 @@ impl WebRTCConnection {
                 Box::pin(async move {
                     match s {
                         RTCPeerConnectionState::Connected => {
-                            info!(event = "webrtc_connected", "WebRTC connection established (answerer)");
+                            info!(
+                                event = "webrtc_connected",
+                                "WebRTC connection established (answerer)"
+                            );
                         }
                         RTCPeerConnectionState::Failed => {
-                            error!(event = "webrtc_failed", "WebRTC connection failed (answerer)");
+                            error!(
+                                event = "webrtc_failed",
+                                "WebRTC connection failed (answerer)"
+                            );
                             let _ = tx.send(ConnectionMessage::Disconnected);
                         }
                         RTCPeerConnectionState::Disconnected => {
                             // Transient — ICE may recover, do not fire disconnect.
-                            warn!(event = "webrtc_disconnected", "WebRTC transient disconnect (answerer, ICE may recover)");
+                            warn!(
+                                event = "webrtc_disconnected",
+                                "WebRTC transient disconnect (answerer, ICE may recover)"
+                            );
                         }
                         RTCPeerConnectionState::Closed => {
                             // Locally initiated close — do nothing.
-                            info!(event = "webrtc_closed", "WebRTC connection closed (answerer, locally initiated)");
+                            info!(
+                                event = "webrtc_closed",
+                                "WebRTC connection closed (answerer, locally initiated)"
+                            );
                         }
                         _ => {}
                     }
@@ -639,8 +658,9 @@ impl WebRTCConnection {
             let atx = app_tx.clone();
             let ra = Arc::new(remote_access);
             let ra_outer = ra.clone();
-            let pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>> =
-                Arc::new(RwLock::new(None));
+            let pending_rotation: Arc<
+                RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>,
+            > = Arc::new(RwLock::new(None));
             let pending_rotation_outer = pending_rotation.clone();
             let chat_send_counter = Arc::new(RwLock::new(0u64));
             let chat_recv_counter = Arc::new(RwLock::new(0u64));
@@ -662,7 +682,8 @@ impl WebRTCConnection {
                 let pr = pr.clone();
                 let crc = crc.clone();
                 Box::pin(async move {
-                    Self::attach_dc_handlers(&dc, ss, rs, pc_chunks, ad, atx, sk, ra, km, pr, crc).await;
+                    Self::attach_dc_handlers(&dc, ss, rs, pc_chunks, ad, atx, sk, ra, km, pr, crc)
+                        .await;
                     let label = dc.label().to_string();
                     if label == "control" {
                         *cl.write().await = Some(dc);
@@ -873,7 +894,8 @@ impl WebRTCConnection {
         };
         let auth_msg = MessageAuthenticator::create(&hmac_key, CHAT_HMAC_CHANNEL, counter, bytes);
         let envelope = serde_json::to_vec(&auth_msg)?;
-        self.send_control(&ControlMessage::AuthenticatedText(envelope)).await
+        self.send_control(&ControlMessage::AuthenticatedText(envelope))
+            .await
     }
 
     /// Send a direct (1-to-1) chat message (HMAC + counter authenticated, encrypted).
@@ -887,7 +909,8 @@ impl WebRTCConnection {
         };
         let auth_msg = MessageAuthenticator::create(&hmac_key, CHAT_HMAC_CHANNEL, counter, bytes);
         let envelope = serde_json::to_vec(&auth_msg)?;
-        self.send_control(&ControlMessage::AuthenticatedDm(envelope)).await
+        self.send_control(&ControlMessage::AuthenticatedDm(envelope))
+            .await
     }
 
     /// Send an ephemeral typing indicator.
@@ -907,7 +930,8 @@ impl WebRTCConnection {
         file_bytes: Vec<u8>,
         filename: impl Into<String>,
     ) -> Result<()> {
-        self.send_file_resuming(file_id, file_bytes, filename, 0).await
+        self.send_file_resuming(file_id, file_bytes, filename, 0)
+            .await
     }
 
     /// Send file bytes, skipping the first `start_chunk` chunks (for resume).
@@ -952,6 +976,7 @@ impl WebRTCConnection {
         self.send_state.write().await.insert(file_id, send_state);
 
         let mut hasher = Sha3_256::new();
+        let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(total_chunks as usize);
         info!(event = "file_send_start", file_id = %file_id, filename = %filename, filesize, total_chunks, start_chunk, "Starting file send");
 
         let mut sent_chunks: u32 = start_chunk;
@@ -966,6 +991,17 @@ impl WebRTCConnection {
                 let end = std::cmp::min(start + CHUNK_SIZE, file_bytes.len());
                 let chunk = file_bytes[start..end].to_vec();
                 hasher.update(&chunk);
+
+                // Compute per-chunk SHA3-256 hash for Merkle tree
+                {
+                    let mut ch = Sha3_256::new();
+                    ch.update(&chunk);
+                    let result = ch.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    chunk_hashes.push(hash);
+                }
+
                 // Skip already-received chunks (for resume)
                 if seq >= start_chunk {
                     chunks_data.push((seq, chunk));
@@ -1062,11 +1098,13 @@ impl WebRTCConnection {
             }
         }
 
-        // Send final hash on control channel
+        // Send final hash + Merkle root on control channel
         let final_hash = hasher.finalize();
+        let merkle_tree = crate::core::pipeline::merkle::MerkleTree::build(&chunk_hashes);
         self.send_control(&ControlMessage::Hash {
             file_id,
             sha3_256: final_hash.to_vec(),
+            merkle_root: Some(*merkle_tree.root()),
         })
         .await?;
 
@@ -1165,7 +1203,10 @@ impl WebRTCConnection {
             ephemeral_pub: pub_bytes,
         })
         .await?;
-        info!(event = "key_rotation_initiated", "Sent ephemeral public key for rotation");
+        info!(
+            event = "key_rotation_initiated",
+            "Sent ephemeral public key for rotation"
+        );
         Ok(())
     }
 
@@ -1292,6 +1333,16 @@ impl WebRTCConnection {
                                 state.buffer[start..end].copy_from_slice(chunk_data);
                                 state.received_chunks += 1;
 
+                                // Hash raw chunk for incremental Merkle tree
+                                if (seq as usize) < state.chunk_hashes.len() {
+                                    let mut ch = Sha3_256::new();
+                                    ch.update(chunk_data);
+                                    let r = ch.finalize();
+                                    let mut h = [0u8; 32];
+                                    h.copy_from_slice(&r);
+                                    state.chunk_hashes[seq as usize] = Some(h);
+                                }
+
                                 if let Some(tx) = &atx {
                                     let _ = tx.send(ConnectionMessage::FileProgress {
                                         file_id,
@@ -1375,12 +1426,20 @@ impl WebRTCConnection {
                 match serde_json::from_slice::<AuthenticatedMessage>(&envelope) {
                     Ok(auth_msg) => {
                         if !MessageAuthenticator::verify(&hmac_key, &auth_msg) {
-                            warn!(event = "chat_hmac_invalid", "Rejected room chat: HMAC verification failed");
+                            warn!(
+                                event = "chat_hmac_invalid",
+                                "Rejected room chat: HMAC verification failed"
+                            );
                             return Ok(());
                         }
                         let mut counter = chat_recv_counter.write().await;
                         if auth_msg.counter <= *counter {
-                            warn!(event = "chat_replay_detected", counter = auth_msg.counter, last_seen = *counter, "Rejected room chat: replay detected");
+                            warn!(
+                                event = "chat_replay_detected",
+                                counter = auth_msg.counter,
+                                last_seen = *counter,
+                                "Rejected room chat: replay detected"
+                            );
                             return Ok(());
                         }
                         *counter = auth_msg.counter;
@@ -1397,12 +1456,20 @@ impl WebRTCConnection {
                 match serde_json::from_slice::<AuthenticatedMessage>(&envelope) {
                     Ok(auth_msg) => {
                         if !MessageAuthenticator::verify(&hmac_key, &auth_msg) {
-                            warn!(event = "dm_hmac_invalid", "Rejected DM: HMAC verification failed");
+                            warn!(
+                                event = "dm_hmac_invalid",
+                                "Rejected DM: HMAC verification failed"
+                            );
                             return Ok(());
                         }
                         let mut counter = chat_recv_counter.write().await;
                         if auth_msg.counter <= *counter {
-                            warn!(event = "dm_replay_detected", counter = auth_msg.counter, last_seen = *counter, "Rejected DM: replay detected");
+                            warn!(
+                                event = "dm_replay_detected",
+                                counter = auth_msg.counter,
+                                last_seen = *counter,
+                                "Rejected DM: replay detected"
+                            );
                             return Ok(());
                         }
                         *counter = auth_msg.counter;
@@ -1466,6 +1533,7 @@ impl WebRTCConnection {
                     received_chunks: 0,
                     buffer,
                     dest_path,
+                    chunk_hashes: vec![None; total_chunks as usize],
                 };
                 recv_state.write().await.insert(file_id, st);
 
@@ -1488,6 +1556,17 @@ impl WebRTCConnection {
                             if end <= state.buffer.len() {
                                 state.buffer[start..end].copy_from_slice(chunk_data);
                                 state.received_chunks += 1;
+
+                                // Hash raw chunk for incremental Merkle tree
+                                if (*seq as usize) < state.chunk_hashes.len() {
+                                    let mut ch = Sha3_256::new();
+                                    ch.update(chunk_data);
+                                    let r = ch.finalize();
+                                    let mut h = [0u8; 32];
+                                    h.copy_from_slice(&r);
+                                    state.chunk_hashes[*seq as usize] = Some(h);
+                                }
+
                                 if let Some(tx) = &app_tx {
                                     let _ = tx.send(ConnectionMessage::FileProgress {
                                         file_id,
@@ -1505,9 +1584,7 @@ impl WebRTCConnection {
                     drop(map);
                     // Now send ACKs for all buffered chunks
                     for (seq, _) in &buffered {
-                        if let Err(e) =
-                            Self::send_ack(dc, &key, file_id, *seq).await
-                        {
+                        if let Err(e) = Self::send_ack(dc, &key, file_id, *seq).await {
                             warn!("Failed to send ACK for buffered chunk {}: {}", seq, e);
                         }
                     }
@@ -1520,7 +1597,11 @@ impl WebRTCConnection {
                     )));
                 }
             }
-            ControlMessage::Hash { file_id, sha3_256 } => {
+            ControlMessage::Hash {
+                file_id,
+                sha3_256,
+                merkle_root: sender_merkle_root,
+            } => {
                 let mut map = recv_state.write().await;
                 if let Some(state) = map.remove(&file_id) {
                     let mut hasher = Sha3_256::new();
@@ -1528,11 +1609,40 @@ impl WebRTCConnection {
                     let local_hash = hasher.finalize();
                     let ok = local_hash.as_slice() == sha3_256.as_slice();
 
-                    // Compute Merkle root from received data for integrity verification
-                    let merkle_root = crate::core::pipeline::merkle::compute_file_merkle_root(
-                        &state.buffer,
-                        CHUNK_SIZE,
-                    );
+                    // Build Merkle root from incrementally collected chunk hashes
+                    let merkle_root = {
+                        let all_present = state.chunk_hashes.iter().all(|h| h.is_some());
+                        if all_present && !state.chunk_hashes.is_empty() {
+                            let leaves: Vec<[u8; 32]> =
+                                state.chunk_hashes.iter().map(|h| h.unwrap()).collect();
+                            *crate::core::pipeline::merkle::MerkleTree::build(&leaves).root()
+                        } else {
+                            [0u8; 32]
+                        }
+                    };
+
+                    // Verify Merkle root against sender's value if provided
+                    if let Some(sender_root) = sender_merkle_root {
+                        if merkle_root != sender_root {
+                            warn!(
+                                event = "merkle_root_mismatch",
+                                file_id = %file_id,
+                                filename = %state.filename,
+                                "Sender/receiver Merkle root mismatch — possible data corruption"
+                            );
+                        } else {
+                            tracing::debug!(
+                                event = "merkle_root_verified",
+                                file_id = %file_id,
+                                "Merkle root matches sender"
+                            );
+                        }
+                    }
+
+                    // Send hash result immediately (before file write) so sender
+                    // knows the verification outcome without waiting for disk I/O.
+                    Self::send_control_on(dc, &key, &ControlMessage::HashResult { file_id, ok })
+                        .await?;
 
                     if ok {
                         info!(event = "file_recv_verified", file_id = %file_id, filename = %state.filename, bytes = state.buffer.len(), "File received and hash verified");
@@ -1542,27 +1652,61 @@ impl WebRTCConnection {
                             let safe = sanitize_relative_path(&state.filename);
                             std::env::current_dir().unwrap_or_default().join(&safe)
                         };
-                        if let Some(parent) = save_path.parent() {
-                            if !parent.exists() {
-                                fs::create_dir_all(parent).await?;
+
+                        // Spawn file write in background so the control channel
+                        // is immediately free to process the next file's Metadata.
+                        let app_tx_clone = app_tx.clone();
+                        let filename = state.filename.clone();
+                        let buffer = state.buffer;
+                        tokio::spawn(async move {
+                            if let Some(parent) = save_path.parent() {
+                                if !parent.exists() {
+                                    let _ = fs::create_dir_all(parent).await;
+                                }
                             }
-                        }
-                        let temp_path = save_path.with_extension(".tmp");
-                        fs::write(&temp_path, &state.buffer).await?;
-                        tokio::fs::rename(&temp_path, &save_path).await?;
-                        tracing::info!(
-                            "File receive complete: {} ({} bytes)",
-                            state.filename,
-                            state.buffer.len()
-                        );
-                        if let Some(tx) = &app_tx {
-                            let _ = tx.send(ConnectionMessage::FileSaved {
-                                file_id,
-                                filename: state.filename,
-                                path: save_path.to_string_lossy().to_string(),
-                                merkle_root,
-                            });
-                        }
+                            let temp_path = save_path.with_extension(".tmp");
+                            match fs::write(&temp_path, &buffer).await {
+                                Ok(()) => match tokio::fs::rename(&temp_path, &save_path).await {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "File receive complete: {} ({} bytes)",
+                                            filename,
+                                            buffer.len()
+                                        );
+                                        if let Some(tx) = &app_tx_clone {
+                                            let _ = tx.send(ConnectionMessage::FileSaved {
+                                                file_id,
+                                                filename,
+                                                path: save_path.to_string_lossy().to_string(),
+                                                merkle_root,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to rename temp file for {}: {}",
+                                            filename, e
+                                        );
+                                        let _ = std::fs::remove_file(&temp_path);
+                                        if let Some(tx) = &app_tx_clone {
+                                            let _ = tx.send(ConnectionMessage::Error(format!(
+                                                "Failed to save {}: {}",
+                                                filename, e
+                                            )));
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Failed to write temp file for {}: {}", filename, e);
+                                    if let Some(tx) = &app_tx_clone {
+                                        let _ = tx.send(ConnectionMessage::Error(format!(
+                                            "Failed to save {}: {}",
+                                            filename, e
+                                        )));
+                                    }
+                                }
+                            }
+                        });
                     } else {
                         error!(event = "file_integrity_failure", file_id = %file_id, filename = %state.filename, "File integrity check failed: hash mismatch");
                         if let Some(tx) = &app_tx {
@@ -1572,14 +1716,6 @@ impl WebRTCConnection {
                             )));
                         }
                     }
-
-                    // Send hash result back on control channel
-                    Self::send_control_on(
-                        dc,
-                        &key,
-                        &ControlMessage::HashResult { file_id, ok },
-                    )
-                    .await?;
                 }
             }
             ControlMessage::HashResult { file_id, ok } => {
@@ -1588,16 +1724,18 @@ impl WebRTCConnection {
                 } else {
                     error!(event = "file_integrity_failure", file_id = %file_id, "File send failed: hash mismatch");
                 }
-                notify_app(&app_tx, ConnectionMessage::SendComplete {
-                    file_id,
-                    success: ok,
-                });
+                notify_app(
+                    &app_tx,
+                    ConnectionMessage::SendComplete {
+                        file_id,
+                        success: ok,
+                    },
+                );
             }
             ControlMessage::LsRequest { path } => {
                 tracing::info!("Remote ls request: {}", path);
                 if !*remote_access.borrow() {
-                    Self::send_control_on(dc, &key, &ControlMessage::RemoteAccessDisabled)
-                        .await?;
+                    Self::send_control_on(dc, &key, &ControlMessage::RemoteAccessDisabled).await?;
                 } else {
                     let mut entries = Vec::new();
                     if let Ok(mut read_dir) = fs::read_dir(&path).await {
@@ -1611,12 +1749,8 @@ impl WebRTCConnection {
                             }
                         }
                     }
-                    Self::send_control_on(
-                        dc,
-                        &key,
-                        &ControlMessage::LsResponse { path, entries },
-                    )
-                    .await?;
+                    Self::send_control_on(dc, &key, &ControlMessage::LsResponse { path, entries })
+                        .await?;
                 }
             }
             ControlMessage::LsResponse { path, entries } => {
@@ -1625,10 +1759,12 @@ impl WebRTCConnection {
             ControlMessage::FetchRequest { path, is_folder } => {
                 tracing::info!("Remote fetch request: {} (folder: {})", path, is_folder);
                 if !*remote_access.borrow() {
-                    Self::send_control_on(dc, &key, &ControlMessage::RemoteAccessDisabled)
-                        .await?;
+                    Self::send_control_on(dc, &key, &ControlMessage::RemoteAccessDisabled).await?;
                 } else {
-                    notify_app(&app_tx, ConnectionMessage::RemoteFetchRequest { path, is_folder });
+                    notify_app(
+                        &app_tx,
+                        ConnectionMessage::RemoteFetchRequest { path, is_folder },
+                    );
                 }
             }
             ControlMessage::RemoteAccessDisabled => {
@@ -1641,12 +1777,15 @@ impl WebRTCConnection {
                 manifest,
                 total_size,
             } => {
-                notify_app(&app_tx, ConnectionMessage::TransactionRequested {
-                    transaction_id,
-                    display_name,
-                    manifest,
-                    total_size,
-                });
+                notify_app(
+                    &app_tx,
+                    ConnectionMessage::TransactionRequested {
+                        transaction_id,
+                        display_name,
+                        manifest,
+                        total_size,
+                    },
+                );
             }
             ControlMessage::TransactionResponse {
                 transaction_id,
@@ -1655,38 +1794,56 @@ impl WebRTCConnection {
                 reject_reason,
             } => {
                 if accepted {
-                    notify_app(&app_tx, ConnectionMessage::TransactionAccepted {
-                        transaction_id,
-                        dest_path,
-                    });
+                    notify_app(
+                        &app_tx,
+                        ConnectionMessage::TransactionAccepted {
+                            transaction_id,
+                            dest_path,
+                        },
+                    );
                 } else {
-                    notify_app(&app_tx, ConnectionMessage::TransactionRejected {
-                        transaction_id,
-                        reason: reject_reason,
-                    });
+                    notify_app(
+                        &app_tx,
+                        ConnectionMessage::TransactionRejected {
+                            transaction_id,
+                            reason: reject_reason,
+                        },
+                    );
                 }
             }
             ControlMessage::TransactionComplete { transaction_id } => {
-                notify_app(&app_tx, ConnectionMessage::TransactionCompleted {
-                    transaction_id,
-                });
+                notify_app(
+                    &app_tx,
+                    ConnectionMessage::TransactionCompleted { transaction_id },
+                );
             }
-            ControlMessage::TransactionCancel { transaction_id, reason } => {
-                notify_app(&app_tx, ConnectionMessage::TransactionCancelled {
-                    transaction_id,
-                    reason,
-                });
+            ControlMessage::TransactionCancel {
+                transaction_id,
+                reason,
+            } => {
+                notify_app(
+                    &app_tx,
+                    ConnectionMessage::TransactionCancelled {
+                        transaction_id,
+                        reason,
+                    },
+                );
             }
             ControlMessage::TransactionResumeRequest { resume_info } => {
-                notify_app(&app_tx, ConnectionMessage::TransactionResumeRequested {
-                    resume_info,
-                });
+                notify_app(
+                    &app_tx,
+                    ConnectionMessage::TransactionResumeRequested { resume_info },
+                );
             }
-            ControlMessage::TransactionResumeResponse { transaction_id, accepted } => {
+            ControlMessage::TransactionResumeResponse {
+                transaction_id,
+                accepted,
+            } => {
                 if accepted {
-                    notify_app(&app_tx, ConnectionMessage::TransactionResumeAccepted {
-                        transaction_id,
-                    });
+                    notify_app(
+                        &app_tx,
+                        ConnectionMessage::TransactionResumeAccepted { transaction_id },
+                    );
                 }
             }
             ControlMessage::KeyRotation { ephemeral_pub } => {
@@ -1720,11 +1877,15 @@ impl WebRTCConnection {
                         info!(event = "key_rotated_responder", new_key_prefix = ?&new_key[..4], "Session key rotated (responder side)");
                     }
 
-                    notify_app(&app_tx, ConnectionMessage::Debug(
-                        "Session key rotated successfully".into(),
-                    ));
+                    notify_app(
+                        &app_tx,
+                        ConnectionMessage::Debug("Session key rotated successfully".into()),
+                    );
                 } else {
-                    warn!(event = "key_rotation_no_manager", "Received KeyRotation but no SessionKeyManager is available");
+                    warn!(
+                        event = "key_rotation_no_manager",
+                        "Received KeyRotation but no SessionKeyManager is available"
+                    );
                 }
             }
         }

@@ -240,10 +240,7 @@ impl Transaction {
 
         for (rel_path, filesize) in files {
             let file_id = Uuid::new_v4();
-            file_map.insert(
-                file_id,
-                TransactionFile::new(file_id, rel_path, filesize),
-            );
+            file_map.insert(file_id, TransactionFile::new(file_id, rel_path, filesize));
             file_order.push(file_id);
         }
 
@@ -391,11 +388,7 @@ impl Transaction {
         let chunk_bitmaps: HashMap<Uuid, Vec<u8>> = self
             .files
             .values()
-            .filter_map(|f| {
-                f.chunk_bitmap
-                    .as_ref()
-                    .map(|bm| (f.file_id, bm.to_bytes()))
-            })
+            .filter_map(|f| f.chunk_bitmap.as_ref().map(|bm| (f.file_id, bm.to_bytes())))
             .collect();
 
         ResumeInfo {
@@ -725,9 +718,9 @@ impl TransactionManager {
 
     /// Get a transaction by ID (active or history).
     pub fn get(&self, id: &Uuid) -> Option<&Transaction> {
-        self.active.get(id).or_else(|| {
-            self.history.iter().find(|t| t.id == *id)
-        })
+        self.active
+            .get(id)
+            .or_else(|| self.history.iter().find(|t| t.id == *id))
     }
 
     /// Get a mutable reference to an active transaction.

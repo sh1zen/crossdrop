@@ -87,7 +87,12 @@ impl Persistence {
             error!(event = "persistence_parse_failure", path = %path.display(), error = %e, "Failed to parse persistence state");
             e
         })?;
-        debug!(event = "persistence_loaded", transactions = p.transactions.len(), history = p.transfer_history.len(), "Persistence state loaded");
+        debug!(
+            event = "persistence_loaded",
+            transactions = p.transactions.len(),
+            history = p.transfer_history.len(),
+            "Persistence state loaded"
+        );
         Ok(p)
     }
 
@@ -127,12 +132,10 @@ impl Persistence {
 
     /// Clear chat history for a specific target and persist.
     pub fn clear_chat_target(&mut self, target: &ChatTargetSnapshot) -> Result<()> {
-        self.chat_history.retain(|m| {
-            match (&m.target, target) {
-                (ChatTargetSnapshot::Room, ChatTargetSnapshot::Room) => false,
-                (ChatTargetSnapshot::Peer(a), ChatTargetSnapshot::Peer(b)) if a == b => false,
-                _ => true,
-            }
+        self.chat_history.retain(|m| match (&m.target, target) {
+            (ChatTargetSnapshot::Room, ChatTargetSnapshot::Room) => false,
+            (ChatTargetSnapshot::Peer(a), ChatTargetSnapshot::Peer(b)) if a == b => false,
+            _ => true,
         });
         self.save()
     }

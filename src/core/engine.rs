@@ -14,7 +14,6 @@
 use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES, TRANSACTION_TIMEOUT};
 use crate::core::initializer::AppEvent;
 use crate::core::persistence::{Persistence, TransferRecordSnapshot};
-use crate::core::protocol::coordinator::TransferCoordinator;
 use crate::core::security::identity::PeerIdentity;
 use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
@@ -198,8 +197,6 @@ pub struct TransferEngine {
     transfer_history: Vec<TransferRecord>,
     /// Maps outbound transaction_id to the local source path (for sending after acceptance).
     source_paths: HashMap<Uuid, String>,
-    /// Secure transfer coordinator for authentication, replay protection, and manifest enforcement.
-    coordinator: Option<TransferCoordinator>,
     /// Our peer identity (long-term key pair for signing manifests and resume requests).
     identity: Option<PeerIdentity>,
     /// Replay protection: monotonic counters per transaction.
@@ -212,10 +209,6 @@ impl TransferEngine {
         let identity = PeerIdentity::default_path()
             .ok()
             .and_then(|path| PeerIdentity::load_or_create(&path).ok());
-
-        let coordinator = identity
-            .as_ref()
-            .map(|id| TransferCoordinator::new(id.clone()));
 
         // Restore transfer history from persistence
         let transfer_history = match Persistence::load() {
@@ -236,20 +229,9 @@ impl TransferEngine {
             pending_incoming: None,
             transfer_history,
             source_paths: HashMap::new(),
-            coordinator,
             identity,
             replay_guard: ReplayGuard::new(),
         }
-    }
-
-    /// Access the transfer coordinator (for secure operations).
-    pub fn coordinator(&self) -> Option<&TransferCoordinator> {
-        self.coordinator.as_ref()
-    }
-
-    /// Access the transfer coordinator mutably.
-    pub fn coordinator_mut(&mut self) -> Option<&mut TransferCoordinator> {
-        self.coordinator.as_mut()
     }
 
     /// Access our peer identity.
@@ -1390,15 +1372,7 @@ impl TransferEngine {
                 txn.make_resumable();
 
                 let src = self.source_paths.get(txn_id).map(|s| s.as_str());
-                let mut snapshot = txn.to_snapshot_with_source(src);
-
-                if let Some(coord) = self.coordinator.as_mut() {
-                    if let Ok(secure_snap) = coord.pause_transfer(txn_id) {
-                        snapshot.expiration_time = Some(secure_snap.expiration_time);
-                        snapshot.last_counter =
-                            Some(secure_snap.replay_state.last_seen_counter);
-                    }
-                }
+                let snapshot = txn.to_snapshot_with_source(src);
 
                 debug!(
                     event = "transaction_persisted",

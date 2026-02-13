@@ -14,9 +14,12 @@
 //! - Incremental Merkle tree reconstruction
 
 use crate::core::config::CHUNK_SIZE;
-use crate::core::pipeline::chunk::{ChunkBitmap, compute_chunk_hash};
+use crate::core::pipeline::chunk::{compute_chunk_hash, ChunkBitmap};
 use crate::core::pipeline::merkle::IncrementalMerkleBuilder;
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit}, Aes256Gcm,
+    Nonce,
+};
 use anyhow::{anyhow, Result};
 use brotli::Decompressor;
 use sha3::{Digest, Sha3_256};
@@ -88,7 +91,9 @@ impl AckRange {
 
     /// Check if a chunk index is covered by these ACK ranges.
     pub fn contains(&self, index: u32) -> bool {
-        self.ranges.iter().any(|(start, end)| index >= *start && index < *end)
+        self.ranges
+            .iter()
+            .any(|(start, end)| index >= *start && index < *end)
     }
 
     /// Total number of acknowledged chunks.
@@ -103,10 +108,7 @@ impl AckRange {
 #[derive(Debug)]
 pub enum ReceiverEvent {
     /// A chunk has been verified and written to the buffer.
-    ChunkVerified {
-        file_id: Uuid,
-        chunk_index: u32,
-    },
+    ChunkVerified { file_id: Uuid, chunk_index: u32 },
     /// Batch ACK should be sent.
     SendAck(AckRange),
     /// A chunk failed verification.
@@ -268,7 +270,10 @@ impl ReceiverPipeline {
 
         // Check if file is complete
         if state.bitmap.is_complete() {
-            match state.merkle_builder.verify_root(&state.expected_merkle_root) {
+            match state
+                .merkle_builder
+                .verify_root(&state.expected_merkle_root)
+            {
                 Some(true) => {
                     events.push(ReceiverEvent::FileVerified {
                         file_id: state.file_id,
@@ -341,7 +346,6 @@ fn decompress_chunk(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[test]
     fn test_ack_range_from_bitmap() {

@@ -1,4 +1,3 @@
-use crate::core::engine::EngineAction;
 use crate::core::initializer::PeerNode;
 use crate::core::transaction::{TransactionDirection, TransactionState};
 use crate::ui::helpers::{format_file_size, get_display_name, truncate_filename};
@@ -34,8 +33,10 @@ impl FilesPanel {
 
 impl Component for FilesPanel {
     fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
-        let has_active = app.engine.transactions().active.values()
-            .any(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending);
+        let has_active =
+            app.engine.transactions().active.values().any(|t| {
+                t.state == TransactionState::Active || t.state == TransactionState::Pending
+            });
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -73,14 +74,28 @@ impl Component for FilesPanel {
             let mut progress_items: Vec<ListItem> = Vec::new();
 
             // Collect active transfer IDs for selection tracking
-            let active_ids: Vec<uuid::Uuid> = app.engine.transactions().active.values()
-                .filter(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending)
+            let active_ids: Vec<uuid::Uuid> = app
+                .engine
+                .transactions()
+                .active
+                .values()
+                .filter(|t| {
+                    t.state == TransactionState::Active || t.state == TransactionState::Pending
+                })
                 .map(|t| t.id)
                 .collect();
-            let selected_idx = app.active_transfer_idx.min(active_ids.len().saturating_sub(1));
+            let selected_idx = app
+                .active_transfer_idx
+                .min(active_ids.len().saturating_sub(1));
 
-            for (idx, txn) in app.engine.transactions().active.values()
-                .filter(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending)
+            for (idx, txn) in app
+                .engine
+                .transactions()
+                .active
+                .values()
+                .filter(|t| {
+                    t.state == TransactionState::Active || t.state == TransactionState::Pending
+                })
                 .enumerate()
             {
                 let (transferred, total) = txn.progress_chunks();
@@ -113,8 +128,11 @@ impl Component for FilesPanel {
                 progress_items.push(ListItem::new(Line::from(vec![
                     Span::styled(
                         marker,
-                        Style::default()
-                            .fg(if is_selected { Color::Yellow } else { Color::DarkGray }),
+                        Style::default().fg(if is_selected {
+                            Color::Yellow
+                        } else {
+                            Color::DarkGray
+                        }),
                     ),
                     Span::styled(
                         arrow,
@@ -144,9 +162,7 @@ impl Component for FilesPanel {
                 progress_items.push(ListItem::new(Line::from(vec![
                     Span::styled(
                         " ✗ ",
-                        Style::default()
-                            .fg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{}{}", short_name, reason_suffix),
@@ -217,13 +233,22 @@ impl Component for FilesPanel {
 
         let mut items: Vec<ListItem> = Vec::new();
 
-        for rec in engine_history.iter().rev().skip(scroll).take(visible_height) {
+        for rec in engine_history
+            .iter()
+            .rev()
+            .skip(scroll)
+            .take(visible_height)
+        {
             let (arrow, color) = match rec.direction {
                 TransactionDirection::Outbound => ("->", Color::Green),
                 TransactionDirection::Inbound => ("<-", Color::Cyan),
             };
             let file_info = if rec.file_count > 1 {
-                format!(" ({} files, {})", rec.file_count, format_file_size(rec.total_size))
+                format!(
+                    " ({} files, {})",
+                    rec.file_count,
+                    format_file_size(rec.total_size)
+                )
             } else {
                 format!(" ({})", format_file_size(rec.total_size))
             };
@@ -234,10 +259,7 @@ impl Component for FilesPanel {
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(rec.display_name.clone(), Style::default().fg(Color::White)),
-                Span::styled(
-                    file_info,
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(file_info, Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("  {}", get_display_name(app, &rec.peer_id)),
                     Style::default().fg(Color::Yellow),
@@ -317,14 +339,22 @@ impl Handler for FilesPanel {
             }
             KeyCode::Enter | KeyCode::Char('x') | KeyCode::Char('X') => {
                 // Cancel the selected active transfer
-                let active_ids: Vec<uuid::Uuid> = app.engine.transactions().active.values()
-                    .filter(|t| t.state == TransactionState::Active || t.state == TransactionState::Pending)
+                let active_ids: Vec<uuid::Uuid> = app
+                    .engine
+                    .transactions()
+                    .active
+                    .values()
+                    .filter(|t| {
+                        t.state == TransactionState::Active || t.state == TransactionState::Pending
+                    })
                     .map(|t| t.id)
                     .collect();
                 if active_ids.is_empty() {
                     return Some(Action::None);
                 }
-                let idx = app.active_transfer_idx.min(active_ids.len().saturating_sub(1));
+                let idx = app
+                    .active_transfer_idx
+                    .min(active_ids.len().saturating_sub(1));
                 let txn_id = active_ids[idx];
                 let outcome = app.engine.cancel_active_transfer(&txn_id);
                 if let Some(status) = outcome.status {
