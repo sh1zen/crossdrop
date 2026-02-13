@@ -3,7 +3,7 @@ mod ui;
 mod utils;
 mod workers;
 
-use crate::utils::log_buffer::{BufferLayer, LogBuffer};
+use crate::utils::log_buffer::{BufferLayer, FileLogLayer, LogBuffer};
 use crate::utils::sos::SignalOfStop;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -32,11 +32,17 @@ async fn main() -> anyhow::Result<()> {
     let filter_layer = EnvFilter::new(filter);
     let buffer_layer = BufferLayer::new(log_buffer.clone());
 
+    // File logging layer - saves full logs to config path
+    let log_path = crate::utils::data_dir::get().join("logs").join("crossdrop.log");
+    let file_layer = FileLogLayer::new(&log_path)?;
+
     // Only the buffer layer captures logs — no fmt layer writing to stderr,
     // which would corrupt the Ratatui TUI. Logs are visible in the Logs menu.
+    // File layer writes full logs to disk for persistence.
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(buffer_layer)
+        .with(file_layer)
         .init();
 
     let sos = SignalOfStop::new();

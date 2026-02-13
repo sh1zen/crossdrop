@@ -57,14 +57,24 @@ impl Component for HomePanel {
         let items: Vec<ListItem> = MENU_ORDER
             .iter()
             .map(|mode| match mode {
-                Mode::Chat => ListItem::new(Line::from(vec![
-                    Span::styled(" 💬  ".to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw(mode.label()),
-                    Span::styled(
-                        format!(" ({})", app.messages.messages_for(&crate::workers::app::ChatTarget::Room).len()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])),
+                Mode::Chat => {
+                    let unread = app.total_unread();
+                    let badge = if unread > 0 {
+                        Span::styled(
+                            format!(" ({})", unread),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::styled(String::new(), Style::default())
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(" 💬  ".to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(mode.label()),
+                        badge,
+                    ]))
+                }
                 Mode::Send => ListItem::new(Line::from(vec![
                     Span::styled(" 🛜  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),
@@ -73,26 +83,46 @@ impl Component for HomePanel {
                     Span::styled(" 🔗  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),
                 ])),
-                Mode::Peers => ListItem::new(Line::from(vec![
-                    Span::styled(" 💻  ".to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw(mode.label()),
-                    Span::styled(
-                        format!(" ({})", app.peers.len()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])),
+                Mode::Peers => {
+                    let online_count = app.peers.iter().filter(|p| app.is_peer_online(p)).count();
+                    let total_count = app.peers.len();
+                    ListItem::new(Line::from(vec![
+                        Span::styled(" 💻  ".to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(mode.label()),
+                        Span::styled(
+                            format!(" ({}/{})", online_count, total_count),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                }
                 Mode::Id => ListItem::new(Line::from(vec![
                     Span::styled(" 🪪  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),
                 ])),
-                Mode::Files => ListItem::new(Line::from(vec![
-                    Span::styled(" 📂  ".to_string(), Style::default().fg(Color::Cyan)),
-                    Span::raw(mode.label()),
-                    Span::styled(
-                        format!(" ({})", app.file_history.len()),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])),
+                Mode::Files => {
+                    use crate::core::transaction::TransactionState;
+                    let active_count = app
+                        .engine
+                        .transactions()
+                        .active
+                        .values()
+                        .filter(|t| {
+                            t.state == TransactionState::Active
+                                || t.state == TransactionState::Pending
+                                || t.state == TransactionState::Interrupted
+                                || t.state == TransactionState::Resumable
+                        })
+                        .count();
+                    let total_count = app.engine.transfer_history().len();
+                    ListItem::new(Line::from(vec![
+                        Span::styled(" 📂  ".to_string(), Style::default().fg(Color::Cyan)),
+                        Span::raw(mode.label()),
+                        Span::styled(
+                            format!(" ({}/{})", active_count, total_count),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                }
                 Mode::Settings => ListItem::new(Line::from(vec![
                     Span::styled(" 🌐  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),
@@ -151,7 +181,7 @@ impl Handler for HomePanel {
             }
             KeyCode::Enter => {
                 if let Some(mode) = Self::index_to_mode(sel) {
-                    app.status.clear();
+                    app.notify.clear();
                     if mode == Mode::Chat {
                         app.chat_target = ChatTarget::Room;
                         app.chat_sidebar_idx = 0;

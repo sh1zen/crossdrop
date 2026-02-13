@@ -62,6 +62,13 @@ impl PeerIdentity {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, &identity.secret)?;
+            // Restrict file permissions on Unix: owner read/write only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(path, perms)?;
+            }
             Ok(identity)
         }
     }
@@ -87,71 +94,27 @@ impl PeerIdentity {
         hmac_sign(&self.secret, data)
     }
 
-    /// Create a `SignedPayload` from raw bytes.
-    pub fn sign_payload(&self, data: Vec<u8>) -> SignedPayload {
-        let signature = self.sign(&data);
-        SignedPayload {
-            data,
-            signature,
-            signer: self.public_key,
-        }
-    }
-
     /// Verify a signed payload against a known public key.
-    /// Since we use HMAC(secret, data) for signing, verification requires
-    /// re-deriving — but in a P2P context we verify by checking the HMAC
-    /// matches when the verifier also knows (or can derive) the secret.
     ///
-    /// For cross-peer verification, we use a challenge-response scheme:
+    /// **Security note**: This scheme uses HMAC(secret, data) for signing.
+    /// Without the secret key, full signature verification is not possible.
+    /// This method only validates that the declared signer matches the
+    /// expected public key using constant-time comparison (preventing
+    /// timing side-channels). For full cryptographic verification when
+    /// the secret is available, use `verify_with_secret()` instead.
+    ///
+    /// In production flows, cross-peer verification relies on the
+    /// challenge-response scheme negotiated during session establishment:
     /// the verifier sends a nonce, the prover signs it, and the verifier
     /// checks against the expected public key derivation.
     pub fn verify_signed(payload: &SignedPayload, expected_signer: &[u8; 32]) -> bool {
-        payload.signer == *expected_signer
-    }
-
-    /// Secret key reference (for session key derivation).
-    pub fn secret(&self) -> &[u8; 32] {
-        &self.secret
+        crate::utils::crypto::constant_time_eq(&payload.signer, expected_signer)
     }
 }
 
-/// HMAC-SHA3-256 for signing.
+/// HMAC-SHA3-256 for signing — delegates to the centralized implementation.
 fn hmac_sign(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 136;
-
-    let actual_key = if key.len() > BLOCK_SIZE {
-        let mut h = Sha3_256::new();
-        h.update(key);
-        let digest = h.finalize();
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..32].copy_from_slice(&digest);
-        k
-    } else {
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..key.len()].copy_from_slice(key);
-        k
-    };
-
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        ipad[i] ^= actual_key[i];
-        opad[i] ^= actual_key[i];
-    }
-
-    let mut inner = Sha3_256::new();
-    inner.update(&ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha3_256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    let result = outer.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    crate::utils::crypto::hmac_sha3_256(key, data)
 }
 
 #[cfg(test)]
@@ -169,7 +132,12 @@ mod tests {
     fn test_sign_and_verify() {
         let id = PeerIdentity::generate();
         let data = b"test payload";
-        let signed = id.sign_payload(data.to_vec());
+        let signature = id.sign(data);
+        let signed = SignedPayload {
+            data: data.to_vec(),
+            signature,
+            signer: id.public_key,
+        };
         assert!(PeerIdentity::verify_signed(&signed, &id.public_key));
         assert!(!PeerIdentity::verify_signed(&signed, &[0u8; 32]));
     }

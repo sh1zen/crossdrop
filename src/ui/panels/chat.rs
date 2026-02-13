@@ -1,4 +1,5 @@
 use crate::core::initializer::PeerNode;
+use crate::core::persistence::{ChatSenderSnapshot, ChatTargetSnapshot};
 use crate::ui::commands::{parse_command, ChatCommand, COMMAND_HELP};
 use crate::ui::helpers::{format_timestamp_now, get_display_name};
 use crate::ui::traits::{Action, Component, Handler};
@@ -205,8 +206,11 @@ impl Component for ChatPanel {
                 let names = typing_peers.join(", ");
                 format!(" {} are typing...", names)
             };
-            let typing_widget = Paragraph::new(typing_text)
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+            let typing_widget = Paragraph::new(typing_text).style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            );
             f.render_widget(typing_widget, right_chunks[1]);
         }
 
@@ -280,8 +284,12 @@ impl Handler for ChatPanel {
                         app.input.clear();
                         match cmd_result {
                             Ok(ChatCommand::Clear) => {
+                                let target_snap = match &app.chat_target {
+                                    ChatTarget::Room => ChatTargetSnapshot::Room,
+                                    ChatTarget::Peer(pid) => ChatTargetSnapshot::Peer(pid.clone()),
+                                };
                                 app.messages.clear_target(&app.chat_target);
-                                return Some(Action::None);
+                                return Some(Action::PersistClearChat(target_snap));
                             }
                             Ok(ChatCommand::Help) => {
                                 // Insert an ephemeral help message (local only)
@@ -296,8 +304,6 @@ impl Handler for ChatPanel {
                                     text: format!("Available commands:\n{}", help_text),
                                     timestamp: format_timestamp_now(),
                                     target: app.chat_target.clone(),
-                                    recipients: vec![],
-                                    created_at: Instant::now(),
                                 });
                                 return Some(Action::None);
                             }
@@ -316,6 +322,7 @@ impl Handler for ChatPanel {
                     let msg_len = msg.len() as u64;
                     let target = app.chat_target.clone();
                     let msg_id = Uuid::new_v4();
+                    let timestamp = format_timestamp_now();
 
                     match &target {
                         ChatTarget::Room => {
@@ -324,15 +331,11 @@ impl Handler for ChatPanel {
                                 id: msg_id,
                                 sender: MessageSender::Me,
                                 text: msg.clone(),
-                                timestamp: format_timestamp_now(),
+                                timestamp: timestamp.clone(),
                                 target: ChatTarget::Room,
-                                recipients: app.peers.clone(),
-                                created_at: Instant::now(),
                             });
                             let peer_count = app.peers.len() as u64;
                             app.engine.record_message_sent(msg_len * peer_count);
-                            app.stats.messages_sent += peer_count;
-                            app.stats.bytes_sent += msg_len * peer_count;
 
                             // Network: still sent individually to each peer
                             let node = node.clone();
@@ -342,6 +345,15 @@ impl Handler for ChatPanel {
                                     tracing::error!("Broadcast failed: {e}");
                                 }
                             });
+
+                            app.input.clear();
+                            return Some(Action::PersistChat {
+                                id: msg_id.to_string(),
+                                sender: ChatSenderSnapshot::Me,
+                                text: msg,
+                                timestamp,
+                                target: ChatTargetSnapshot::Room,
+                            });
                         }
                         ChatTarget::Peer(peer_id) => {
                             // DM: one message, one peer, only in this chat view
@@ -349,14 +361,17 @@ impl Handler for ChatPanel {
                                 id: msg_id,
                                 sender: MessageSender::Me,
                                 text: msg.clone(),
-                                timestamp: format_timestamp_now(),
+                                timestamp: timestamp.clone(),
                                 target: ChatTarget::Peer(peer_id.clone()),
-                                recipients: vec![peer_id.clone()],
-                                created_at: Instant::now(),
                             });
                             app.engine.record_message_sent(msg_len);
-                            app.stats.messages_sent += 1;
-                            app.stats.bytes_sent += msg_len;
+
+                            // Update per-peer stats (messages sent)
+                            let stats = app
+                                .peer_stats
+                                .entry(peer_id.clone())
+                                .or_insert((0, 0, 0, 0));
+                            stats.0 += 1;
 
                             // Use DM protocol so receiver routes to peer chat
                             let node = node.clone();
@@ -367,10 +382,18 @@ impl Handler for ChatPanel {
                                     tracing::error!("DM failed: {e}");
                                 }
                             });
+
+                            let target_snap = ChatTargetSnapshot::Peer(peer_id.clone());
+                            app.input.clear();
+                            return Some(Action::PersistChat {
+                                id: msg_id.to_string(),
+                                sender: ChatSenderSnapshot::Me,
+                                text: msg,
+                                timestamp,
+                                target: target_snap,
+                            });
                         }
                     }
-
-                    app.input.clear();
                 }
                 Some(Action::None)
             }

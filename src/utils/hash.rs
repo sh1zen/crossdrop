@@ -194,5 +194,4 @@ pub fn get_or_create_secret() -> anyhow::Result<(SecretKey, Option<InstanceGuard
         rand::fill(&mut bytes);
         return Ok((SecretKey::from_bytes(&bytes), None));
     }
-
 }

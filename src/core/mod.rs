@@ -1,9 +1,9 @@
+pub mod config;
 pub mod connection;
 pub mod engine;
 pub mod initializer;
 pub mod peer_registry;
 pub mod persistence;
 pub mod pipeline;
-pub mod protocol;
 pub mod security;
 pub mod transaction;

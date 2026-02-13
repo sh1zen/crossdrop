@@ -1,6 +1,9 @@
+use crate::core::config::TYPING_TIMEOUT_SECS;
 use crate::core::engine::TransferEngine;
-use crate::core::transaction::TransactionManager;
+use crate::ui::notify::NotifyManager;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -95,14 +98,7 @@ pub struct Message {
     /// Absolute timestamp formatted at creation (e.g. `"14:32"`).
     pub timestamp: String,
     /// Which chat context this message belongs to.
-    pub target: ChatTarget,
-    /// For outgoing room broadcasts: list of peer IDs the message was
-    /// sent to.  Empty for incoming messages.
-    #[allow(dead_code)]
-    pub recipients: Vec<String>,
-    /// Monotonic instant kept for internal ordering only.
-    #[allow(dead_code)]
-    pub created_at: Instant,
+    pub target: ChatTarget
 }
 
 /// The logical message table.  Rendering consumes this — not network events.
@@ -126,18 +122,15 @@ impl MessageTable {
 
     /// All messages for a given chat target, in insertion order.
     pub fn messages_for(&self, target: &ChatTarget) -> Vec<&Message> {
-        self.messages.iter().filter(|m| &m.target == target).collect()
+        self.messages
+            .iter()
+            .filter(|m| &m.target == target)
+            .collect()
     }
 
     /// Clear messages for a target (`/clear` command).
     pub fn clear_target(&mut self, target: &ChatTarget) {
         self.messages.retain(|m| &m.target != target);
-    }
-
-    /// Total number of messages across all targets.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.messages.len()
     }
 }
 
@@ -184,6 +177,11 @@ impl UnreadTracker {
     pub fn remove_peer(&mut self, peer_id: &str) {
         self.peers.remove(peer_id);
     }
+
+    /// Total unread messages across room + all peer DMs.
+    pub fn total(&self) -> usize {
+        self.room + self.peers.values().sum::<usize>()
+    }
 }
 
 // ── Typing State ─────────────────────────────────────────────────────────────
@@ -192,7 +190,6 @@ impl UnreadTracker {
 ///
 /// * Peer-specific — does **not** create message entries.
 /// * Auto-expires after `TYPING_TIMEOUT_SECS`.
-const TYPING_TIMEOUT_SECS: u64 = 3;
 
 pub struct TypingState {
     /// peer_id → when the peer last signalled "typing".
@@ -231,103 +228,92 @@ impl TypingState {
     }
 }
 
-pub struct PendingFileOffer {
+/// A pending remote file/folder request with editable download path.
+pub struct RemotePathRequest {
     pub peer_id: String,
-    pub _file_id: Uuid,
-    pub _filename: String,
-    pub _filesize: u64,
-    pub _total_size: u64,
-}
-
-pub struct PendingFolderOffer {
-    pub peer_id: String,
-    pub folder_id: Uuid,
-    pub dirname: String,
-    pub _file_count: u32,
-    pub _total_size: u64,
-}
-
-/// A legacy pending file offer for backward compatibility.
-pub struct AcceptingFileOffer {
-    pub peer_id: String,
-    pub file_id: Uuid,
-    pub filename: String,
-    pub filesize: u64,
-    pub _total_size: u64,
-    pub save_path_input: String,
-    pub is_remote: bool,
-    pub remote_path: Option<String>,
-}
-
-/// A pending remote file request with editable download path.
-pub struct RemoteFileRequest {
-    pub peer_id: String,
-    pub filename: String,
-    pub filesize: u64,
+    /// Name of the file or folder.
+    pub name: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Remote path being requested.
     pub remote_path: String,
+    /// User-editable save path.
     pub save_path_input: String,
+    /// 0 = Accept, 1 = Decline, 2 = Path input.
     pub button_focus: usize,
+    /// Whether the path input field is being edited.
     pub is_path_editing: bool,
+    /// True if this is a folder request, false if file.
+    pub is_folder: bool,
 }
-
-/// A pending remote folder request with editable download path.
-pub struct RemoteFolderRequest {
-    pub peer_id: String,
-    pub dirname: String,
-    pub total_size: u64,
-    pub remote_path: String,
-    pub save_path_input: String,
-    pub button_focus: usize,
-    pub is_path_editing: bool,
-}
-
-/// A legacy pending folder offer for backward compatibility.
-pub struct AcceptingFolderOffer {
-    pub peer_id: String,
-    pub folder_id: Uuid,
-    pub dirname: String,
-    pub file_count: u32,
-    pub total_size: u64,
-    pub is_remote: bool,
-    pub remote_path: Option<String>,
-    pub save_path_input: String,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum FileDirection {
-    Sent,
-    Received,
-}
-
-#[derive(Clone)]
-pub enum FileTransferStatus {
-    Rejected,
-}
-
-#[derive(Clone)]
-pub struct FileRecord {
-    pub direction: FileDirection,
-    pub peer_id: String,
-    pub filename: String,
-    pub filesize: u64,
-    pub path: Option<String>,
-    pub timestamp: Instant,
-}
-
-#[derive(Default)]
-pub struct DataStats {
-    pub bytes_sent: u64,
-    pub messages_sent: u64,
-}
-
-/// NOTE: DataStats above is kept for backward compatibility during transition.
-/// The authoritative stats are in TransferEngine.stats().
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct RemoteEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+}
+
+/// Available UI themes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppTheme {
+    Default,
+    Blue,
+    Green,
+    Purple,
+    Red,
+}
+
+impl AppTheme {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AppTheme::Default => "Default (Cyan)",
+            AppTheme::Blue => "Blue",
+            AppTheme::Green => "Green",
+            AppTheme::Purple => "Purple",
+            AppTheme::Red => "Red",
+        }
+    }
+
+    pub fn accent(&self) -> ratatui::style::Color {
+        match self {
+            AppTheme::Default => ratatui::style::Color::Cyan,
+            AppTheme::Blue => ratatui::style::Color::Blue,
+            AppTheme::Green => ratatui::style::Color::Green,
+            AppTheme::Purple => ratatui::style::Color::Magenta,
+            AppTheme::Red => ratatui::style::Color::Red,
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "blue" => AppTheme::Blue,
+            "green" => AppTheme::Green,
+            "purple" => AppTheme::Purple,
+            "red" => AppTheme::Red,
+            _ => AppTheme::Default,
+        }
+    }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            AppTheme::Default => "default",
+            AppTheme::Blue => "blue",
+            AppTheme::Green => "green",
+            AppTheme::Purple => "purple",
+            AppTheme::Red => "red",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            AppTheme::Default => AppTheme::Blue,
+            AppTheme::Blue => AppTheme::Green,
+            AppTheme::Green => AppTheme::Purple,
+            AppTheme::Purple => AppTheme::Red,
+            AppTheme::Red => AppTheme::Default,
+        }
+    }
 }
 
 pub struct App {
@@ -360,33 +346,14 @@ pub struct App {
     /// Per-peer connectivity status (Online / Offline).
     pub peer_status: HashMap<String, PeerStatus>,
     pub selected_peer_idx: usize,
-
-    // File offers
-    pub pending_offers: Vec<PendingFileOffer>,
-    pub accepting_file: Option<AcceptingFileOffer>,
-    pub file_progress: HashMap<Uuid, (String, u32, u32)>,
-    pub send_progress: HashMap<Uuid, (String, u32, u32)>,
-    pub rejected_transfers: HashMap<Uuid, (String, Option<String>)>, // file_id -> (filename, reason)
-    pub file_transfer_status: HashMap<Uuid, FileTransferStatus>, // Track status of transfers
-    pub file_offer_button_focus: usize, // 0 = Accept, 1 = Reject
-    pub file_path_editing: bool,
-
-    // Folder offers
-    pub pending_folder_offers: Vec<PendingFolderOffer>,
-    pub accepting_folder: Option<AcceptingFolderOffer>,
-    pub folder_progress: HashMap<Uuid, (u32, u32)>,
-    pub folder_offer_button_focus: usize, // 0 = Accept, 1 = Reject
-    pub folder_path_editing: bool,
-    /// Maps file_id to folder_id for tracking which folder a file belongs to
-    pub file_to_folder: HashMap<Uuid, Uuid>,
-    /// Tracks folder transactions: folder_id -> (peer_id, dirname, total_size, file_count, received_count)
-    pub folder_transactions: HashMap<Uuid, (String, String, u64, u32, u32)>,
-
-    // File history
-    pub file_history: Vec<FileRecord>,
-
-    // Data statistics
-    pub stats: DataStats,
+    /// Peer info popup: which peer is being viewed.
+    pub peer_info_popup: Option<String>,
+    /// Per-peer statistics: (messages_sent, messages_received, files_sent, files_received).
+    pub peer_stats: HashMap<String, (u64, u64, u64, u64)>,
+    /// Per-peer connection timestamps.
+    pub peer_connected_at: HashMap<String, String>,
+    /// Per-peer IP addresses (remote address from WebRTC ICE connection).
+    pub peer_ips: HashMap<String, String>,
 
     // Connect
     pub connect_ticket_input: String,
@@ -399,8 +366,16 @@ pub struct App {
 
     // Files
     pub history_scroll: usize,
-    pub files_peer_idx: usize,
+
     pub files_search: String,
+    /// Whether search mode is active in Files panel.
+    pub files_search_mode: bool,
+    /// Index of the selected active transfer (for cancel).
+    pub active_transfer_idx: usize,
+    /// Index of the selected history entry (for info popup).
+    pub history_selected_idx: usize,
+    /// Focus area in Files panel: true = active transfers, false = history.
+    pub files_focus_active: bool,
 
     // Settings
     pub display_name: String,
@@ -411,31 +386,35 @@ pub struct App {
     pub remote_path: String,
     pub remote_entries: Vec<RemoteEntry>,
     pub remote_selected: usize,
-    pub remote_file_request: Option<RemoteFileRequest>,
-    pub remote_folder_request: Option<RemoteFolderRequest>,
+    pub remote_path_request: Option<RemotePathRequest>,
     /// Save paths for pending remote file requests, keyed by peer_id.
     /// When a file offer arrives from a peer in this map, auto-accept
     /// with the stored save path instead of showing a popup.
     pub pending_remote_save_paths: HashMap<String, String>,
 
-    // Status
-    pub status: String,
+    // Notifications (user-facing status bar)
+    pub notify: NotifyManager,
 
     // Connecting status
     pub connecting_peers: HashMap<String, String>,
+
+    // Theme
+    pub theme: AppTheme,
 
     // ── Transfer Engine ──────────────────────────────────────────────────
     /// The TransferEngine owns ALL transfer state and logic.
     /// No transfer logic exists outside the engine.
     pub engine: TransferEngine,
 
-    // ── Legacy fields (kept for transition, delegate to engine) ──────────
-    /// Legacy transaction manager reference — use engine.transactions() instead.
-    pub transactions: TransactionManager,
+    // ── Wire-level statistics ────────────────────────────────────────────
+    /// Cumulative wire-level TX/RX bytes - atomic counters for direct
+    /// updates from WebRTC connections. Tracks ALL bytes crossing the network.
+    pub cumulative_tx: Arc<AtomicU64>,
+    pub cumulative_rx: Arc<AtomicU64>,
 }
 
 impl App {
-    pub fn new(peer_id: String, ticket: String, display_name: Option<String>) -> Self {
+    pub fn new(peer_id: String, ticket: String, display_name: Option<String>, cumulative_tx: Arc<AtomicU64>, cumulative_rx: Arc<AtomicU64>) -> Self {
         Self {
             mode: Mode::Home,
             input: String::new(),
@@ -453,71 +432,35 @@ impl App {
             peer_keys: HashMap::new(),
             peer_status: HashMap::new(),
             selected_peer_idx: 0,
-            pending_offers: Vec::new(),
-            accepting_file: None,
-            file_progress: HashMap::new(),
-            send_progress: HashMap::new(),
-            rejected_transfers: HashMap::new(),
-            file_transfer_status: HashMap::new(),
-            file_offer_button_focus: 0,
-            file_path_editing: false,
-            pending_folder_offers: Vec::new(),
-            accepting_folder: None,
-            folder_progress: HashMap::new(),
-            folder_offer_button_focus: 0,
-            folder_path_editing: false,
-            file_to_folder: HashMap::new(),
-            folder_transactions: HashMap::new(),
-            file_history: Vec::new(),
-            stats: DataStats::default(),
+            peer_info_popup: None,
+            peer_stats: HashMap::new(),
+            peer_connected_at: HashMap::new(),
+            peer_ips: HashMap::new(),
             connect_ticket_input: String::new(),
             send_file_path: String::new(),
             log_scroll: 0,
             history_scroll: 0,
-            files_peer_idx: 0,
             files_search: String::new(),
-            display_name: display_name.unwrap_or_else(|| "Anonymous".to_string()),
+            files_search_mode: false,
+            active_transfer_idx: 0,
+            history_selected_idx: 0,
+            files_focus_active: true,
+            display_name: display_name.unwrap_or_default(),
             // Remote access is disabled by default per security spec.
             remote_access: false,
             remote_peer: None,
             remote_path: "/".to_string(),
             remote_entries: Vec::new(),
             remote_selected: 0,
-            remote_file_request: None,
-            remote_folder_request: None,
+            remote_path_request: None,
             pending_remote_save_paths: HashMap::new(),
-            status: String::new(),
+            theme: AppTheme::Default,
+            notify: NotifyManager::new(),
             connecting_peers: HashMap::new(),
             engine: TransferEngine::new(),
-            transactions: TransactionManager::new(),
+            cumulative_tx,
+            cumulative_rx,
         }
-    }
-
-    /// Peer attualmente selezionato nella vista Files
-    pub fn files_peer(&self) -> Option<&String> {
-        self.peers.get(self.files_peer_idx)
-    }
-
-    /// File history filtrata per peer + search
-    pub fn filtered_file_history(&self) -> Vec<&FileRecord> {
-        let peer = match self.files_peer() {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
-
-        let search = self.files_search.to_lowercase();
-
-        self.file_history
-            .iter()
-            .filter(|r| &r.peer_id == peer)
-            .filter(|r| {
-                if search.is_empty() {
-                    true
-                } else {
-                    r.filename.to_lowercase().contains(&search)
-                }
-            })
-            .collect()
     }
 
     /// Build the list of chat targets for the sidebar: Room + each peer.
@@ -534,11 +477,11 @@ impl App {
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
-        self.status = msg.into();
+        self.notify.info(msg);
     }
 
     pub fn push_error(&mut self, msg: impl Into<String>) {
-        self.status = msg.into();
+        self.notify.error(msg);
     }
 
     pub fn add_peer(&mut self, peer_id: String) {
@@ -546,36 +489,20 @@ impl App {
             self.peers.push(peer_id.clone());
         }
         // Mark as online (re-connection or first connection)
-        self.peer_status.insert(peer_id, PeerStatus::Online);
+        self.peer_status.insert(peer_id.clone(), PeerStatus::Online);
+        // Track connection time
+        self.peer_connected_at.insert(peer_id, crate::ui::helpers::format_absolute_timestamp_now());
     }
 
     /// Transition a peer to offline state.
     /// Preserves identity, chat history, display name, and keys.
     /// Does NOT remove the peer from the list.
     pub fn set_peer_offline(&mut self, peer_id: &str) {
-        self.peer_status.insert(peer_id.to_string(), PeerStatus::Offline);
+        self.peer_status
+            .insert(peer_id.to_string(), PeerStatus::Offline);
 
         // Clean up ephemeral typing indicator
         self.typing.remove_peer(peer_id);
-
-        // Clean up pending offers from this peer (they can't complete)
-        self.pending_offers.retain(|o| o.peer_id != peer_id);
-        self.pending_folder_offers.retain(|o| o.peer_id != peer_id);
-
-        // Clean up folder transactions from this peer
-        self.folder_transactions.retain(|_, (pid, _, _, _, _)| pid != peer_id);
-
-        // Clear accepting state if it's from this peer
-        if let Some(ref af) = self.accepting_file {
-            if af.peer_id == peer_id {
-                self.accepting_file = None;
-            }
-        }
-        if let Some(ref af) = self.accepting_folder {
-            if af.peer_id == peer_id {
-                self.accepting_folder = None;
-            }
-        }
 
         // If we're viewing this peer's remote filesystem, exit remote mode
         if self.mode == Mode::Remote && self.remote_peer.as_deref() == Some(peer_id) {
@@ -602,25 +529,6 @@ impl App {
         self.typing.remove_peer(peer_id);
         self.unread.remove_peer(peer_id);
 
-        // Clean up pending offers from this peer
-        self.pending_offers.retain(|o| o.peer_id != peer_id);
-        self.pending_folder_offers.retain(|o| o.peer_id != peer_id);
-
-        // Clean up folder transactions from this peer
-        self.folder_transactions.retain(|_, (pid, _, _, _, _)| pid != peer_id);
-
-        // Clear accepting state if it's from this peer
-        if let Some(ref af) = self.accepting_file {
-            if af.peer_id == peer_id {
-                self.accepting_file = None;
-            }
-        }
-        if let Some(ref af) = self.accepting_folder {
-            if af.peer_id == peer_id {
-                self.accepting_folder = None;
-            }
-        }
-
         // If we're viewing this peer's remote filesystem, exit remote mode
         if self.mode == Mode::Remote && self.remote_peer.as_deref() == Some(peer_id) {
             self.mode = Mode::Peers;
@@ -631,6 +539,16 @@ impl App {
     /// Check if a peer is currently online.
     pub fn is_peer_online(&self, peer_id: &str) -> bool {
         self.peer_status.get(peer_id).copied() == Some(PeerStatus::Online)
+    }
+
+    /// Get wire-level TX bytes (session lifetime).
+    pub fn total_wire_tx(&self) -> u64 {
+        self.cumulative_tx.load(Ordering::Relaxed)
+    }
+
+    /// Get wire-level RX bytes (session lifetime).
+    pub fn total_wire_rx(&self) -> u64 {
+        self.cumulative_rx.load(Ordering::Relaxed)
     }
 
     /// Switch the active chat target and reset unread for it.
@@ -650,5 +568,10 @@ impl App {
     /// Count unread DM messages for a specific peer.
     pub fn unread_dm_count(&self, peer_id: &str) -> usize {
         self.unread.peer_count(peer_id)
+    }
+
+    /// Total unread messages across all chat channels.
+    pub fn total_unread(&self) -> usize {
+        self.unread.total()
     }
 }

@@ -1,30 +1,180 @@
-use crate::core::protocol::coordinator::SecureTransferSnapshot;
-use crate::core::transaction::TransactionSnapshot;
+use crate::core::transaction::{TransactionDirection, TransactionSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TransferState {
-    pub file_id: Uuid,
-    pub filename: String,
-    pub total_chunks: u32,
-    pub received_chunks: u32,
-    pub dest_path: Option<PathBuf>,
+// ── Transfer Status ──────────────────────────────────────────────────────────
+
+/// Outcome status for a transfer record in history.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TransferStatus {
+    /// Transfer completed successfully.
+    #[default]
+    Ok,
+    /// Transfer was declined/rejected by the peer.
+    Declined,
+    /// Transfer failed with an error.
+    Error,
+    /// Transfer was cancelled by the user.
+    Cancelled,
+    /// Resume was declined by the sender.
+    ResumeDeclined,
+    /// Transfer expired before it could be resumed.
+    Expired,
 }
 
+impl TransferStatus {
+    /// Human-readable label for the status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            TransferStatus::Ok => "✓",
+            TransferStatus::Declined => "✗ declined",
+            TransferStatus::Error => "⚠ error",
+            TransferStatus::Cancelled => "⊘ cancelled",
+            TransferStatus::ResumeDeclined => "↻✗ resume declined",
+            TransferStatus::Expired => "⏱ expired",
+        }
+    }
+}
+
+// ── Transfer History Snapshot ────────────────────────────────────────────────
+
+/// Persistable transfer history record.
+/// One entry per completed/cancelled/rejected transaction.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TransferRecordSnapshot {
+    pub direction: TransactionDirection,
+    pub peer_id: String,
+    pub display_name: String,
+    pub total_size: u64,
+    pub file_count: u32,
+    /// Absolute timestamp formatted as "dd-mm-yyyy HH:MM".
+    pub timestamp: String,
+    /// Outcome status of the transfer.
+    #[serde(default)]
+    pub status: TransferStatus,
+}
+
+// ── Transfer Statistics Snapshot ──────────────────────────────────────────────
+
+/// Persistable cumulative transfer statistics.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TransferStatsSnapshot {
+    pub files_sent: u64,
+    pub files_received: u64,
+    pub folders_sent: u64,
+    pub folders_received: u64,
+    /// Cumulative chat messages sent (persisted across sessions).
+    #[serde(default)]
+    pub messages_sent: u64,
+    /// Cumulative chat messages received (persisted across sessions).
+    #[serde(default)]
+    pub messages_received: u64,
+}
+
+// ── Chat History Snapshot ────────────────────────────────────────────────────
+
+/// Who sent the chat message (persistable).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ChatSenderSnapshot {
+    Me,
+    Peer(String),
+}
+
+/// Which chat channel the message belongs to (persistable).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ChatTargetSnapshot {
+    Room,
+    Peer(String),
+}
+
+/// Persistable chat message record.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatMessageSnapshot {
+    pub id: String,
+    pub sender: ChatSenderSnapshot,
+    pub text: String,
+    /// Absolute timestamp formatted at creation (e.g. "14:32").
+    pub timestamp: String,
+    pub target: ChatTargetSnapshot,
+}
+
+// ── Pending Message Queue ────────────────────────────────────────────────────
+
+/// Types of messages that can be queued for offline peers.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum QueuedMessageType {
+    /// Direct message (chat).
+    Dm { message: String },
+    /// Transaction request.
+    TransactionRequest {
+        transaction_id: Uuid,
+        display_name: String,
+        manifest: crate::core::transaction::TransactionManifest,
+        total_size: u64,
+    },
+    /// Transaction response.
+    TransactionResponse {
+        transaction_id: Uuid,
+        accepted: bool,
+        dest_path: Option<String>,
+        reject_reason: Option<String>,
+    },
+    /// Transaction cancel.
+    TransactionCancel { transaction_id: Uuid },
+}
+
+/// A message queued for delivery to an offline peer.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QueuedMessage {
+    /// Unique ID for this queued message.
+    pub id: Uuid,
+    /// Target peer ID.
+    pub peer_id: String,
+    /// The message type and payload.
+    pub message_type: QueuedMessageType,
+    /// Timestamp when the message was queued.
+    pub queued_at: String,
+}
+
+// ── Unified Persistence ──────────────────────────────────────────────────────
+
+/// Central persistence for all application state that must survive restarts.
+///
+/// Saved atomically via temp-file + rename on every mutation.
+/// The application may be closed at any time — every change triggers a save.
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Persistence {
-    pub transfers: HashMap<Uuid, TransferState>,
     /// Transaction-level persistence for resume support.
     #[serde(default)]
     pub transactions: HashMap<Uuid, TransactionSnapshot>,
-    /// Secure transfer snapshots for resumable transfers.
+
+    /// User's own display name (empty string = not set).
     #[serde(default)]
-    pub secure_transfers: HashMap<Uuid, SecureTransferSnapshot>,
+    pub display_name: Option<String>,
+
+    /// Completed transfer history with absolute timestamps.
+    #[serde(default)]
+    pub transfer_history: Vec<TransferRecordSnapshot>,
+
+    /// Cumulative transfer statistics (files/folders sent/received).
+    #[serde(default)]
+    pub transfer_stats: TransferStatsSnapshot,
+
+    /// Session-scoped chat message history.
+    #[serde(default)]
+    pub chat_history: Vec<ChatMessageSnapshot>,
+
+    /// Messages queued for offline peers.
+    #[serde(default)]
+    pub pending_messages: Vec<QueuedMessage>,
+
+    /// UI theme name (persisted across sessions).
+    #[serde(default)]
+    pub theme: String,
 }
 
 impl Persistence {
@@ -41,60 +191,106 @@ impl Persistence {
             error!(event = "persistence_parse_failure", path = %path.display(), error = %e, "Failed to parse persistence state");
             e
         })?;
-        debug!(event = "persistence_loaded", transactions = p.transactions.len(), transfers = p.transfers.len(), "Persistence state loaded");
+        debug!(
+            event = "persistence_loaded",
+            transactions = p.transactions.len(),
+            history = p.transfer_history.len(),
+            "Persistence state loaded"
+        );
         Ok(p)
     }
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let content = serde_json::to_string_pretty(self)?;
-
-        // Atomic write: write to a temporary file then rename.
-        // This prevents corruption if the process is killed mid-write
-        // (e.g. power loss, crash). The rename is atomic on all major
-        // filesystems (NTFS, ext4, APFS).
-        let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &content).map_err(|e| {
-            error!(event = "persistence_save_failure", path = %tmp_path.display(), error = %e, "Failed to write persistence temp file");
-            e
-        })?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            error!(event = "persistence_rename_failure", from = %tmp_path.display(), to = %path.display(), error = %e, "Failed to rename persistence temp file");
-            // Attempt cleanup of the temp file on rename failure
-            let _ = std::fs::remove_file(&tmp_path);
-            e
-        })?;
-        Ok(())
+        crate::utils::atomic_write::atomic_write(&path, content.as_bytes())
     }
 
     /// Remove a completed transaction from persistence.
     pub fn remove_transaction(&mut self, id: &Uuid) -> Result<()> {
         self.transactions.remove(id);
-        self.secure_transfers.remove(id);
         self.save()
     }
 
-    /// Save a secure transfer snapshot for resume.
-    #[allow(dead_code)]
-    pub fn save_secure_transfer(&mut self, snapshot: SecureTransferSnapshot) -> Result<()> {
-        self.secure_transfers.insert(snapshot.transaction_id, snapshot);
+    /// Save the user's display name.
+    pub fn save_display_name(&mut self, name: &str) -> Result<()> {
+        self.display_name = if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        };
         self.save()
     }
 
-    /// Load a secure transfer snapshot by transaction ID.
-    #[allow(dead_code)]
-    pub fn get_secure_transfer(&self, id: &Uuid) -> Option<&SecureTransferSnapshot> {
-        self.secure_transfers.get(id)
+    /// Append a transfer record to history and persist.
+    pub fn push_transfer_record(&mut self, record: TransferRecordSnapshot) -> Result<()> {
+        self.transfer_history.push(record);
+        self.save()
     }
 
-    /// Remove a secure transfer snapshot.
-    #[allow(dead_code)]
-    pub fn remove_secure_transfer(&mut self, id: &Uuid) -> Result<()> {
-        self.secure_transfers.remove(id);
+    /// Update transfer statistics and persist.
+    pub fn update_transfer_stats(&mut self, stats: &TransferStatsSnapshot) -> Result<()> {
+        self.transfer_stats = stats.clone();
         self.save()
+    }
+
+    /// Append a chat message to history and persist.
+    pub fn push_chat_message(&mut self, msg: ChatMessageSnapshot) -> Result<()> {
+        self.chat_history.push(msg);
+        self.save()
+    }
+
+    /// Save the UI theme name.
+    pub fn save_theme(&mut self, theme: &str) -> Result<()> {
+        self.theme = theme.to_string();
+        self.save()
+    }
+
+    /// Clear chat history for a specific target and persist.
+    pub fn clear_chat_target(&mut self, target: &ChatTargetSnapshot) -> Result<()> {
+        self.chat_history.retain(|m| match (&m.target, target) {
+            (ChatTargetSnapshot::Room, ChatTargetSnapshot::Room) => false,
+            (ChatTargetSnapshot::Peer(a), ChatTargetSnapshot::Peer(b)) if a == b => false,
+            _ => true,
+        });
+        self.save()
+    }
+
+    // ── Pending Message Queue ────────────────────────────────────────────────
+
+    /// Queue a message for an offline peer.
+    pub fn queue_message(&mut self, msg: QueuedMessage) -> Result<()> {
+        info!(
+            event = "message_queued",
+            peer_id = %msg.peer_id,
+            message_id = %msg.id,
+            "Message queued for offline peer"
+        );
+        self.pending_messages.push(msg);
+        self.save()
+    }
+
+    /// Get all pending messages for a specific peer.
+    pub fn get_pending_messages(&self, peer_id: &str) -> Vec<&QueuedMessage> {
+        self.pending_messages
+            .iter()
+            .filter(|m| m.peer_id == peer_id)
+            .collect()
+    }
+
+    /// Remove a delivered message from the queue.
+    pub fn remove_pending_message(&mut self, id: &Uuid) -> Result<()> {
+        let initial_len = self.pending_messages.len();
+        self.pending_messages.retain(|m| m.id != *id);
+        if self.pending_messages.len() < initial_len {
+            info!(
+                event = "pending_message_removed",
+                message_id = %id,
+                "Pending message removed after delivery"
+            );
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn path() -> Result<PathBuf> {

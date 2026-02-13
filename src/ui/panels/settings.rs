@@ -14,6 +14,7 @@ use ratatui::{
 enum FocusElement {
     DisplayNameInput,   // Index 0
     RemoteAccessToggle, // Index 1
+    ThemeToggle,        // Index 2
 }
 
 impl FocusElement {
@@ -21,6 +22,7 @@ impl FocusElement {
         match index {
             0 => FocusElement::DisplayNameInput,
             1 => FocusElement::RemoteAccessToggle,
+            2 => FocusElement::ThemeToggle,
             _ => FocusElement::DisplayNameInput,
         }
     }
@@ -29,6 +31,7 @@ impl FocusElement {
         match self {
             FocusElement::DisplayNameInput => 0,
             FocusElement::RemoteAccessToggle => 1,
+            FocusElement::ThemeToggle => 2,
         }
     }
 }
@@ -59,6 +62,7 @@ impl Component for SettingsPanel {
             .constraints([
                 Constraint::Length(3), // Display name input
                 Constraint::Length(3), // Remote access toggle
+                Constraint::Length(3), // Theme toggle
                 Constraint::Min(0),    // Spacer
             ])
             .split(area);
@@ -118,6 +122,42 @@ impl Component for SettingsPanel {
 
         let toggle_widget = Paragraph::new(toggle_line).block(toggle_block);
         f.render_widget(toggle_widget, chunks[1]);
+
+        // Theme toggle
+        let theme_focused = self.focused_element == FocusElement::ThemeToggle;
+        let theme_border_color = if theme_focused {
+            app.theme.accent()
+        } else {
+            Color::DarkGray
+        };
+
+        let theme_label = Span::styled(
+            format!(" {} ", app.theme.label()),
+            Style::default().fg(app.theme.accent()),
+        );
+
+        let theme_help = if theme_focused {
+            Span::styled(" (Press 't' to cycle) ", Style::default().fg(Color::Gray))
+        } else {
+            Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
+        };
+
+        let theme_line = Line::from(vec![
+            Span::raw("Theme: "),
+            theme_label,
+            theme_help,
+        ]);
+
+        let theme_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme_border_color))
+            .title(Span::styled(
+                " UI Theme ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let theme_widget = Paragraph::new(theme_line).block(theme_block);
+        f.render_widget(theme_widget, chunks[2]);
     }
 
     fn on_focus(&mut self, app: &mut App) {
@@ -147,14 +187,25 @@ impl Handler for SettingsPanel {
             KeyCode::Enter => {
                 // Save display name
                 let name = app.input.trim().to_string();
-                if !name.is_empty() && name != app.display_name {
+                if name != app.display_name {
                     app.display_name = name.clone();
-                    app.set_status(format!("Display name set to: {}", name));
+                    if name.is_empty() {
+                        app.set_status("Display name cleared".to_string());
+                    } else {
+                        app.set_status(format!("Display name set to: {}", name));
+                    }
 
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        node.broadcast_display_name(name).await;
-                    });
+                    // Persist to disk
+                    if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                        let _ = p.save_display_name(&name);
+                    }
+
+                    if !name.is_empty() {
+                        let node = node.clone();
+                        tokio::spawn(async move {
+                            node.broadcast_display_name(name).await;
+                        });
+                    }
                 }
                 app.input.clear();
                 return Some(Action::SwitchMode(crate::workers::app::Mode::Home));
@@ -180,6 +231,17 @@ impl Handler for SettingsPanel {
                             ));
                         }
                     }
+                    FocusElement::ThemeToggle => {
+                        if c == 't' || c == 'T' {
+                            app.theme = app.theme.next();
+                            let theme_str = app.theme.to_str().to_string();
+                            app.set_status(format!("Theme: {}", app.theme.label()));
+                            // Persist theme
+                            if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                                let _ = p.save_theme(&theme_str);
+                            }
+                        }
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -195,7 +257,7 @@ impl Handler for SettingsPanel {
 
 impl Focusable for SettingsPanel {
     fn focusable_elements(&self) -> Vec<FocusableElement> {
-        vec![FocusableElement::TextInput, FocusableElement::Toggle]
+        vec![FocusableElement::TextInput, FocusableElement::Toggle, FocusableElement::Toggle]
     }
 
     fn focused_index(&self) -> usize {

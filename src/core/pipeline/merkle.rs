@@ -1,35 +1,56 @@
-//! Merkle tree for file integrity verification.
+//! Merkle tree for file integrity verification with incremental computation.
 //!
-//! The sender computes Merkle roots for each file in the manifest.
-//! The receiver incrementally reconstructs the tree and validates
-//! the final root against the manifest.
+//! Used by the sender to compute the Merkle root as chunks are processed,
+//! and by the receiver to verify file integrity.
+//!
+//! # Incremental Verification Flow
+//!
+//! 1. Sender computes chunk hashes incrementally while reading the file
+//! 2. Sender sends the MerkleTree message (all chunk hashes + root) BEFORE chunks
+//! 3. Receiver stores expected chunk hashes
+//! 4. As each chunk arrives, receiver verifies its hash against the expected hash
+//! 5. If any chunk fails verification, receiver requests retransmission
+//! 6. Security is guaranteed by the Merkle root (sender cannot tamper with chunks)
 
 use sha3::{Digest, Sha3_256};
-use serde::{Deserialize, Serialize};
 
 /// A Merkle tree built from chunk hashes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct MerkleTree {
-    /// Leaf hashes (one per chunk, in order).
-    leaves: Vec<[u8; 32]>,
     /// The computed Merkle root.
     root: [u8; 32],
+    /// All leaf hashes (chunk hashes).
+    leaves: Vec<[u8; 32]>,
+}
+
+/// Incremental Merkle tree builder.
+///
+/// Allows adding leaves one at a time and computing the root at any point.
+/// Used by the sender to compute the Merkle root as chunks are processed.
+#[derive(Debug, Clone)]
+pub struct IncrementalMerkleBuilder {
+    /// Leaf hashes collected so far.
+    leaves: Vec<[u8; 32]>,
+}
+
+/// Expected chunk hashes for verification.
+///
+/// Created from the sender's MerkleTree message, used by the receiver
+/// to verify each chunk as it arrives.
+#[derive(Debug, Clone)]
+pub struct ChunkHashVerifier {
+    /// Expected hash for each chunk (indexed by chunk sequence number).
+    chunk_hashes: Vec<[u8; 32]>,
 }
 
 impl MerkleTree {
     /// Build a Merkle tree from an ordered list of chunk hashes.
     pub fn build(chunk_hashes: &[[u8; 32]]) -> Self {
-        if chunk_hashes.is_empty() {
-            return Self {
-                leaves: Vec::new(),
-                root: [0u8; 32],
-            };
+        let root = Self::compute_root(chunk_hashes);
+        Self {
+            root,
+            leaves: chunk_hashes.to_vec(),
         }
-
-        let leaves: Vec<[u8; 32]> = chunk_hashes.to_vec();
-        let root = Self::compute_root(&leaves);
-
-        Self { leaves, root }
     }
 
     /// Get the Merkle root.
@@ -37,13 +58,13 @@ impl MerkleTree {
         &self.root
     }
 
-    /// Get the number of leaves (chunks).
-    pub fn leaf_count(&self) -> usize {
-        self.leaves.len()
+    /// Get all leaf hashes.
+    pub fn leaves(&self) -> &[[u8; 32]] {
+        &self.leaves
     }
 
     /// Compute the Merkle root from a list of leaf hashes.
-    fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    pub fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         if leaves.is_empty() {
             return [0u8; 32];
         }
@@ -72,72 +93,136 @@ impl MerkleTree {
     }
 }
 
-/// Incremental Merkle tree builder for the receiver.
-/// Collects chunk hashes as they arrive and can verify the final root.
-#[derive(Debug, Clone)]
-pub struct IncrementalMerkleBuilder {
-    /// Expected total number of chunks.
-    total_chunks: u32,
-    /// Collected chunk hashes, indexed by chunk_index.
-    hashes: Vec<Option<[u8; 32]>>,
-    /// Number of hashes collected so far.
-    collected: u32,
+impl ChunkHashVerifier {
+    /// Create a new verifier from chunk hashes received from the sender.
+    pub fn new(chunk_hashes: Vec<[u8; 32]>) -> Self {
+        Self { chunk_hashes }
+    }
+
+    /// Create a new verifier with pre-allocated capacity for incremental hash addition.
+    /// Used when chunk hashes are sent in batches during transfer.
+    pub fn with_capacity(total_chunks: usize) -> Self {
+        Self {
+            chunk_hashes: vec![[0u8; 32]; total_chunks],
+        }
+    }
+
+    /// Add chunk hashes starting at a specific index.
+    /// Used for incremental hash delivery during transfer.
+    pub fn add_hashes(&mut self, start_index: u32, hashes: Vec<[u8; 32]>) {
+        let start = start_index as usize;
+        for (i, hash) in hashes.into_iter().enumerate() {
+            if start + i < self.chunk_hashes.len() {
+                self.chunk_hashes[start + i] = hash;
+            }
+        }
+    }
+
+    /// Get the expected hash for a specific chunk.
+    pub fn get_chunk_hash(&self, seq: u32) -> Option<&[u8; 32]> {
+        self.chunk_hashes.get(seq as usize)
+    }
+
+    /// Get total number of chunks.
+    pub fn total_chunks(&self) -> u32 {
+        self.chunk_hashes.len() as u32
+    }
+
+    /// Verify a pre-computed chunk hash against the expected hash.
+    /// This avoids double-hashing when the caller has already computed the
+    /// SHA3-256 hash (e.g. in [`StreamingFileWriter::write_chunk`]).
+    pub fn verify_chunk_hash(
+        &self,
+        seq: u32,
+        computed: &[u8; 32],
+    ) -> Result<(), ChunkVerificationError> {
+        let expected =
+            self.get_chunk_hash(seq)
+                .ok_or_else(|| ChunkVerificationError::InvalidSequence {
+                    seq,
+                    total: self.total_chunks(),
+                })?;
+
+        // Check if hash has been set (for incremental verification)
+        if expected == &[0u8; 32] {
+            return Err(ChunkVerificationError::HashNotYetReceived { seq });
+        }
+
+        if computed == expected {
+            Ok(())
+        } else {
+            Err(ChunkVerificationError::HashMismatch { seq })
+        }
+    }
 }
 
+/// Errors that can occur during chunk verification.
+#[derive(Debug, Clone)]
+pub enum ChunkVerificationError {
+    /// The chunk sequence number is out of range.
+    InvalidSequence { seq: u32, total: u32 },
+    /// The chunk hash doesn't match the expected hash.
+    HashMismatch { seq: u32 },
+    /// The chunk hash hasn't been received yet (incremental verification).
+    HashNotYetReceived { seq: u32 },
+}
+
+impl std::fmt::Display for ChunkVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSequence { seq, total } => {
+                write!(f, "Invalid chunk sequence {} (total: {})", seq, total)
+            }
+            Self::HashMismatch { seq, .. } => {
+                write!(f, "Chunk {} hash mismatch", seq)
+            }
+            Self::HashNotYetReceived { seq } => {
+                write!(f, "Chunk {} hash not yet received", seq)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChunkVerificationError {}
+
 impl IncrementalMerkleBuilder {
-    pub fn new(total_chunks: u32) -> Self {
+    /// Create a new incremental Merkle builder.
+    pub fn new() -> Self {
+        Self { leaves: Vec::new() }
+    }
+
+    /// Create a builder with pre-allocated capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            total_chunks,
-            hashes: vec![None; total_chunks as usize],
-            collected: 0,
+            leaves: Vec::with_capacity(capacity),
         }
     }
 
-    /// Add a chunk hash at the given index.
-    /// Returns `true` if the hash was newly added.
-    pub fn add_hash(&mut self, index: u32, hash: [u8; 32]) -> bool {
-        if index >= self.total_chunks {
-            return false;
-        }
-        if self.hashes[index as usize].is_none() {
-            self.hashes[index as usize] = Some(hash);
-            self.collected += 1;
-            true
-        } else {
-            false
-        }
+    /// Add a leaf hash to the tree.
+    pub fn add_leaf(&mut self, hash: [u8; 32]) {
+        self.leaves.push(hash);
     }
 
-    /// Check if all hashes have been collected.
-    pub fn is_complete(&self) -> bool {
-        self.collected == self.total_chunks
+    /// Convert into a MerkleTree.
+    pub fn build(self) -> MerkleTree {
+        MerkleTree::build(&self.leaves)
     }
+}
 
-    /// Compute the Merkle root from collected hashes.
-    /// Returns `None` if not all hashes have been collected.
-    pub fn compute_root(&self) -> Option<[u8; 32]> {
-        if !self.is_complete() {
-            return None;
-        }
-
-        let leaves: Vec<[u8; 32]> = self
-            .hashes
-            .iter()
-            .map(|h| h.expect("all hashes should be present"))
-            .collect();
-
-        Some(MerkleTree::compute_root(&leaves))
+impl Default for IncrementalMerkleBuilder {
+    fn default() -> Self {
+        Self::new()
     }
+}
 
-    /// Verify the final Merkle root against an expected value.
-    pub fn verify_root(&self, expected: &[u8; 32]) -> Option<bool> {
-        self.compute_root().map(|root| root == *expected)
-    }
-
-    /// Number of hashes collected.
-    pub fn collected_count(&self) -> u32 {
-        self.collected
-    }
+/// Hash a chunk of data.
+pub fn hash_chunk(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
 }
 
 /// Hash two nodes together for Merkle tree construction.
@@ -149,28 +234,6 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
     hash
-}
-
-/// Compute the Merkle root for a file given its raw bytes and chunk size.
-pub fn compute_file_merkle_root(file_data: &[u8], chunk_size: usize) -> [u8; 32] {
-    if file_data.is_empty() {
-        return [0u8; 32];
-    }
-
-    let chunk_hashes: Vec<[u8; 32]> = file_data
-        .chunks(chunk_size)
-        .map(|chunk| {
-            let mut hasher = Sha3_256::new();
-            hasher.update(chunk);
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            hash
-        })
-        .collect();
-
-    let tree = MerkleTree::build(&chunk_hashes);
-    *tree.root()
 }
 
 #[cfg(test)]
@@ -200,45 +263,58 @@ mod tests {
         let h3 = [3u8; 32];
         let tree = MerkleTree::build(&[h1, h2, h3]);
         let left = hash_pair(&h1, &h2);
-        let right = hash_pair(&h3, &h3); // odd, hashed with itself
+        let right = hash_pair(&h3, &h3);
         let root = hash_pair(&left, &right);
         assert_eq!(*tree.root(), root);
-    }
-
-    #[test]
-    fn test_incremental_builder() {
-        let hashes = vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
-        let tree = MerkleTree::build(&hashes);
-
-        let mut builder = IncrementalMerkleBuilder::new(4);
-        assert!(!builder.is_complete());
-
-        // Add in random order
-        builder.add_hash(2, hashes[2]);
-        builder.add_hash(0, hashes[0]);
-        builder.add_hash(3, hashes[3]);
-        assert!(!builder.is_complete());
-
-        builder.add_hash(1, hashes[1]);
-        assert!(builder.is_complete());
-
-        assert_eq!(builder.verify_root(tree.root()), Some(true));
-    }
-
-    #[test]
-    fn test_file_merkle_root() {
-        let data = vec![0u8; 1024];
-        let root = compute_file_merkle_root(&data, 256);
-        assert_ne!(root, [0u8; 32]);
-
-        // Same data should produce same root
-        let root2 = compute_file_merkle_root(&data, 256);
-        assert_eq!(root, root2);
     }
 
     #[test]
     fn test_empty() {
         let tree = MerkleTree::build(&[]);
         assert_eq!(*tree.root(), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_incremental_builder() {
+        let mut builder = IncrementalMerkleBuilder::with_capacity(3);
+
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let h3 = [3u8; 32];
+
+        builder.add_leaf(h1);
+        builder.add_leaf(h2);
+        builder.add_leaf(h3);
+
+        let tree = builder.build();
+        let expected_tree = MerkleTree::build(&[h1, h2, h3]);
+
+        assert_eq!(*tree.root(), *expected_tree.root());
+    }
+
+    #[test]
+    fn test_merkle_tree_leaves() {
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let tree = MerkleTree::build(&[h1, h2]);
+
+        assert_eq!(tree.leaves().len(), 2);
+        assert_eq!(tree.leaves()[0], h1);
+        assert_eq!(tree.leaves()[1], h2);
+    }
+
+    #[test]
+    fn test_chunk_hash_verifier() {
+        let data1 = b"chunk one data";
+        let data2 = b"chunk two data";
+        let h1 = hash_chunk(data1);
+        let h2 = hash_chunk(data2);
+
+        let verifier = ChunkHashVerifier::new(vec![h1, h2]);
+
+        // verify_chunk_hash (pre-computed hash)
+        assert!(verifier.verify_chunk_hash(0, &h1).is_ok());
+        assert!(verifier.verify_chunk_hash(1, &h2).is_ok());
+        assert!(verifier.verify_chunk_hash(0, &h2).is_err()); // wrong hash
     }
 }

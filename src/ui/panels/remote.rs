@@ -1,8 +1,8 @@
 use crate::core::initializer::PeerNode;
-use crate::ui::executer::UIPopup;
 use crate::ui::helpers::{format_file_size, get_display_name};
+use crate::ui::popups::UIPopup;
 use crate::ui::traits::{Action, Component, Handler};
-use crate::workers::app::{App, Mode, RemoteFileRequest, RemoteFolderRequest};
+use crate::workers::app::{App, Mode, RemotePathRequest};
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -142,16 +142,17 @@ impl Handler for RemotePanel {
                             let save_dir = std::env::current_dir()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|_| ".".to_string());
-                            app.remote_file_request = Some(RemoteFileRequest {
+                            app.remote_path_request = Some(RemotePathRequest {
                                 peer_id: peer_id.clone(),
-                                filename: entry.name.clone(),
-                                filesize: entry.size,
+                                name: entry.name.clone(),
+                                size: entry.size,
                                 remote_path,
                                 save_path_input: save_dir,
                                 button_focus: 0,
                                 is_path_editing: false,
+                                is_folder: false,
                             });
-                            return Some(Action::ShowPopup(UIPopup::RemoteFileRequest));
+                            return Some(Action::ShowPopup(UIPopup::RemotePathRequest));
                         }
                     }
                 }
@@ -198,16 +199,17 @@ impl Handler for RemotePanel {
                             let save_dir = std::env::current_dir()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|_| ".".to_string());
-                            app.remote_folder_request = Some(RemoteFolderRequest {
+                            app.remote_path_request = Some(RemotePathRequest {
                                 peer_id: peer_id.clone(),
-                                dirname: entry.name.clone(),
-                                total_size: entry.size,
+                                name: entry.name.clone(),
+                                size: entry.size,
                                 remote_path,
                                 save_path_input: save_dir,
                                 button_focus: 0,
                                 is_path_editing: false,
+                                is_folder: true,
                             });
-                            return Some(Action::ShowPopup(UIPopup::RemoteFolderRequest));
+                            return Some(Action::ShowPopup(UIPopup::RemotePathRequest));
                         }
                     }
                 }

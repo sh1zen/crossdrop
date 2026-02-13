@@ -150,54 +150,6 @@ impl Component for SendPanel {
             ])));
         }
 
-        // Legacy send progress (backward compatibility for non-transaction transfers)
-        for (filename, sent, total) in app.send_progress.values() {
-            let bar = self.progress_bar.render(*sent, *total, Color::Cyan);
-            let short_name = truncate_filename(filename, 20);
-            progress_items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    " -> ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(short_name, Style::default().fg(Color::White)),
-                Span::raw(" "),
-                bar.spans[0].clone(),
-                bar.spans[1].clone(),
-                bar.spans[2].clone(),
-                bar.spans[3].clone(),
-                Span::styled(
-                    format!(" ({}/{})", sent, total),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])));
-        }
-
-        // Legacy receive progress
-        for (filename, recv, total) in app.file_progress.values() {
-            let bar = self.progress_bar.render(*recv, *total, Color::Cyan);
-            let short_name = truncate_filename(filename, 20);
-            progress_items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    " <- ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(short_name, Style::default().fg(Color::White)),
-                Span::raw(" "),
-                bar.spans[0].clone(),
-                bar.spans[1].clone(),
-                bar.spans[2].clone(),
-                bar.spans[3].clone(),
-                Span::styled(
-                    format!(" ({}/{})", recv, total),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])));
-        }
-
         let progress_list = List::new(progress_items).block(
             Block::default()
                 .title(" Active Transfers ")
@@ -294,8 +246,7 @@ impl Handler for SendPanel {
                                             if let Ok(meta) = std::fs::metadata(&p) {
                                                 let size = meta.len();
                                                 *total += size;
-                                                let root_parent =
-                                                    root.parent().unwrap_or(root);
+                                                let root_parent = root.parent().unwrap_or(root);
                                                 let relative = p
                                                     .strip_prefix(root_parent)
                                                     .unwrap_or(&p)
@@ -316,12 +267,10 @@ impl Handler for SendPanel {
                         }
 
                         // Delegate to TransferEngine — no transfer logic in UI
-                        match app.engine.initiate_folder_send(
-                            &peer_id,
-                            &dirname,
-                            files_data,
-                            &path,
-                        ) {
+                        match app
+                            .engine
+                            .initiate_folder_send(&peer_id, &dirname, files_data, &path)
+                        {
                             Ok(outcome) => {
                                 let status = outcome
                                     .status
@@ -345,12 +294,10 @@ impl Handler for SendPanel {
                         let filesize = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
                         // Delegate to TransferEngine — no transfer logic in UI
-                        match app.engine.initiate_file_send(
-                            &peer_id,
-                            &filename,
-                            filesize,
-                            &path,
-                        ) {
+                        match app
+                            .engine
+                            .initiate_file_send(&peer_id, &filename, filesize, &path)
+                        {
                             Ok(outcome) => {
                                 app.send_file_path.clear();
                                 let status = outcome
@@ -364,9 +311,7 @@ impl Handler for SendPanel {
                                     Some(Action::EngineActions(outcome.actions))
                                 }
                             }
-                            Err(e) => {
-                                Some(Action::SetStatus(format!("Error: {}", e)))
-                            }
+                            Err(e) => Some(Action::SetStatus(format!("Error: {}", e))),
                         }
                     }
                 } else {

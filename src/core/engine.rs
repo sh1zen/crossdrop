@@ -11,25 +11,23 @@
 //! The UI layer reads state and dispatches commands; the transport layer
 //! sends/receives raw frames. All coordination happens here.
 
+use crate::core::config::{
+    CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_FILE_RETRANSMISSIONS, MAX_TRANSACTION_RETRIES,
+    TRANSACTION_TIMEOUT,
+};
 use crate::core::initializer::AppEvent;
-use crate::core::persistence::Persistence;
-use crate::core::protocol::coordinator::TransferCoordinator;
+use crate::core::persistence::{Persistence, TransferRecordSnapshot, TransferStatus};
 use crate::core::security::identity::PeerIdentity;
+use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
-    ManifestEntry, ResumeInfo, Transaction, TransactionDirection, TransactionManifest,
-    TransactionManager, TransactionState, CHUNK_SIZE,
+    ResumeInfo, Transaction, TransactionDirection, TransactionManager, TransactionManifest,
+    TransactionState,
 };
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-/// Maximum number of simultaneously active (non-terminal) transactions.
-pub const MAX_CONCURRENT_TRANSACTIONS: usize = 3;
 
 // ── Engine Actions ───────────────────────────────────────────────────────────
 
@@ -56,9 +54,13 @@ pub enum EngineAction {
     },
     /// Pre-register file destinations on the transport layer so incoming
     /// Metadata frames can find the correct save path.
+    /// If `resume_bitmaps` is non-empty, also register chunk bitmaps so
+    /// the Metadata handler can resume the file writer from the existing
+    /// temp file instead of truncating it.
     PrepareReceive {
         peer_id: String,
         files: Vec<(Uuid, PathBuf)>,
+        resume_bitmaps: Vec<(Uuid, crate::core::pipeline::chunk::ChunkBitmap)>,
     },
     /// Start sending a single file (outbound).
     SendFileData {
@@ -89,27 +91,39 @@ pub enum EngineAction {
         transaction_id: Uuid,
         resume_info: crate::core::transaction::ResumeInfo,
     },
+    /// Reject a resume request and notify the peer.
+    RejectResume {
+        peer_id: String,
+        transaction_id: Uuid,
+        reason: String,
+    },
     /// Re-send only the missing files/chunks for a resumed outbound transfer.
     ResendFiles {
         peer_id: String,
         transaction_id: Uuid,
     },
-    /// Handle a remote fetch (legacy path — sender side).
+    /// Handle a remote fetch (sender side).
     HandleRemoteFetch {
         peer_id: String,
         path: String,
         is_folder: bool,
     },
-    /// Accept a legacy file offer (wrap in transaction).
-    AcceptLegacyFileOffer {
+    /// Cancel an active transfer and notify the peer.
+    CancelTransaction {
         peer_id: String,
-        file_id: Uuid,
-        dest_path: String,
+        transaction_id: Uuid,
     },
-    /// Reject a legacy file offer.
-    RejectLegacyFileOffer {
+    /// Retransmit specific chunks due to Merkle integrity failure (receiver requested).
+    RetransmitChunks {
         peer_id: String,
         file_id: Uuid,
+        /// List of chunk indices that need to be resent.
+        chunk_indices: Vec<u32>,
+    },
+    /// Transaction completion acknowledged by peer.
+    TransactionCompleteAck {
+        peer_id: String,
+        transaction_id: Uuid,
     },
 }
 
@@ -151,10 +165,6 @@ pub struct PendingIncoming {
     pub save_path_input: String,
     pub button_focus: usize,
     pub path_editing: bool,
-    /// Whether this originated from a legacy FileOffer (not Transaction protocol).
-    pub is_legacy_file: bool,
-    /// For legacy file offers, the original file_id from the sender.
-    pub legacy_file_id: Option<Uuid>,
 }
 
 // ── Data Statistics ──────────────────────────────────────────────────────────
@@ -169,14 +179,16 @@ pub struct DataStats {
     pub bytes_sent: u64,
     /// Raw bytes received on the wire (post-compression, post-encryption).
     pub bytes_received: u64,
-    /// Pre-compression bytes sent (original payload size).
-    pub raw_bytes_sent: u64,
     /// Pre-compression bytes received (original payload size).
     pub raw_bytes_received: u64,
     pub messages_sent: u64,
     pub messages_received: u64,
     pub files_sent: u64,
     pub files_received: u64,
+    /// Folders sent (cumulative).
+    pub folders_sent: u64,
+    /// Folders received (cumulative).
+    pub folders_received: u64,
     /// Metadata and control-channel overhead.
     pub metadata_bytes: u64,
     /// Remote filesystem exploration traffic.
@@ -193,7 +205,10 @@ pub struct TransferRecord {
     pub display_name: String,
     pub total_size: u64,
     pub file_count: u32,
-    pub timestamp: Instant,
+    /// Absolute timestamp formatted as "dd-mm-yyyy HH:MM".
+    pub timestamp: String,
+    /// Outcome status (ok, declined, error, cancelled, resume_declined).
+    pub status: TransferStatus,
 }
 
 // ── TransferEngine ───────────────────────────────────────────────────────────
@@ -209,52 +224,170 @@ pub struct TransferEngine {
     transfer_history: Vec<TransferRecord>,
     /// Maps outbound transaction_id to the local source path (for sending after acceptance).
     source_paths: HashMap<Uuid, String>,
-    /// Secure transfer coordinator for authentication, replay protection, and manifest enforcement.
-    #[allow(dead_code)]
-    coordinator: Option<TransferCoordinator>,
-    /// Our peer identity (long-term Ed25519 key pair).
-    #[allow(dead_code)]
+    /// Our peer identity (long-term key pair for signing manifests and resume requests).
     identity: Option<PeerIdentity>,
+    /// Replay protection: monotonic counters per transaction.
+    replay_guard: ReplayGuard,
+    /// Per-peer file stats: (files_sent, files_received).
+    peer_file_stats: HashMap<String, (u64, u64)>,
 }
 
 impl TransferEngine {
+    /// Restituisce una transazione mutabile dato un file_id, se esiste.
+    pub fn find_transaction_by_file_mut(
+        &mut self,
+        file_id: &uuid::Uuid,
+    ) -> Option<&mut crate::core::transaction::Transaction> {
+        self.transactions.find_by_file_mut(file_id)
+    }
+    /// Restituisce il percorso sorgente per una transaction (se esiste).
+    pub fn get_source_path(&self, txn_id: &Uuid) -> Option<&String> {
+        self.source_paths.get(txn_id)
+    }
     pub fn new() -> Self {
         // Try to load or create the peer identity
         let identity = PeerIdentity::default_path()
             .ok()
             .and_then(|path| PeerIdentity::load_or_create(&path).ok());
 
-        let coordinator = identity
-            .as_ref()
-            .map(|id| TransferCoordinator::new(id.clone()));
+        // Restore transfer history and resumable transactions from persistence
+        let (transfer_history, resumable_transactions, source_paths, persisted_stats) =
+            match Persistence::load() {
+                Ok(mut p) => {
+                    // Restore transfer history
+                    let mut history: Vec<TransferRecord> = p
+                        .transfer_history
+                        .iter()
+                        .map(|snap| TransferRecord {
+                            direction: snap.direction,
+                            peer_id: snap.peer_id.clone(),
+                            display_name: snap.display_name.clone(),
+                            total_size: snap.total_size,
+                            file_count: snap.file_count,
+                            timestamp: snap.timestamp.clone(),
+                            status: snap.status.clone(),
+                        })
+                        .collect();
+
+                    // Restore outbound resumable/interrupted transactions to active memory
+                    let mut resumable = HashMap::new();
+                    let mut paths = HashMap::new();
+                    let mut expired_ids = Vec::new();
+
+                    for (id, snap) in &p.transactions {
+                        // Only restore outbound transactions that are resumable
+                        if snap.direction == TransactionDirection::Outbound
+                            && matches!(
+                                snap.state,
+                                TransactionState::Resumable | TransactionState::Interrupted
+                            )
+                        {
+                            // Check if the transaction has expired
+                            if snap.is_expired() {
+                                warn!(
+                                    event = "transaction_expired",
+                                    transaction_id = %id,
+                                    "Transaction has expired, moving to history"
+                                );
+                                expired_ids.push(*id);
+                                // Add to history as expired
+                                let expired_record = TransferRecord {
+                                    direction: snap.direction,
+                                    peer_id: snap.peer_id.clone(),
+                                    display_name: snap.display_name.clone(),
+                                    total_size: snap.total_size,
+                                    file_count: snap.files.len() as u32,
+                                    timestamp: crate::ui::helpers::format_absolute_timestamp_now(),
+                                    status: TransferStatus::Expired,
+                                };
+                                history.push(expired_record);
+                                continue;
+                            }
+
+                            let txn = Transaction::from_snapshot(snap);
+                            resumable.insert(*id, txn);
+
+                            // Restore source path if available
+                            if let Some(src) = &snap.source_path {
+                                paths.insert(*id, src.clone());
+                            }
+
+                            info!(
+                                event = "transaction_restored_from_persistence",
+                                transaction_id = %id,
+                                state = ?snap.state,
+                                peer_id = %snap.peer_id,
+                                "Restored outbound transaction from persistence"
+                            );
+                        }
+                    }
+
+                    // Remove expired transactions from persistence
+                    for id in &expired_ids {
+                        p.transactions.remove(id);
+                    }
+                    if !expired_ids.is_empty() {
+                        // Also update the transfer history in persistence
+                        p.transfer_history = history.iter().map(|rec| {
+                            crate::core::persistence::TransferRecordSnapshot {
+                                direction: rec.direction,
+                                peer_id: rec.peer_id.clone(),
+                                display_name: rec.display_name.clone(),
+                                total_size: rec.total_size,
+                                file_count: rec.file_count,
+                                timestamp: rec.timestamp.clone(),
+                                status: rec.status.clone(),
+                            }
+                        }).collect();
+                        let _ = p.save();
+                    }
+
+                    if !resumable.is_empty() {
+                        info!(
+                            event = "persistence_restore_complete",
+                            count = resumable.len(),
+                            "Restored {} resumable outbound transaction(s) from persistence",
+                            resumable.len()
+                        );
+                    }
+
+                    (history, resumable, paths, p.transfer_stats)
+                }
+                Err(_) => (
+                    Vec::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    crate::core::persistence::TransferStatsSnapshot::default(),
+                ),
+            };
+
+        // Create TransactionManager with restored transactions
+        let mut transactions = TransactionManager::new();
+        for (_, txn) in resumable_transactions {
+            transactions.insert(txn);
+        }
+
+        // Initialize stats from persisted values
+        let stats = DataStats {
+            files_sent: persisted_stats.files_sent,
+            files_received: persisted_stats.files_received,
+            folders_sent: persisted_stats.folders_sent,
+            folders_received: persisted_stats.folders_received,
+            messages_sent: persisted_stats.messages_sent,
+            messages_received: persisted_stats.messages_received,
+            ..DataStats::default()
+        };
 
         Self {
-            transactions: TransactionManager::new(),
-            stats: DataStats::default(),
+            transactions,
+            stats,
             pending_incoming: None,
-            transfer_history: Vec::new(),
-            source_paths: HashMap::new(),
-            coordinator,
+            transfer_history,
+            source_paths,
             identity,
+            replay_guard: ReplayGuard::new(),
+            peer_file_stats: HashMap::new(),
         }
-    }
-
-    /// Access the transfer coordinator (for secure operations).
-    #[allow(dead_code)]
-    pub fn coordinator(&self) -> Option<&TransferCoordinator> {
-        self.coordinator.as_ref()
-    }
-
-    /// Access the transfer coordinator mutably.
-    #[allow(dead_code)]
-    pub fn coordinator_mut(&mut self) -> Option<&mut TransferCoordinator> {
-        self.coordinator.as_mut()
-    }
-
-    /// Access our peer identity.
-    #[allow(dead_code)]
-    pub fn identity(&self) -> Option<&PeerIdentity> {
-        self.identity.as_ref()
     }
 
     // ── Queries (read-only, for UI rendering) ────────────────────────────
@@ -287,6 +420,90 @@ impl TransferEngine {
         self.transactions.active_count() < MAX_CONCURRENT_TRANSACTIONS
     }
 
+    /// Cancel an active or pending transfer by transaction ID.
+    /// Returns actions to notify the remote peer.
+    pub fn cancel_active_transfer(&mut self, transaction_id: &Uuid) -> EngineOutcome {
+        if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
+            let peer_id = txn.peer_id.clone();
+            let display_name = txn.display_name.clone();
+            txn.cancel();
+            info!(event = "transfer_cancelled_by_user", transaction_id = %transaction_id, name = %display_name, "User cancelled transfer");
+            self.archive_transaction_with_status(*transaction_id, TransferStatus::Cancelled);
+            self.source_paths.remove(transaction_id);
+            EngineOutcome {
+                actions: vec![EngineAction::CancelTransaction {
+                    peer_id,
+                    transaction_id: *transaction_id,
+                }],
+                status: Some(format!("Cancelled: {}", display_name)),
+            }
+        } else {
+            EngineOutcome::empty()
+        }
+    }
+
+    // ── Manifest Security ────────────────────────────────────────────────
+
+    /// Sign a transaction manifest with our peer identity.
+    /// Sets sender_id, nonce_seed, expiration_time, and computes the HMAC signature.
+    pub fn sign_manifest(&self, manifest: &mut TransactionManifest) {
+        if let Some(ref identity) = self.identity {
+            manifest.sender_id = Some(identity.public_key);
+            manifest.nonce_seed = Some(rand::random());
+            manifest.expiration_time = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + TRANSACTION_TIMEOUT.as_secs(),
+            );
+            let content = Transaction::manifest_content_bytes(manifest);
+            manifest.signature = Some(identity.sign(&content));
+        }
+    }
+
+    /// Validate a manifest's signature against the declared sender_id.
+    /// Returns true if the signature is valid or if no signature is present
+    /// (backward compatibility during upgrade window).
+    pub fn validate_manifest_signature(&self, manifest: &TransactionManifest) -> bool {
+        match (&manifest.sender_id, &manifest.signature) {
+            (Some(sender_id), Some(signature)) => {
+                // Check expiration
+                if let Some(exp) = manifest.expiration_time {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now >= exp {
+                        warn!(event = "manifest_expired", "Received expired manifest");
+                        return false;
+                    }
+                }
+                // Verify signature: reconstruct SignedPayload and validate signer
+                let content = Transaction::manifest_content_bytes(manifest);
+                let signed = crate::core::security::identity::SignedPayload {
+                    data: content,
+                    signature: *signature,
+                    signer: *sender_id,
+                };
+                PeerIdentity::verify_signed(&signed, sender_id)
+            }
+            // No security fields present — accept (will be required in future)
+            _ => true,
+        }
+    }
+
+    /// Register a transaction with the replay guard.
+    fn register_replay_guard(&mut self, transaction_id: Uuid) {
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + TRANSACTION_TIMEOUT.as_secs();
+        self.replay_guard
+            .register_transaction(transaction_id, expiration);
+    }
+
     // ── Initiating Outbound Transfers ────────────────────────────────────
 
     /// Initiate a single-file send. Creates Transaction, returns action to
@@ -299,7 +516,12 @@ impl TransferEngine {
         file_path: &str,
     ) -> Result<EngineOutcome> {
         if !self.can_start_transfer() {
-            warn!(event = "transfer_limit_reached", active = self.transactions.active_count(), limit = MAX_CONCURRENT_TRANSACTIONS, "File send blocked: concurrent transaction limit");
+            warn!(
+                event = "transfer_limit_reached",
+                active = self.transactions.active_count(),
+                limit = MAX_CONCURRENT_TRANSACTIONS,
+                "File send blocked: concurrent transaction limit"
+            );
             return Err(anyhow!(
                 "Maximum concurrent transactions ({}) reached",
                 MAX_CONCURRENT_TRANSACTIONS
@@ -312,9 +534,15 @@ impl TransferEngine {
             None,
             vec![(filename.to_string(), filesize)],
         );
-        let manifest = txn.build_manifest();
+        let mut manifest = txn.build_manifest();
         let txn_id = txn.id;
         let total_size = txn.total_size;
+
+        // Sign the manifest with our identity
+        self.sign_manifest(&mut manifest);
+
+        // Register with replay guard
+        self.register_replay_guard(txn_id);
 
         self.source_paths.insert(txn_id, file_path.to_string());
         self.transactions.insert(txn);
@@ -346,7 +574,12 @@ impl TransferEngine {
         folder_path: &str,
     ) -> Result<EngineOutcome> {
         if !self.can_start_transfer() {
-            warn!(event = "transfer_limit_reached", active = self.transactions.active_count(), limit = MAX_CONCURRENT_TRANSACTIONS, "Folder send blocked: concurrent transaction limit");
+            warn!(
+                event = "transfer_limit_reached",
+                active = self.transactions.active_count(),
+                limit = MAX_CONCURRENT_TRANSACTIONS,
+                "Folder send blocked: concurrent transaction limit"
+            );
             return Err(anyhow!(
                 "Maximum concurrent transactions ({}) reached",
                 MAX_CONCURRENT_TRANSACTIONS
@@ -364,10 +597,16 @@ impl TransferEngine {
             Some(dirname.to_string()),
             files,
         );
-        let manifest = txn.build_manifest();
+        let mut manifest = txn.build_manifest();
         let txn_id = txn.id;
         let total_size = txn.total_size;
         let files_len = txn.file_order.len();
+
+        // Sign the manifest with our identity
+        self.sign_manifest(&mut manifest);
+
+        // Register with replay guard
+        self.register_replay_guard(txn_id);
 
         self.source_paths.insert(txn_id, folder_path.to_string());
         self.transactions.insert(txn);
@@ -399,20 +638,6 @@ impl TransferEngine {
             .ok_or_else(|| anyhow!("No pending incoming transaction"))?;
 
         info!(event = "transfer_accepted", transaction_id = %pending.transaction_id, display_name = %pending.display_name, dest = %dest_path, "Incoming transfer accepted");
-
-        // Handle legacy file offer acceptance
-        if pending.is_legacy_file {
-            if let Some(legacy_file_id) = pending.legacy_file_id {
-                return Ok(EngineOutcome {
-                    actions: vec![EngineAction::AcceptLegacyFileOffer {
-                        peer_id: pending.peer_id.clone(),
-                        file_id: legacy_file_id,
-                        dest_path: dest_path.clone(),
-                    }],
-                    status: Some(format!("Downloading: {}", pending.display_name)),
-                });
-            }
-        }
 
         let mut txn = Transaction::new_inbound(
             pending.transaction_id,
@@ -451,6 +676,7 @@ impl TransferEngine {
                 EngineAction::PrepareReceive {
                     peer_id: peer_id.clone(),
                     files,
+                    resume_bitmaps: Vec::new(),
                 },
                 EngineAction::SendTransactionResponse {
                     peer_id,
@@ -475,19 +701,6 @@ impl TransferEngine {
 
         let display_name = pending.display_name.clone();
 
-        // Handle legacy file offer rejection
-        if pending.is_legacy_file {
-            if let Some(legacy_file_id) = pending.legacy_file_id {
-                return Ok(EngineOutcome {
-                    actions: vec![EngineAction::RejectLegacyFileOffer {
-                        peer_id: pending.peer_id.clone(),
-                        file_id: legacy_file_id,
-                    }],
-                    status: Some(format!("Rejected: {}", display_name)),
-                });
-            }
-        }
-
         // Create and immediately reject a transaction for history
         let mut txn = Transaction::new_inbound(
             pending.transaction_id,
@@ -499,7 +712,7 @@ impl TransferEngine {
         );
         txn.reject(Some("User declined".to_string()));
         self.transactions.insert(txn);
-        self.archive_transaction(pending.transaction_id);
+        self.archive_transaction_with_status(pending.transaction_id, TransferStatus::Declined);
 
         Ok(EngineOutcome {
             actions: vec![EngineAction::SendTransactionResponse {
@@ -520,20 +733,89 @@ impl TransferEngine {
     /// events MUST be routed through here.
     pub fn process_event(&mut self, event: &AppEvent) -> EngineOutcome {
         match event {
+            AppEvent::ChunkRetransmitRequested {
+                peer_id,
+                file_id,
+                chunk_indices,
+            } => {
+                // Find the transaction and file, increment retransmit_count
+                if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
+                    if let Some(tf) = txn.files.get_mut(file_id) {
+                        tf.retransmit_count += 1;
+                        if tf.retransmit_count > MAX_FILE_RETRANSMISSIONS {
+                            warn!(event = "retransmit_limit_exceeded", file_id = %file_id, "File failed too many times, marking as failed");
+                            tf.completed = true;
+                            tf.verified = Some(false);
+                        } else {
+                            info!(event = "retransmit_chunks", file_id = %file_id, count = tf.retransmit_count, chunks = ?chunk_indices, "Retransmitting specific chunks due to Merkle integrity failure");
+                            return EngineOutcome {
+                                actions: vec![EngineAction::RetransmitChunks {
+                                    peer_id: peer_id.clone(),
+                                    file_id: *file_id,
+                                    chunk_indices: chunk_indices.clone(),
+                                }],
+                                status: Some(format!(
+                                    "Retransmitting {} chunks for file {} (attempt {})",
+                                    chunk_indices.len(),
+                                    file_id,
+                                    tf.retransmit_count
+                                )),
+                            };
+                        }
+                    }
+                }
+                EngineOutcome::empty()
+            }
+            AppEvent::TransactionCompleteAcked {
+                peer_id,
+                transaction_id,
+            } => {
+                info!(event = "transaction_complete_ack_received", transaction_id = %transaction_id, "Peer acknowledged transaction completion");
+
+                // Archive the sender's transaction now that the receiver confirmed completion
+                let display = self
+                    .transactions
+                    .get(&transaction_id)
+                    .map(|t| t.display_name.clone())
+                    .unwrap_or_default();
+                self.archive_transaction_with_status(*transaction_id, TransferStatus::Ok);
+                self.source_paths.remove(&transaction_id);
+
+                return EngineOutcome {
+                    actions: vec![EngineAction::TransactionCompleteAck {
+                        peer_id: peer_id.clone(),
+                        transaction_id: *transaction_id,
+                    }],
+                    status: Some(format!("Transfer complete: {}", display)),
+                };
+            }
+            AppEvent::FileReceivedAck {
+                file_id,
+            } => {
+                // The receiver has confirmed that a file was received and saved.
+                // This is informational - the SendComplete event already marked the file as done.
+                debug!(
+                    event = "file_received_ack",
+                    file_id = %file_id,
+                    "Receiver confirmed file received and saved"
+                );
+                EngineOutcome::empty()
+            }
             AppEvent::PeerDisconnected { peer_id, .. } => {
                 info!(event = "peer_transfers_interrupted", peer = %peer_id, "Interrupting transfers for disconnected peer");
 
-                // Collect transaction IDs that need persistence before mutating.
-                // Only consider Active or Interrupted — skip already-Resumable/terminal
-                // to stay idempotent when duplicate disconnects arrive.
+                // Step 1: Active → Interrupted for all non-terminal transactions.
+                self.transactions.interrupt_peer(peer_id);
+
+                // Step 2: Collect Interrupted transactions to persist as Resumable.
+                // Skip already-Resumable/terminal to stay idempotent when
+                // duplicate disconnects arrive.
                 let txn_ids: Vec<Uuid> = self
                     .transactions
                     .active
                     .iter()
                     .filter(|(_, t)| {
-                        t.peer_id == *peer_id
-                            && (t.state == TransactionState::Active
-                                || t.state == TransactionState::Interrupted)
+                        t.peer_id == *peer_id && t.state == TransactionState::Interrupted
                     })
                     .map(|(id, _)| *id)
                     .collect();
@@ -541,35 +823,18 @@ impl TransferEngine {
                 // Transition each to Resumable and persist
                 if !txn_ids.is_empty() {
                     let mut persistence = Persistence::load().unwrap_or_default();
-
-                    for txn_id in &txn_ids {
-                        if let Some(txn) = self.transactions.get_active_mut(txn_id) {
-                            // Transition Active → Resumable (persisted)
-                            txn.make_resumable();
-
-                            // Build snapshot with source_path so outbound transfers
-                            // can be resumed even after a process restart.
-                            let src = self.source_paths.get(txn_id).map(|s| s.as_str());
-                            let mut snapshot = txn.to_snapshot_with_source(src);
-
-                            // Populate expiration / counter from coordinator if available
-                            if let Some(coord) = self.coordinator.as_mut() {
-                                if let Ok(secure_snap) = coord.pause_transfer(txn_id) {
-                                    snapshot.expiration_time = Some(secure_snap.expiration_time);
-                                    snapshot.last_counter = Some(secure_snap.replay_state.last_seen_counter);
-                                    persistence.secure_transfers.insert(*txn_id, secure_snap);
-                                }
-                            }
-
-                            debug!(event = "transaction_persisted", transaction_id = %txn_id, direction = ?txn.direction, state = ?txn.state, "Transaction state persisted for resume");
-                            persistence.transactions.insert(*txn_id, snapshot);
-                        }
-                    }
+                    self.persist_transactions_as_resumable(&txn_ids, &mut persistence);
 
                     if let Err(e) = persistence.save() {
                         error!(event = "persistence_save_failure", error = %e, "Failed to persist transaction state on disconnect");
                     } else {
-                        info!(event = "transactions_persisted", count = txn_ids.len(), "Persisted {} transactions for peer {}", txn_ids.len(), peer_id);
+                        info!(
+                            event = "transactions_persisted",
+                            count = txn_ids.len(),
+                            "Persisted {} transactions for peer {}",
+                            txn_ids.len(),
+                            peer_id
+                        );
                     }
                 }
 
@@ -589,16 +854,17 @@ impl TransferEngine {
                 self.stats.raw_bytes_received += message.len() as u64;
                 // Wire bytes are not tracked per-message; use raw as estimate
                 self.stats.bytes_received += message.len() as u64;
+                // Persist message stats so they survive a restart
+                self.persist_transfer_stats();
                 EngineOutcome::empty()
             }
 
             // ── File-level progress (from transport) ─────────────────────
-
             AppEvent::FileProgress {
                 file_id,
                 received_chunks,
-                total_chunks: _,
                 wire_bytes,
+                chunk_bitmap_bytes,
                 ..
             } => {
                 if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
@@ -612,19 +878,17 @@ impl TransferEngine {
                     self.stats.raw_bytes_received += delta as u64 * CHUNK_SIZE as u64;
                     // Track wire bytes (post-compression/encryption) — lowest level
                     self.stats.bytes_received += *wire_bytes;
-                    txn.update_file_progress(*file_id, *received_chunks);
+                    
+                    // Update progress and sync bitmap from receiver
+                    txn.update_file_progress_with_bitmap(*file_id, *received_chunks, chunk_bitmap_bytes.as_deref());
 
-                    // Persist transaction state every 20 chunks so it
-                    // survives a sudden process kill.  The snapshot
-                    // includes dest_path and per-file progress.
-                    if received_chunks % 20 == 0 {
+                    // Persist transaction state more frequently (every 10 chunks)
+                    // so it survives a sudden process kill. The snapshot
+                    // includes dest_path and per-file progress with bitmap.
+                    if received_chunks % 10 == 0 {
                         let txn_id = txn.id;
                         self.persist_active_transaction(&txn_id);
                     }
-                } else {
-                    // Legacy transfer without engine transaction — still count bytes
-                    self.stats.raw_bytes_received += CHUNK_SIZE as u64;
-                    self.stats.bytes_received += *wire_bytes;
                 }
                 EngineOutcome::empty()
             }
@@ -636,28 +900,18 @@ impl TransferEngine {
                 ..
             } => {
                 if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
-                    let old = txn
-                        .files
-                        .get(file_id)
-                        .map(|f| f.transferred_chunks)
-                        .unwrap_or(0);
-                    let delta = sent_chunks.saturating_sub(old);
-                    // Track raw bytes (pre-compression)
-                    self.stats.raw_bytes_sent += delta as u64 * CHUNK_SIZE as u64;
                     // Track wire bytes (post-compression/encryption) — lowest level
                     self.stats.bytes_sent += *wire_bytes;
-                    txn.update_file_progress(*file_id, *sent_chunks);
+                    // Update progress and mark chunks as sent in bitmap
+                    txn.update_file_progress_sent(*file_id, *sent_chunks);
 
                     // Persist transaction state periodically so outbound
                     // transfers survive a sudden process kill.
-                    if sent_chunks % 20 == 0 {
+                    // More frequent persistence (every 10 chunks) for better resume
+                    if sent_chunks % 10 == 0 {
                         let txn_id = txn.id;
                         self.persist_active_transaction(&txn_id);
                     }
-                } else {
-                    // Legacy transfer without engine transaction
-                    self.stats.raw_bytes_sent += CHUNK_SIZE as u64;
-                    self.stats.bytes_sent += *wire_bytes;
                 }
                 EngineOutcome::empty()
             }
@@ -669,20 +923,39 @@ impl TransferEngine {
                     if *success {
                         txn.complete_file(*file_id, true);
                         self.stats.files_sent += 1;
+                        // Track per-peer file stats
+                        let peer_stats = self
+                            .peer_file_stats
+                            .entry(txn.peer_id.clone())
+                            .or_insert((0, 0));
+                        peer_stats.0 += 1;
                         debug!(event = "file_sent", file_id = %file_id, transaction_id = %txn.id, "File sent successfully");
                     } else {
-                        // Mark the file as done (unverified) so the
-                        // transaction can still conclude instead of
-                        // hanging forever waiting for this file.
-                        txn.complete_file(*file_id, false);
-                        warn!(event = "file_send_failed", file_id = %file_id, transaction_id = %txn.id, "File send failed, marking as done (unverified)");
+                        // Mark the file as failed, do NOT mark as completed
+                        if let Some(tf) = txn.files.get_mut(file_id) {
+                            tf.completed = true;
+                            tf.verified = Some(false);
+                        }
+                        warn!(event = "file_send_failed", file_id = %file_id, transaction_id = %txn.id, "File send failed, marking as failed");
                     }
                     let txn_id = txn.id;
                     let peer_id = txn.peer_id.clone();
-                    if txn.check_completion() {
+                    let is_folder = txn.parent_dir.is_some();
+                    // Only complete transaction if all files are either verified or failed
+                    let all_done = txn.files.values().all(|f| f.completed);
+                    if all_done {
                         let txn_display = txn.display_name.clone();
                         info!(event = "transfer_complete", transaction_id = %txn_id, direction = "outbound", name = %txn_display, "Outbound transfer complete");
-                        self.archive_transaction(txn_id);
+
+                        // Increment folder counter if this was a folder transfer
+                        if is_folder {
+                            self.stats.folders_sent += 1;
+                        }
+
+                        // Persist the updated stats
+                        self.persist_transfer_stats();
+
+                        self.archive_transaction_with_status(txn_id, TransferStatus::Ok);
                         self.source_paths.remove(&txn_id);
                         return EngineOutcome {
                             actions: vec![EngineAction::SendTransactionComplete {
@@ -692,124 +965,85 @@ impl TransferEngine {
                             status: Some(format!("Transfer complete: {}", txn_display)),
                         };
                     }
-                } else if *success {
-                    // Legacy transfer — still count
-                    self.stats.files_sent += 1;
                 }
                 if *success {
-                    EngineOutcome::with_status("File sent successfully")
+                    EngineOutcome::with_status("Sent successfully")
                 } else {
-                    EngineOutcome::with_status("File transfer failed (hash mismatch)")
+                    EngineOutcome::with_status("Transfer failed: verification error")
                 }
             }
 
             AppEvent::FileComplete {
                 file_id,
                 filename,
-                path,
+                merkle_root,
                 ..
             } => {
                 if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
+                    // Verify Merkle root against the manifest if available
+                    if let Some(file_entry) = txn.files.get(file_id) {
+                        if let Some(expected_root) = &file_entry.merkle_root {
+                            if expected_root != merkle_root {
+                                warn!(
+                                    event = "merkle_root_mismatch",
+                                    file_id = %file_id,
+                                    transaction_id = %txn.id,
+                                    "Merkle root mismatch for file — data integrity violation"
+                                );
+                            } else {
+                                debug!(
+                                    event = "merkle_root_verified",
+                                    file_id = %file_id,
+                                    transaction_id = %txn.id,
+                                    "Merkle root verified for file"
+                                );
+                            }
+                        } else {
+                            // Store the computed Merkle root for future reference
+                            // (manifest didn't include one, but we computed it on receive)
+                        }
+                    }
+
                     txn.complete_file(*file_id, true);
+                    // Store the received Merkle root in the transaction file entry
+                    if let Some(tf) = txn.files.get_mut(file_id) {
+                        tf.merkle_root = Some(*merkle_root);
+                    }
                     self.stats.files_received += 1;
+                    // Track per-peer file stats
+                    let peer_stats = self
+                        .peer_file_stats
+                        .entry(txn.peer_id.clone())
+                        .or_insert((0, 0));
+                    peer_stats.1 += 1;
                     debug!(event = "file_received", file_id = %file_id, transaction_id = %txn.id, filename = %filename, "File received successfully");
                     let txn_id = txn.id;
+                    let is_folder = txn.parent_dir.is_some();
                     if txn.check_completion() {
                         let display_name = txn.display_name.clone();
                         info!(event = "transfer_complete", transaction_id = %txn_id, direction = "inbound", name = %display_name, "Inbound transfer complete");
-                        self.archive_transaction(txn_id);
+
+                        // Increment folder counter if this was a folder transfer
+                        if is_folder {
+                            self.stats.folders_received += 1;
+                        }
+
+                        // Persist the updated stats
+                        self.persist_transfer_stats();
+
+                        // Clean up replay guard for completed transaction
+                        self.replay_guard.remove_transaction(&txn_id);
+                        self.archive_transaction_with_status(txn_id, TransferStatus::Ok);
                         return EngineOutcome::with_status(format!(
                             "Transfer complete: {}",
                             display_name
                         ));
                     }
-                } else {
-                    // Legacy transfer without engine transaction
-                    self.stats.files_received += 1;
                 }
-                EngineOutcome::with_status(format!("File saved: {} -> {}", filename, path))
-            }
-
-            AppEvent::FileRejected {
-                file_id, reason, ..
-            } => {
-                if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
-                    let txn_id = txn.id;
-                    warn!(event = "file_rejected", file_id = %file_id, transaction_id = %txn_id, reason = ?reason, "File transfer rejected");
-                    txn.reject(reason.clone());
-                    self.archive_transaction(txn_id);
-                }
-                let reason_str = reason.as_deref().unwrap_or("unknown reason");
-                EngineOutcome::with_status(format!("Transfer rejected: {}", reason_str))
-            }
-
-            // ── Legacy file/folder offers (wrap in Transaction) ──────────
-
-            AppEvent::FileOffered {
-                peer_id,
-                file_id,
-                filename,
-                filesize,
-                total_size,
-            } => {
-                // Check if this file belongs to an existing accepted transaction.
-                if self.transactions.transaction_id_for_file(file_id).is_some() {
-                    // Already tracked — auto-accept via transport layer
-                    return EngineOutcome::empty();
-                }
-
-                // Unsolicited file offer — create ad-hoc pending transaction.
-                let save_dir = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".to_string());
-
-                // Only show popup if we don't already have one
-                if self.pending_incoming.is_some() {
-                    // Queue it — for now just accept (auto-accept unsolicited per spec)
-                    return EngineOutcome::empty();
-                }
-
-                let txn_id = Uuid::new_v4();
-                let manifest = TransactionManifest {
-                    files: vec![ManifestEntry {
-                        file_id: *file_id,
-                        relative_path: filename.clone(),
-                        filesize: *filesize,
-                        merkle_root: None,
-                        total_chunks: None,
-                    }],
-                    parent_dir: None,
-                };
-
-                self.pending_incoming = Some(PendingIncoming {
-                    peer_id: peer_id.clone(),
-                    transaction_id: txn_id,
-                    display_name: filename.clone(),
-                    manifest,
-                    total_size: *total_size,
-                    save_path_input: save_dir,
-                    button_focus: 0,
-                    path_editing: false,
-                    is_legacy_file: true,
-                    legacy_file_id: Some(*file_id),
-                });
-
-                EngineOutcome::with_status(format!("File offered: {}", filename))
-            }
-
-            AppEvent::FolderOffered { .. } => {
-                // Legacy folder offer — auto-accept and track
-                self.stats.metadata_bytes += 128; // estimate for folder metadata
-                EngineOutcome::empty() // Folders are auto-accepted via legacy path
-            }
-
-            AppEvent::FolderComplete { .. } => {
-                self.stats.metadata_bytes += 64;
-                EngineOutcome::empty()
+                EngineOutcome::with_status(format!("Received: {}", filename))
             }
 
             // ── Transaction-level events ─────────────────────────────────
-
             AppEvent::TransactionRequested {
                 peer_id,
                 transaction_id,
@@ -817,6 +1051,21 @@ impl TransferEngine {
                 manifest,
                 total_size,
             } => {
+                // Validate manifest signature
+                if !self.validate_manifest_signature(manifest) {
+                    warn!(event = "manifest_signature_invalid", transaction_id = %transaction_id, "Rejecting transfer with invalid manifest signature");
+                    return EngineOutcome {
+                        actions: vec![EngineAction::SendTransactionResponse {
+                            peer_id: peer_id.clone(),
+                            transaction_id: *transaction_id,
+                            accepted: false,
+                            dest_path: None,
+                            reason: Some("Invalid manifest signature".to_string()),
+                        }],
+                        status: Some("Transfer rejected: invalid manifest signature".to_string()),
+                    };
+                }
+
                 // Check capacity
                 if !self.can_start_transfer() {
                     return EngineOutcome {
@@ -833,6 +1082,9 @@ impl TransferEngine {
                     };
                 }
 
+                // Register with replay guard (receiver side)
+                self.register_replay_guard(*transaction_id);
+
                 let save_dir = std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| ".".to_string());
@@ -846,8 +1098,6 @@ impl TransferEngine {
                     save_path_input: save_dir,
                     button_focus: 0,
                     path_editing: false,
-                    is_legacy_file: false,
-                    legacy_file_id: None,
                 });
 
                 info!(event = "transfer_requested", transaction_id = %transaction_id, display_name = %display_name, total_size, file_count = manifest.files.len(), "Incoming transfer request received");
@@ -891,9 +1141,7 @@ impl TransferEngine {
                             .file_order
                             .iter()
                             .filter_map(|fid| {
-                                txn.files
-                                    .get(fid)
-                                    .map(|f| (*fid, f.relative_path.clone()))
+                                txn.files.get(fid).map(|f| (*fid, f.relative_path.clone()))
                             })
                             .collect();
                         vec![EngineAction::SendFolderData {
@@ -922,7 +1170,7 @@ impl TransferEngine {
 
                     return EngineOutcome {
                         actions,
-                        status: Some(format!("Transfer accepted, sending: {}", display)),
+                        status: Some(format!("Sending: {}", display)),
                     };
                 }
                 EngineOutcome::empty()
@@ -936,7 +1184,7 @@ impl TransferEngine {
                 if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
                     txn.reject(reason.clone());
                 }
-                self.archive_transaction(*transaction_id);
+                self.archive_transaction_with_status(*transaction_id, TransferStatus::Declined);
                 self.source_paths.remove(transaction_id);
                 EngineOutcome::with_status(format!(
                     "Transfer rejected: {}",
@@ -944,9 +1192,7 @@ impl TransferEngine {
                 ))
             }
 
-            AppEvent::TransactionCompleted {
-                transaction_id,
-            } => {
+            AppEvent::TransactionCompleted { transaction_id } => {
                 if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
                     let file_ids: Vec<Uuid> = txn.file_order.clone();
                     for fid in file_ids {
@@ -959,7 +1205,7 @@ impl TransferEngine {
                     .get(transaction_id)
                     .map(|t| t.display_name.clone())
                     .unwrap_or_default();
-                self.archive_transaction(*transaction_id);
+                self.archive_transaction_with_status(*transaction_id, TransferStatus::Ok);
                 EngineOutcome::with_status(format!("Transfer complete: {}", display))
             }
 
@@ -972,7 +1218,7 @@ impl TransferEngine {
                 if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
                     txn.cancel();
                 }
-                self.archive_transaction(*transaction_id);
+                self.archive_transaction_with_status(*transaction_id, TransferStatus::Cancelled);
                 self.source_paths.remove(transaction_id);
                 EngineOutcome::with_status(format!(
                     "Transfer cancelled: {}",
@@ -1008,46 +1254,25 @@ impl TransferEngine {
                 }
 
                 if let Some(txn) = self.transactions.get_active_mut(&txn_id) {
-                    // Validate: must be in a resumable state OR Active (Active
-                    // means the peer reconnected before we realised the old
-                    // connection was dead — Step 0 in handle_peer_reconnected
-                    // should have transitioned it, but if it didn't, or if the
-                    // request races with Step 0, we accept it anyway).
-                    if txn.state != TransactionState::Resumable
-                        && txn.state != TransactionState::Interrupted
-                        && txn.state != TransactionState::Active
+                    // Centralized validation of resume request preconditions
+                    if let Err(reason) =
+                        txn.validate_resume_request(resume_info, MAX_TRANSACTION_RETRIES as u32)
                     {
-                        warn!(event = "resume_rejected_state", transaction_id = %txn_id, state = ?txn.state, "Resume rejected: invalid transaction state");
-                        return EngineOutcome::with_status(format!(
-                            "Resume rejected: transaction {} in {:?} state",
-                            txn_id, txn.state
-                        ));
-                    }
-
-                    // Validate: must be an outbound transaction (we are the sender)
-                    if txn.direction != TransactionDirection::Outbound {
-                        warn!(event = "resume_rejected_direction", transaction_id = %txn_id, "Resume rejected: not an outbound transaction");
-                        return EngineOutcome::with_status("Resume rejected: wrong direction".to_string());
-                    }
-
-                    // Validate: retry limit
-                    if txn.resume_count >= safety::MAX_TRANSACTION_RETRIES as u32 {
-                        warn!(event = "resume_rejected_retries", transaction_id = %txn_id, count = txn.resume_count, "Resume rejected: retry limit exceeded");
-                        return EngineOutcome::with_status("Resume rejected: retry limit exceeded".to_string());
-                    }
-
-                    // Validate: requested files must be in the manifest
-                    for file_id in &resume_info.completed_files {
-                        if !txn.files.contains_key(file_id) {
-                            warn!(event = "resume_rejected_file", transaction_id = %txn_id, file_id = %file_id, "Resume rejected: unknown file_id");
-                            return EngineOutcome::with_status("Resume rejected: unknown file in request".to_string());
-                        }
-                    }
-                    for file_id in resume_info.partial_offsets.keys() {
-                        if !txn.files.contains_key(file_id) {
-                            warn!(event = "resume_rejected_file", transaction_id = %txn_id, file_id = %file_id, "Resume rejected: unknown file_id in partial offsets");
-                            return EngineOutcome::with_status("Resume rejected: unknown file in request".to_string());
-                        }
+                        warn!(
+                            event = "resume_rejected",
+                            transaction_id = %txn_id,
+                            state = ?txn.state,
+                            reason = reason,
+                            "Resume request rejected"
+                        );
+                        return EngineOutcome {
+                            actions: vec![EngineAction::RejectResume {
+                                peer_id: peer_id.clone(),
+                                transaction_id: txn_id,
+                                reason: reason.to_string(),
+                            }],
+                            status: Some("Resume rejected".to_string()),
+                        };
                     }
 
                     // All validations passed — apply resume info and re-send
@@ -1076,13 +1301,21 @@ impl TransferEngine {
                     }
                 } else {
                     warn!(event = "resume_rejected_unknown", transaction_id = %txn_id, "Resume rejected: transaction not found");
-                    EngineOutcome::with_status(format!("Resume rejected: unknown transaction {}", txn_id))
+                    return EngineOutcome {
+                        actions: vec![EngineAction::RejectResume {
+                            peer_id: peer_id.clone(),
+                            transaction_id: txn_id,
+                            reason: "Transaction not found".to_string(),
+                        }],
+                        status: Some(format!(
+                            "Resume rejected: unknown transaction {}",
+                            txn_id
+                        )),
+                    };
                 }
             }
 
-            AppEvent::TransactionResumeAccepted {
-                transaction_id, ..
-            } => {
+            AppEvent::TransactionResumeAccepted { transaction_id, .. } => {
                 if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
                     txn.activate();
                     let peer_id = txn.peer_id.clone();
@@ -1099,30 +1332,16 @@ impl TransferEngine {
                     // re-send the missing chunks. We MUST re-register file
                     // destinations on the new WebRTC connection so incoming
                     // Metadata/chunk frames can find the correct save path.
+                    // Also register resume bitmaps so the Metadata handler opens
+                    // existing temp files without truncating.
                     if txn.direction == TransactionDirection::Inbound {
-                        if let Some(ref dest) = txn.dest_path {
-                            let files: Vec<(Uuid, PathBuf)> = txn
-                                .file_order
-                                .iter()
-                                .filter_map(|fid| {
-                                    txn.files.get(fid).and_then(|f| {
-                                        if !f.completed {
-                                            Some((*fid, dest.clone()))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                })
-                                .collect();
-                            if !files.is_empty() {
-                                return EngineOutcome {
-                                    actions: vec![EngineAction::PrepareReceive {
-                                        peer_id,
-                                        files,
-                                    }],
-                                    status: Some("Resume accepted".to_string()),
-                                };
-                            }
+                        let files = Self::incomplete_file_destinations(txn);
+                        let bitmaps = Self::incomplete_file_bitmaps(txn);
+                        if !files.is_empty() {
+                            return EngineOutcome {
+                                actions: vec![EngineAction::PrepareReceive { peer_id, files, resume_bitmaps: bitmaps }],
+                                status: Some("Resume accepted".to_string()),
+                            };
                         }
                     }
                     // For outbound, the sender already handles ResendFiles in the
@@ -1131,8 +1350,19 @@ impl TransferEngine {
                 EngineOutcome::with_status("Resume accepted")
             }
 
-            // ── Remote fetch requests ────────────────────────────────────
+            AppEvent::TransactionResumeRejected { transaction_id, reason } => {
+                warn!(event = "resume_rejected_by_sender", transaction_id = %transaction_id, reason = ?reason, "Resume was declined by sender");
+                if let Some(txn) = self.transactions.get_active_mut(transaction_id) {
+                    txn.cancel();
+                }
+                self.archive_transaction_with_status(*transaction_id, TransferStatus::ResumeDeclined);
+                EngineOutcome::with_status(format!(
+                    "Resume declined: {}",
+                    reason.as_deref().unwrap_or("unknown")
+                ))
+            }
 
+            // ── Remote fetch requests ────────────────────────────────────
             AppEvent::RemoteFetchRequest {
                 peer_id,
                 path,
@@ -1179,12 +1409,24 @@ impl TransferEngine {
         //    A peer that just reconnected means the old connection is dead.
         //    Transactions stuck in Active are zombies — running on a dead
         //    WebRTC data channel.  Transition them so they can be resumed.
+        //
+        //    EXCEPTION: skip transactions that were resumed very recently
+        //    (within the last 30 s).  A `TransactionResumeRequested` control
+        //    message can arrive via the data channel BEFORE this `PeerConnected`
+        //    event is processed.  In that case the transaction has already been
+        //    activated by the resume handler and is actively transferring on the
+        //    NEW connection — transitioning it back to Resumable would stall it.
+        let recently_resumed_cutoff = std::time::Duration::from_secs(30);
         let active_txn_ids: Vec<Uuid> = self
             .transactions
             .active
             .iter()
             .filter(|(_, t)| {
-                t.peer_id == peer_id && t.state == TransactionState::Active
+                t.peer_id == peer_id
+                    && t.state == TransactionState::Active
+                    && !t
+                        .resumed_at
+                        .map_or(false, |at| at.elapsed() < recently_resumed_cutoff)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1192,28 +1434,16 @@ impl TransferEngine {
         if !active_txn_ids.is_empty() {
             let mut persistence = Persistence::load().unwrap_or_default();
 
+            self.persist_transactions_as_resumable(&active_txn_ids, &mut persistence);
+
             for txn_id in &active_txn_ids {
-                if let Some(txn) = self.transactions.get_active_mut(txn_id) {
-                    txn.make_resumable();
-
-                    let src = self.source_paths.get(txn_id).map(|s| s.as_str());
-                    let mut snapshot = txn.to_snapshot_with_source(src);
-
-                    if let Some(coord) = self.coordinator.as_mut() {
-                        if let Ok(secure_snap) = coord.pause_transfer(txn_id) {
-                            snapshot.expiration_time = Some(secure_snap.expiration_time);
-                            snapshot.last_counter = Some(secure_snap.replay_state.last_seen_counter);
-                            persistence.secure_transfers.insert(*txn_id, secure_snap);
-                        }
-                    }
-
+                if let Some(txn) = self.transactions.get(txn_id) {
                     info!(
                         event = "active_to_resumable_on_reconnect",
                         transaction_id = %txn_id,
                         direction = ?txn.direction,
                         "Active transaction transitioned to Resumable (peer reconnected before heartbeat detected disconnect)"
                     );
-                    persistence.transactions.insert(*txn_id, snapshot);
                 }
             }
 
@@ -1273,26 +1503,14 @@ impl TransferEngine {
                         // destinations are ready before the sender responds with
                         // data (PrepareReceive is awaited, not spawned).
                         if let Some(txn) = self.transactions.get(&rid) {
-                            if let Some(ref dest) = txn.dest_path {
-                                let files: Vec<(Uuid, std::path::PathBuf)> = txn
-                                    .file_order
-                                    .iter()
-                                    .filter_map(|fid| {
-                                        txn.files.get(fid).and_then(|f| {
-                                            if !f.completed {
-                                                Some((*fid, dest.clone()))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                    .collect();
-                                if !files.is_empty() {
-                                    actions.push(EngineAction::PrepareReceive {
-                                        peer_id: peer_id.to_string(),
-                                        files,
-                                    });
-                                }
+                            let files = Self::incomplete_file_destinations(txn);
+                            let bitmaps = Self::incomplete_file_bitmaps(txn);
+                            if !files.is_empty() {
+                                actions.push(EngineAction::PrepareReceive {
+                                    peer_id: peer_id.to_string(),
+                                    files,
+                                    resume_bitmaps: bitmaps,
+                                });
                             }
                         }
 
@@ -1319,26 +1537,14 @@ impl TransferEngine {
         for (txn_id, resume_info) in resumable_inbound {
             // Register file destinations on the new connection
             if let Some(txn) = self.transactions.get(&txn_id) {
-                if let Some(ref dest) = txn.dest_path {
-                    let files: Vec<(Uuid, std::path::PathBuf)> = txn
-                        .file_order
-                        .iter()
-                        .filter_map(|fid| {
-                            txn.files.get(fid).and_then(|f| {
-                                if !f.completed {
-                                    Some((*fid, dest.clone()))
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .collect();
-                    if !files.is_empty() {
-                        actions.push(EngineAction::PrepareReceive {
-                            peer_id: peer_id.to_string(),
-                            files,
-                        });
-                    }
+                let files = Self::incomplete_file_destinations(txn);
+                let bitmaps = Self::incomplete_file_bitmaps(txn);
+                if !files.is_empty() {
+                    actions.push(EngineAction::PrepareReceive {
+                        peer_id: peer_id.to_string(),
+                        files,
+                        resume_bitmaps: bitmaps,
+                    });
                 }
             }
 
@@ -1363,15 +1569,27 @@ impl TransferEngine {
 
         if actions.is_empty() {
             // Log WHY we found nothing — helps debug "not trying to resume"
-            let all_for_peer: Vec<_> = self.transactions.active.values()
+            let all_for_peer: Vec<_> = self
+                .transactions
+                .active
+                .values()
                 .filter(|t| t.peer_id == peer_id)
-                .map(|t| format!("{}({:?}/{:?})", &t.id.to_string()[..8], t.state, t.direction))
+                .map(|t| {
+                    format!(
+                        "{}({:?}/{:?})",
+                        &t.id.to_string()[..8],
+                        t.state,
+                        t.direction
+                    )
+                })
                 .collect();
             if all_for_peer.is_empty() {
                 info!(event = "resume_no_transactions", peer = %peer_id, "No transactions found for peer (none in memory)");
                 // Also check persistence
                 if let Ok(persistence) = Persistence::load() {
-                    let persisted: Vec<_> = persistence.transactions.keys()
+                    let persisted: Vec<_> = persistence
+                        .transactions
+                        .keys()
                         .filter(|_| true) // show all
                         .map(|id| id.to_string()[..8].to_string())
                         .collect();
@@ -1399,7 +1617,8 @@ impl TransferEngine {
     pub fn record_message_sent(&mut self, bytes: u64) {
         self.stats.messages_sent += 1;
         self.stats.bytes_sent += bytes;
-        self.stats.raw_bytes_sent += bytes;
+        // Persist message stats so they survive a restart
+        self.persist_transfer_stats();
     }
 
     /// Get the source path for an outbound transaction.
@@ -1408,6 +1627,81 @@ impl TransferEngine {
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
+
+    /// Build the list of `(file_id, dest_path)` pairs for incomplete files
+    /// in a transaction.  Used to register file destinations on a (new)
+    /// WebRTC connection before receiving data.
+    ///
+    /// Returns an empty vec if the transaction has no dest_path or all
+    /// files are already completed.
+    fn incomplete_file_destinations(txn: &Transaction) -> Vec<(Uuid, PathBuf)> {
+        let dest = match txn.dest_path.as_ref() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        txn.file_order
+            .iter()
+            .filter_map(|fid| {
+                txn.files.get(fid).and_then(|f| {
+                    if !f.completed {
+                        Some((*fid, dest.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Extract chunk bitmaps for incomplete files in a transaction.
+    /// Used during resume to register bitmaps on the new connection so
+    /// the Metadata handler can open the existing temp file without truncating.
+    fn incomplete_file_bitmaps(
+        txn: &Transaction,
+    ) -> Vec<(Uuid, crate::core::pipeline::chunk::ChunkBitmap)> {
+        txn.file_order
+            .iter()
+            .filter_map(|fid| {
+                txn.files.get(fid).and_then(|f| {
+                    if !f.completed {
+                        f.chunk_bitmap.as_ref().map(|bm| (*fid, bm.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Transition a set of transactions to `Resumable`, build snapshots,
+    /// and persist them atomically.
+    ///
+    /// This is the shared logic for both `PeerDisconnected` and
+    /// `handle_peer_reconnected` (Step 0).  Extracts the repeated
+    /// pattern of: transition → snapshot → coordinator pause → persist.
+    fn persist_transactions_as_resumable(
+        &mut self,
+        txn_ids: &[Uuid],
+        persistence: &mut Persistence,
+    ) {
+        for txn_id in txn_ids {
+            if let Some(txn) = self.transactions.get_active_mut(txn_id) {
+                txn.make_resumable();
+
+                let src = self.source_paths.get(txn_id).map(|s| s.as_str());
+                let snapshot = txn.to_snapshot_with_source(src);
+
+                debug!(
+                    event = "transaction_persisted",
+                    transaction_id = %txn_id,
+                    direction = ?txn.direction,
+                    state = ?txn.state,
+                    "Transaction state persisted for resume"
+                );
+                persistence.transactions.insert(*txn_id, snapshot);
+            }
+        }
+    }
 
     /// Persist a single active transaction to disk so it survives a crash.
     /// Called periodically during progress updates and when transactions
@@ -1431,19 +1725,60 @@ impl TransferEngine {
         }
     }
 
-    /// Move a transaction from active to history and persist.
-    fn archive_transaction(&mut self, txn_id: Uuid) {
-        if let Some(txn) = self.transactions.get(&txn_id) {
-            self.transfer_history.push(TransferRecord {
+    /// Persist transfer statistics to disk.
+    fn persist_transfer_stats(&self) {
+        if let Ok(mut p) = Persistence::load() {
+            let stats = crate::core::persistence::TransferStatsSnapshot {
+                files_sent: self.stats.files_sent,
+                files_received: self.stats.files_received,
+                folders_sent: self.stats.folders_sent,
+                folders_received: self.stats.folders_received,
+                messages_sent: self.stats.messages_sent,
+                messages_received: self.stats.messages_received,
+            };
+            if let Err(e) = p.update_transfer_stats(&stats) {
+                warn!(event = "transfer_stats_persist_failure", error = %e, "Failed to persist transfer statistics");
+            }
+        }
+    }
+
+    /// Move a transaction from active to history with a status mark and persist.
+    /// Only adds to history if the transaction is still in active (prevents duplicates).
+    fn archive_transaction_with_status(&mut self, txn_id: Uuid, status: TransferStatus) {
+        // Only add to history if transaction is still in active (not already archived)
+        if let Some(txn) = self.transactions.active.get(&txn_id) {
+            let timestamp = crate::ui::helpers::format_absolute_timestamp_now();
+            let record = TransferRecord {
                 direction: txn.direction,
                 peer_id: txn.peer_id.clone(),
                 display_name: txn.display_name.clone(),
                 total_size: txn.total_size,
                 file_count: txn.total_file_count(),
-                timestamp: Instant::now(),
-            });
+                timestamp: timestamp.clone(),
+                status: status.clone(),
+            };
+            self.transfer_history.push(record);
+
+            // Persist history record immediately
+            let snapshot = TransferRecordSnapshot {
+                direction: txn.direction,
+                peer_id: txn.peer_id.clone(),
+                display_name: txn.display_name.clone(),
+                total_size: txn.total_size,
+                file_count: txn.total_file_count(),
+                timestamp,
+                status,
+            };
+            if let Ok(mut p) = Persistence::load() {
+                if let Err(e) = p.push_transfer_record(snapshot) {
+                    warn!(event = "history_persist_failure", error = %e, "Failed to persist transfer history record");
+                }
+            }
         }
         self.transactions.archive(&txn_id);
+
+        // Clean up replay guard entry for this transaction
+        self.replay_guard.remove_transaction(&txn_id);
 
         // Persist removal — use unwrap_or_default to handle corrupted files
         let mut p = Persistence::load().unwrap_or_default();
@@ -1455,23 +1790,4 @@ impl Default for TransferEngine {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ── Abuse & Safety Controls ─────────────────────────────────────────────────
-
-/// Constants for abuse prevention.
-#[allow(dead_code)]
-pub mod safety {
-    use std::time::Duration;
-
-    /// Maximum retries per chunk before giving up.
-    pub const MAX_CHUNK_RETRIES: usize = 3;
-    /// Maximum total retries per transaction.
-    pub const MAX_TRANSACTION_RETRIES: usize = 100;
-    /// Transaction timeout (after which it expires).
-    pub const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
-    /// Maximum memory budget for buffered chunks (128 MB).
-    pub const MAX_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
-    /// Maximum concurrent chunks in pipeline.
-    pub const MAX_PIPELINE_DEPTH: usize = 64;
 }

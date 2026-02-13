@@ -6,7 +6,6 @@
 //! - HMAC(session_key, payload)
 
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
 use uuid::Uuid;
 
 /// An authenticated protocol message envelope.
@@ -57,66 +56,21 @@ impl MessageAuthenticator {
     }
 
     /// Verify an authenticated message.
-    pub fn verify(
-        session_key: &[u8; 32],
-        msg: &AuthenticatedMessage,
-    ) -> bool {
-        let expected = Self::compute_hmac(
-            session_key,
-            &msg.transaction_id,
-            msg.counter,
-            &msg.payload,
-        );
+    pub fn verify(session_key: &[u8; 32], msg: &AuthenticatedMessage) -> bool {
+        let expected =
+            Self::compute_hmac(session_key, &msg.transaction_id, msg.counter, &msg.payload);
         constant_time_eq(&expected, &msg.hmac)
     }
 }
 
-/// HMAC-SHA3-256.
+/// HMAC-SHA3-256 — delegates to the centralized implementation in `utils::crypto`.
 fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 136; // SHA3-256 rate
-
-    let actual_key = if key.len() > BLOCK_SIZE {
-        let mut h = Sha3_256::new();
-        h.update(key);
-        let digest = h.finalize();
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..32].copy_from_slice(&digest);
-        k
-    } else {
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..key.len()].copy_from_slice(key);
-        k
-    };
-
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        ipad[i] ^= actual_key[i];
-        opad[i] ^= actual_key[i];
-    }
-
-    let mut inner = Sha3_256::new();
-    inner.update(&ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha3_256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    let result = outer.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    crate::utils::crypto::hmac_sha3_256(key, data)
 }
 
-/// Constant-time comparison to prevent timing attacks.
+/// Constant-time comparison — delegates to the centralized implementation in `utils::crypto`.
 fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    crate::utils::crypto::constant_time_eq(a, b)
 }
 
 #[cfg(test)]

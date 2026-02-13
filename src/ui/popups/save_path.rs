@@ -9,25 +9,6 @@ use ratatui::{
 };
 
 enum OfferContext<'a> {
-    File {
-        name: &'a str,
-        size_str: String,
-        button_focus: usize,
-        border_color: Color,
-        height: u16,
-        save_path: &'a str,
-        is_editing: bool,
-    },
-    Folder {
-        name: &'a str,
-        size_str: String,
-        file_count: u32,
-        button_focus: usize,
-        border_color: Color,
-        height: u16,
-        save_path: &'a str,
-        is_editing: bool,
-    },
     Transaction {
         name: &'a str,
         size_str: String,
@@ -39,7 +20,7 @@ enum OfferContext<'a> {
         is_editing: bool,
         parent_dir: Option<&'a str>,
     },
-    RemoteFile {
+    RemotePath {
         name: &'a str,
         size_str: String,
         remote_path: &'a str,
@@ -48,16 +29,7 @@ enum OfferContext<'a> {
         button_focus: usize,
         border_color: Color,
         height: u16,
-    },
-    RemoteFolder {
-        name: &'a str,
-        size_str: String,
-        remote_path: &'a str,
-        save_path: &'a str,
-        is_editing: bool,
-        button_focus: usize,
-        border_color: Color,
-        height: u16,
+        is_folder: bool,
     },
 }
 
@@ -66,37 +38,6 @@ pub struct SavePathPopup;
 impl SavePathPopup {
     pub fn new() -> Self {
         Self
-    }
-
-    pub fn render_file<'a>(&self, f: &mut Frame, app: &'a App) {
-        if let Some(af) = &app.accepting_file {
-            let context = OfferContext::File {
-                name: &af.filename,
-                size_str: format_file_size(af.filesize),
-                button_focus: app.file_offer_button_focus,
-                border_color: Color::Green,
-                height: 11,
-                save_path: &af.save_path_input,
-                is_editing: app.file_path_editing,
-            };
-            self.render_internal(f, context);
-        }
-    }
-
-    pub fn render_folder<'a>(&self, f: &mut Frame, app: &'a App) {
-        if let Some(af) = &app.accepting_folder {
-            let context = OfferContext::Folder {
-                name: &af.dirname,
-                size_str: format_file_size(af.total_size),
-                file_count: af.file_count,
-                button_focus: app.folder_offer_button_focus,
-                border_color: Color::Magenta,
-                height: 12,
-                save_path: &af.save_path_input,
-                is_editing: app.folder_path_editing,
-            };
-            self.render_internal(f, context);
-        }
     }
 
     /// Render the pending incoming transaction popup from the engine.
@@ -117,33 +58,18 @@ impl SavePathPopup {
         }
     }
 
-    pub fn render_remote_file<'a>(&self, f: &mut Frame, app: &'a App) {
-        if let Some(req) = &app.remote_file_request {
-            let context = OfferContext::RemoteFile {
-                name: &req.filename,
-                size_str: format_file_size(req.filesize),
+    pub fn render_remote_path<'a>(&self, f: &mut Frame, app: &'a App) {
+        if let Some(req) = &app.remote_path_request {
+            let context = OfferContext::RemotePath {
+                name: &req.name,
+                size_str: format_file_size(req.size),
                 remote_path: &req.remote_path,
                 save_path: &req.save_path_input,
                 is_editing: req.is_path_editing,
                 button_focus: req.button_focus,
-                border_color: Color::Cyan,
+                border_color: if req.is_folder { Color::Magenta } else { Color::Cyan },
                 height: 12,
-            };
-            self.render_internal(f, context);
-        }
-    }
-
-    pub fn render_remote_folder<'a>(&self, f: &mut Frame, app: &'a App) {
-        if let Some(req) = &app.remote_folder_request {
-            let context = OfferContext::RemoteFolder {
-                name: &req.dirname,
-                size_str: format_file_size(req.total_size),
-                remote_path: &req.remote_path,
-                save_path: &req.save_path_input,
-                is_editing: req.is_path_editing,
-                button_focus: req.button_focus,
-                border_color: Color::Magenta,
-                height: 12,
+                is_folder: req.is_folder,
             };
             self.render_internal(f, context);
         }
@@ -154,37 +80,6 @@ impl SavePathPopup {
 
         // Estrarre i valori comuni
         let (height, _button_focus, border_color, text_lines, title) = match context {
-            OfferContext::File {
-                name,
-                size_str,
-                button_focus,
-                border_color,
-                height,
-                save_path,
-                is_editing,
-            } => (
-                height,
-                button_focus,
-                border_color,
-                Self::build_file_text(name, size_str, button_focus, save_path, is_editing),
-                " Confirm Download ",
-            ),
-            OfferContext::Folder {
-                name,
-                size_str,
-                file_count,
-                button_focus,
-                border_color,
-                height,
-                save_path,
-                is_editing,
-            } => (
-                height,
-                button_focus,
-                border_color,
-                Self::build_folder_text(name, file_count, size_str, button_focus, save_path, is_editing),
-                " Confirm Download ",
-            ),
             OfferContext::Transaction {
                 name,
                 size_str,
@@ -210,7 +105,7 @@ impl SavePathPopup {
                 ),
                 " Confirm Download ",
             ),
-            OfferContext::RemoteFile {
+            OfferContext::RemotePath {
                 name,
                 size_str,
                 remote_path,
@@ -219,31 +114,23 @@ impl SavePathPopup {
                 button_focus,
                 border_color,
                 height,
+                is_folder,
             } => (
                 height,
                 button_focus,
                 border_color,
-                Self::build_remote_file_text(name, size_str, remote_path, save_path, is_editing, button_focus),
-                " Request File ",
-            ),
-            OfferContext::RemoteFolder {
-                name,
-                size_str,
-                remote_path,
-                save_path,
-                is_editing,
-                button_focus,
-                border_color,
-                height,
-            } => (
-                height,
-                button_focus,
-                border_color,
-                Self::build_remote_folder_text(name, size_str, remote_path, save_path, is_editing, button_focus),
-                " Request Folder ",
+                Self::build_remote_path_text(
+                    name,
+                    size_str,
+                    remote_path,
+                    save_path,
+                    is_editing,
+                    button_focus,
+                    is_folder,
+                ),
+                if is_folder { " Request Folder " } else { " Request File " },
             ),
         };
-
 
         let popup_area = Rect {
             x: area.width / 4,
@@ -273,7 +160,11 @@ impl SavePathPopup {
         Self::build_buttons_with_labels(button_focus, " Request ", " Cancel ")
     }
 
-    fn build_buttons_with_labels(button_focus: usize, accept_label: &str, cancel_label: &str) -> Vec<Span<'static>> {
+    fn build_buttons_with_labels(
+        button_focus: usize,
+        accept_label: &str,
+        cancel_label: &str,
+    ) -> Vec<Span<'static>> {
         let download_style = if button_focus == 0 {
             Style::default()
                 .fg(Color::Black)
@@ -295,110 +186,6 @@ impl SavePathPopup {
             Span::styled(accept_label.to_string(), download_style),
             Span::raw("  "),
             Span::styled(cancel_label.to_string(), cancel_style),
-        ]
-    }
-
-    fn build_file_text(name: &str, size_str: String, button_focus: usize, save_path: &str, is_editing: bool) -> Vec<Line<'static>> {
-        let path_style = if is_editing {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if button_focus == 2 {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-
-        let name_string = name.to_string();
-        let save_path_string = save_path.to_string();
-        let edit_indicator = if is_editing {
-            " [EDIT]".to_string()
-        } else {
-            String::new()
-        };
-        let hint_text = if is_editing {
-            "  Type to edit path · Enter/Esc to confirm"
-        } else {
-            "  Tab to navigate · Enter to select"
-        };
-
-        vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  File: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    name_string,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(" ({})", size_str)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Path: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(save_path_string, path_style),
-                Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
-            ]),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
-            Line::from(""),
-            Line::from(Self::build_buttons(button_focus)),
-        ]
-    }
-
-    fn build_folder_text(
-        name: &str,
-        file_count: u32,
-        size_str: String,
-        button_focus: usize,
-        save_path: &str,
-        is_editing: bool,
-    ) -> Vec<Line<'static>> {
-        let path_style = if is_editing {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if button_focus == 2 {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-        let edit_indicator = if is_editing {
-            " [EDIT]".to_string()
-        } else {
-            String::new()
-        };
-        let hint_text = if is_editing {
-            "  Type to edit path \u{00b7} Enter/Esc to confirm"
-        } else {
-            "  Tab to navigate \u{00b7} Enter to select"
-        };
-
-        vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Folder: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    name.to_string(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(" ({} files, {})", file_count, size_str)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Path: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(save_path.to_string(), path_style),
-                Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
-            ]),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
-            Line::from(""),
-            Line::from(Self::build_buttons(button_focus)),
         ]
     }
 
@@ -453,10 +240,7 @@ impl SavePathPopup {
         if let Some(dir) = parent_dir {
             lines.push(Line::from(vec![
                 Span::styled("  Folder: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    dir.to_string(),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(dir.to_string(), Style::default().fg(Color::Yellow)),
             ]));
         }
 
@@ -471,20 +255,24 @@ impl SavePathPopup {
             Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
         ]));
 
-        lines.push(Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            hint_text,
+            Style::default().fg(Color::DarkGray),
+        )));
         lines.push(Line::from(""));
         lines.push(Line::from(Self::build_buttons(button_focus)));
 
         lines
     }
 
-    fn build_remote_file_text(
+    fn build_remote_path_text(
         name: &str,
         size_str: String,
         remote_path: &str,
         save_path: &str,
         is_editing: bool,
         button_focus: usize,
+        is_folder: bool,
     ) -> Vec<Line<'static>> {
         let path_style = if is_editing {
             Style::default()
@@ -509,10 +297,12 @@ impl SavePathPopup {
             "  Tab to navigate · Enter to select"
         };
 
+        let label = if is_folder { "Folder" } else { "File" };
+
         vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  File: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {}: ", label), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     name.to_string(),
                     Style::default()
@@ -533,68 +323,10 @@ impl SavePathPopup {
                 Span::styled(save_path.to_string(), path_style),
                 Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
             ]),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
-            Line::from(""),
-            Line::from(Self::build_request_buttons(button_focus)),
-        ]
-    }
-
-    fn build_remote_folder_text(
-        name: &str,
-        size_str: String,
-        remote_path: &str,
-        save_path: &str,
-        is_editing: bool,
-        button_focus: usize,
-    ) -> Vec<Line<'static>> {
-        let path_style = if is_editing {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if button_focus == 2 {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-        let edit_indicator = if is_editing {
-            " [EDIT]".to_string()
-        } else {
-            String::new()
-        };
-        let hint_text = if is_editing {
-            "  Type to edit path \u{00b7} Enter/Esc to confirm"
-        } else {
-            "  Tab to navigate \u{00b7} Enter to select"
-        };
-
-        vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Folder: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    name.to_string(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(" ({})", size_str)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Remote: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    remote_path.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Save to: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(save_path.to_string(), path_style),
-                Span::styled(edit_indicator, Style::default().fg(Color::Yellow)),
-            ]),
-            Line::from(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            )),
             Line::from(""),
             Line::from(Self::build_request_buttons(button_focus)),
         ]

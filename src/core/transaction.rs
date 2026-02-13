@@ -12,6 +12,7 @@
 //!
 //! There is exactly one Transaction per transfer request.
 
+pub use crate::core::config::CHUNK_SIZE;
 use crate::core::pipeline::chunk::ChunkBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,9 +20,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
 
-/// Canonical chunk size in bytes. Must match the constant in webrtc.rs.
-/// Every module that computes total_chunks or byte offsets MUST use this.
-pub const CHUNK_SIZE: usize = 48 * 1024;
+/// Compute the total number of chunks for a file of the given size.
+///
+/// This is the **single source of truth** for chunk count computation.
+/// All modules MUST use this instead of duplicating the formula.
+///
+/// Invariant: always returns at least 1 (even for zero-size files).
+#[inline]
+pub fn compute_total_chunks(file_size: u64) -> u32 {
+    ((file_size as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32
+}
 
 // ── Transaction State Machine ────────────────────────────────────────────────
 
@@ -89,16 +97,17 @@ pub struct TransactionFile {
     pub verified: Option<bool>,
     /// Chunk completion bitmap for resume support.
     #[serde(skip)]
-    #[allow(dead_code)]
     pub chunk_bitmap: Option<ChunkBitmap>,
     /// Merkle root for integrity verification.
     #[serde(default)]
     pub merkle_root: Option<[u8; 32]>,
+    /// Numero di richieste di ritrasmissione per questo file.
+    pub retransmit_count: u32,
 }
 
 impl TransactionFile {
     pub fn new(file_id: Uuid, relative_path: String, filesize: u64) -> Self {
-        let total_chunks = ((filesize as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
+        let total_chunks = compute_total_chunks(filesize);
         Self {
             file_id,
             relative_path,
@@ -109,6 +118,7 @@ impl TransactionFile {
             verified: None,
             chunk_bitmap: Some(ChunkBitmap::new(total_chunks)),
             merkle_root: None,
+            retransmit_count: 0,
         }
     }
 }
@@ -116,12 +126,27 @@ impl TransactionFile {
 // ── Transaction Manifest (sent over the wire) ────────────────────────────────
 
 /// The file manifest sent from sender to receiver as part of the transfer request.
+///
+/// Includes cryptographic security fields: the sender signs the manifest
+/// content and the receiver validates the signature before ACK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionManifest {
     /// List of files in this transaction with relative paths and sizes.
     pub files: Vec<ManifestEntry>,
     /// Parent directory name, if this is a folder transfer.
     pub parent_dir: Option<String>,
+    /// Sender's public key (identity).
+    #[serde(default)]
+    pub sender_id: Option<[u8; 32]>,
+    /// HMAC signature over manifest content by the sender.
+    #[serde(default)]
+    pub signature: Option<[u8; 32]>,
+    /// Per-session nonce seed for deterministic nonce derivation.
+    #[serde(default)]
+    pub nonce_seed: Option<[u8; 32]>,
+    /// Manifest expiration time (Unix timestamp seconds).
+    #[serde(default)]
+    pub expiration_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +219,11 @@ pub struct Transaction {
     pub reject_reason: Option<String>,
     /// Number of resume attempts.
     pub resume_count: u32,
+    /// Timestamp when the transaction was last activated via resume.
+    /// Used to prevent `handle_peer_reconnected` from re-interrupting a
+    /// transfer that was just resumed (race between data-channel resume
+    /// messages and the PeerConnected event).
+    pub resumed_at: Option<Instant>,
 }
 
 impl Transaction {
@@ -211,10 +241,7 @@ impl Transaction {
 
         for (rel_path, filesize) in files {
             let file_id = Uuid::new_v4();
-            file_map.insert(
-                file_id,
-                TransactionFile::new(file_id, rel_path, filesize),
-            );
+            file_map.insert(file_id, TransactionFile::new(file_id, rel_path, filesize));
             file_order.push(file_id);
         }
 
@@ -232,6 +259,7 @@ impl Transaction {
             finished_at: None,
             reject_reason: None,
             resume_count: 0,
+            resumed_at: None,
         }
     }
 
@@ -251,10 +279,10 @@ impl Transaction {
             // Use the file_id from the manifest so sender and receiver
             // share the same identifiers for ACK / resume.
             let file_id = entry.file_id;
-            file_map.insert(
-                file_id,
-                TransactionFile::new(file_id, entry.relative_path.clone(), entry.filesize),
-            );
+            let mut tf = TransactionFile::new(file_id, entry.relative_path.clone(), entry.filesize);
+            // Copy Merkle root from manifest for integrity verification on receive
+            tf.merkle_root = entry.merkle_root;
+            file_map.insert(file_id, tf);
             file_order.push(file_id);
         }
 
@@ -272,6 +300,7 @@ impl Transaction {
             finished_at: None,
             reject_reason: None,
             resume_count: 0,
+            resumed_at: None,
         }
     }
 
@@ -310,38 +339,13 @@ impl Transaction {
     }
 
     /// Mark the transaction as resumable (persisted state).
-    #[allow(dead_code)]
     pub fn make_resumable(&mut self) {
         if self.state == TransactionState::Active || self.state == TransactionState::Interrupted {
             self.state = TransactionState::Resumable;
         }
     }
 
-    /// Mark a specific chunk as received for a file.
-    #[allow(dead_code)]
-    pub fn mark_chunk_received(&mut self, file_id: Uuid, chunk_index: u32) {
-        if let Some(file) = self.files.get_mut(&file_id) {
-            if let Some(ref mut bitmap) = file.chunk_bitmap {
-                if !bitmap.is_set(chunk_index) {
-                    bitmap.set(chunk_index);
-                    file.transferred_chunks = bitmap.received_count();
-                }
-            }
-        }
-    }
-
-    /// Get missing chunks for a file.
-    #[allow(dead_code)]
-    pub fn missing_chunks(&self, file_id: &Uuid) -> Vec<u32> {
-        self.files
-            .get(file_id)
-            .and_then(|f| f.chunk_bitmap.as_ref())
-            .map(|bm| bm.missing_chunks())
-            .unwrap_or_default()
-    }
-
     /// Build a resume info from the current transaction state.
-    #[allow(dead_code)]
     pub fn build_resume_info(&self) -> ResumeInfo {
         let completed_files: Vec<Uuid> = self
             .files
@@ -360,11 +364,7 @@ impl Transaction {
         let chunk_bitmaps: HashMap<Uuid, Vec<u8>> = self
             .files
             .values()
-            .filter_map(|f| {
-                f.chunk_bitmap
-                    .as_ref()
-                    .map(|bm| (f.file_id, bm.to_bytes()))
-            })
+            .filter_map(|f| f.chunk_bitmap.as_ref().map(|bm| (f.file_id, bm.to_bytes())))
             .collect();
 
         ResumeInfo {
@@ -400,6 +400,39 @@ impl Transaction {
         }
     }
 
+    /// Update chunk progress for a specific file and mark chunks as sent in bitmap.
+    /// This is used by the sender to track which chunks have been sent.
+    pub fn update_file_progress_sent(&mut self, file_id: Uuid, sent_chunks: u32) {
+        if let Some(file) = self.files.get_mut(&file_id) {
+            file.transferred_chunks = sent_chunks;
+            // Mark chunks 0..sent_chunks as sent in the bitmap
+            if let Some(ref mut bitmap) = file.chunk_bitmap {
+                // Only mark chunks that aren't already marked
+                for i in file.transferred_chunks..sent_chunks {
+                    bitmap.set(i);
+                }
+            }
+        }
+    }
+
+    /// Update chunk progress for a specific file and sync the bitmap from receiver.
+    pub fn update_file_progress_with_bitmap(
+        &mut self,
+        file_id: Uuid,
+        transferred_chunks: u32,
+        bitmap_bytes: Option<&[u8]>,
+    ) {
+        if let Some(file) = self.files.get_mut(&file_id) {
+            file.transferred_chunks = transferred_chunks;
+            // Sync bitmap from receiver if provided
+            if let Some(bytes) = bitmap_bytes {
+                if let Some(bitmap) = ChunkBitmap::from_bytes(bytes) {
+                    file.chunk_bitmap = Some(bitmap);
+                }
+            }
+        }
+    }
+
     /// Mark a file as completed within this transaction.
     pub fn complete_file(&mut self, file_id: Uuid, verified: bool) {
         if let Some(file) = self.files.get_mut(&file_id) {
@@ -428,7 +461,56 @@ impl Transaction {
 
     // ── Resume support ───────────────────────────────────────────────────
 
-    /// Apply resume info from the receiver: mark completed files as done.
+    /// Validate a resume request against the transaction's current state.
+    ///
+    /// Checks:
+    /// 1. Transaction is in a resumable state (Active, Interrupted, or Resumable).
+    /// 2. Transaction is outbound (we are the sender; receiver drives resume).
+    /// 3. Retry limit has not been exceeded.
+    /// 4. All referenced file_ids exist in the transaction manifest.
+    ///
+    /// Returns `Ok(())` if valid, `Err(reason)` if the request must be rejected.
+    pub fn validate_resume_request(
+        &self,
+        resume_info: &ResumeInfo,
+        max_retries: u32,
+    ) -> Result<(), &'static str> {
+        // State check: must be in a resumable-compatible state
+        if self.state != TransactionState::Resumable
+            && self.state != TransactionState::Interrupted
+            && self.state != TransactionState::Active
+        {
+            return Err("Invalid transaction state for resume");
+        }
+
+        // Direction check: only outbound transactions accept resume requests
+        if self.direction != TransactionDirection::Outbound {
+            return Err("Resume rejected: wrong direction");
+        }
+
+        // Retry limit
+        if self.resume_count >= max_retries {
+            return Err("Resume rejected: retry limit exceeded");
+        }
+
+        // Manifest integrity: all referenced file_ids must exist
+        for file_id in &resume_info.completed_files {
+            if !self.files.contains_key(file_id) {
+                return Err("Resume rejected: unknown file in request");
+            }
+        }
+        for file_id in resume_info.partial_offsets.keys() {
+            if !self.files.contains_key(file_id) {
+                return Err("Resume rejected: unknown file in request");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply resume info from the receiver: mark completed files as done,
+    /// and preserve partial progress for incomplete files so the sender
+    /// can skip already-received chunks.
     pub fn apply_resume_info(&mut self, info: &ResumeInfo) {
         self.resume_count += 1;
 
@@ -438,16 +520,45 @@ impl Transaction {
                 file.transferred_chunks = file.total_chunks;
                 file.verified = Some(true);
             } else {
-                // Reset progress for incomplete files — the sender will
-                // re-send ALL chunks from 0 because the receiver's
-                // in-memory buffer is lost on reconnect.  Keeping the
-                // old transferred_chunks would cause the sender to skip
-                // chunks that the receiver no longer has.
-                file.transferred_chunks = 0;
+                // Reset `completed` because a prior SendComplete{success:false}
+                // (fired when the connection drops mid-send) marks the file as
+                // completed even though it was never fully transferred.
+                file.completed = false;
+                file.verified = None;
+
+                // Restore chunk bitmap from the resume info if available.
+                // This allows the sender to skip already-received chunks
+                // instead of re-sending the entire file.
+                if let Some(bitmap_bytes) = info.chunk_bitmaps.get(file_id) {
+                    if let Some(bitmap) = ChunkBitmap::from_bytes(bitmap_bytes) {
+                        // Count received chunks from the bitmap
+                        let mut count = 0u32;
+                        for i in 0..file.total_chunks {
+                            if bitmap.is_set(i) {
+                                count += 1;
+                            }
+                        }
+                        file.transferred_chunks = count;
+                        file.chunk_bitmap = Some(bitmap);
+                    } else {
+                        // Invalid bitmap — reset to 0
+                        file.transferred_chunks = 0;
+                        if let Some(ref mut bitmap) = file.chunk_bitmap {
+                            *bitmap = ChunkBitmap::new(file.total_chunks);
+                        }
+                    }
+                } else {
+                    // No bitmap in resume info — reset to 0
+                    file.transferred_chunks = 0;
+                    if let Some(ref mut bitmap) = file.chunk_bitmap {
+                        *bitmap = ChunkBitmap::new(file.total_chunks);
+                    }
+                }
             }
         }
 
         self.state = TransactionState::Active;
+        self.resumed_at = Some(Instant::now());
     }
 
     // ── Snapshot (persistence) ─────────────────────────────────────────────
@@ -469,6 +580,7 @@ impl Transaction {
                 verified: f.verified,
                 chunk_bitmap_bytes: f.chunk_bitmap.as_ref().map(|bm| bm.to_bytes()),
                 merkle_root: f.merkle_root,
+                retransmit_count: f.retransmit_count,
             })
             .collect();
 
@@ -487,15 +599,19 @@ impl Transaction {
             reject_reason: self.reject_reason.clone(),
             resume_count: self.resume_count,
             expiration_time: None,
+            interrupted_at: if self.state == TransactionState::Resumable 
+                || self.state == TransactionState::Interrupted {
+                Some(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs())
+            } else {
+                None
+            },
             last_counter: None,
             source_path: source_path.map(|s| s.to_string()),
             manifest,
         }
-    }
-
-    /// Create a serializable snapshot (convenience, no source_path).
-    pub fn to_snapshot(&self) -> TransactionSnapshot {
-        self.to_snapshot_with_source(None)
     }
 
     /// Restore a Transaction from a persisted snapshot.
@@ -527,6 +643,7 @@ impl Transaction {
                 verified: fs.verified,
                 chunk_bitmap: Some(bitmap),
                 merkle_root: fs.merkle_root,
+                retransmit_count: fs.retransmit_count,
             };
             file_map.insert(fs.file_id, tf);
             file_order.push(fs.file_id);
@@ -546,6 +663,7 @@ impl Transaction {
             finished_at: None,
             reject_reason: snap.reject_reason.clone(),
             resume_count: snap.resume_count,
+            resumed_at: None,
         }
     }
 
@@ -569,7 +687,41 @@ impl Transaction {
         TransactionManifest {
             files,
             parent_dir: self.parent_dir.clone(),
+            sender_id: None,
+            signature: None,
+            nonce_seed: None,
+            expiration_time: None,
         }
+    }
+
+    /// Compute the canonical bytes used for manifest signing.
+    /// Covers all content except the signature itself.
+    pub fn manifest_content_bytes(manifest: &TransactionManifest) -> Vec<u8> {
+        let mut data = Vec::new();
+        if let Some(ref pd) = manifest.parent_dir {
+            data.extend_from_slice(pd.as_bytes());
+        }
+        if let Some(ref sender) = manifest.sender_id {
+            data.extend_from_slice(sender);
+        }
+        if let Some(ref seed) = manifest.nonce_seed {
+            data.extend_from_slice(seed);
+        }
+        if let Some(exp) = manifest.expiration_time {
+            data.extend_from_slice(&exp.to_be_bytes());
+        }
+        for f in &manifest.files {
+            data.extend_from_slice(f.file_id.as_bytes());
+            data.extend_from_slice(f.relative_path.as_bytes());
+            data.extend_from_slice(&f.filesize.to_be_bytes());
+            if let Some(tc) = f.total_chunks {
+                data.extend_from_slice(&tc.to_be_bytes());
+            }
+            if let Some(ref mr) = f.merkle_root {
+                data.extend_from_slice(mr);
+            }
+        }
+        data
     }
 }
 
@@ -606,9 +758,9 @@ impl TransactionManager {
 
     /// Get a transaction by ID (active or history).
     pub fn get(&self, id: &Uuid) -> Option<&Transaction> {
-        self.active.get(id).or_else(|| {
-            self.history.iter().find(|t| t.id == *id)
-        })
+        self.active
+            .get(id)
+            .or_else(|| self.history.iter().find(|t| t.id == *id))
     }
 
     /// Get a mutable reference to an active transaction.
@@ -624,11 +776,6 @@ impl TransactionManager {
         } else {
             None
         }
-    }
-
-    /// Get the transaction ID for a file ID.
-    pub fn transaction_id_for_file(&self, file_id: &Uuid) -> Option<Uuid> {
-        self.file_to_transaction.get(file_id).copied()
     }
 
     /// Move a transaction from active to history.
@@ -666,11 +813,13 @@ impl TransactionManager {
         result
     }
 
-    /// Total count of active (non-terminal) transactions.
+    /// Count of transactions currently transferring data (state == Active).
+    /// Pending, Interrupted, and Resumable transactions do NOT count,
+    /// so they don't block new transfers from starting.
     pub fn active_count(&self) -> usize {
         self.active
             .values()
-            .filter(|t| !t.state.is_terminal())
+            .filter(|t| t.state == TransactionState::Active)
             .count()
     }
 }
@@ -700,6 +849,10 @@ pub struct TransactionSnapshot {
     /// Transaction expiration time (Unix timestamp seconds).
     #[serde(default)]
     pub expiration_time: Option<u64>,
+    /// Timestamp when the transaction became resumable (Unix timestamp seconds).
+    /// Used to determine if the transaction has expired.
+    #[serde(default)]
+    pub interrupted_at: Option<u64>,
     /// Last replay counter seen.
     #[serde(default)]
     pub last_counter: Option<u64>,
@@ -709,6 +862,42 @@ pub struct TransactionSnapshot {
     /// Manifest snapshot for the transaction (immutable after creation).
     #[serde(default)]
     pub manifest: Option<TransactionManifest>,
+}
+
+impl TransactionSnapshot {
+    /// Check if this transaction has expired.
+    /// A transaction is expired if:
+    /// 1. It's in Resumable or Interrupted state
+    /// 2. The expiration_time has passed (if set)
+    /// 3. Or 24 hours have passed since interrupted_at
+    pub fn is_expired(&self) -> bool {
+        if self.state != TransactionState::Resumable 
+            && self.state != TransactionState::Interrupted {
+            return false;
+        }
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Check explicit expiration time
+        if let Some(exp) = self.expiration_time {
+            if now >= exp {
+                return true;
+            }
+        }
+        
+        // Check 24-hour default expiration from interrupted_at
+        if let Some(interrupted) = self.interrupted_at {
+            const EXPIRY_SECS: u64 = 24 * 3600; // 24 hours
+            if now >= interrupted + EXPIRY_SECS {
+                return true;
+            }
+        }
+        
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,4 +915,7 @@ pub struct TransactionFileSnapshot {
     /// Merkle root for integrity verification.
     #[serde(default)]
     pub merkle_root: Option<[u8; 32]>,
+    /// Number of retransmission attempts for this file.
+    #[serde(default)]
+    pub retransmit_count: u32,
 }

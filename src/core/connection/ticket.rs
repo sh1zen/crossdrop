@@ -22,10 +22,12 @@ impl Ticket {
     }
 
     pub fn parse(s: String) -> anyhow::Result<Self> {
-        let s = hash::expand_string(s).map_err(|e| {
-            error!(event = "ticket_decode_failure", error = %e, "Failed to decompress ticket");
-            e
-        }).context("failed to decompress ticket")?;
+        let s = hash::expand_string(s)
+            .map_err(|e| {
+                error!(event = "ticket_decode_failure", error = %e, "Failed to decompress ticket");
+                e
+            })
+            .context("failed to decompress ticket")?;
         let ticket: Self = serde_json::from_str(&s).map_err(|e| {
             error!(event = "ticket_deserialize_failure", error = %e, "Failed to deserialize ticket");
             anyhow::anyhow!(e)
