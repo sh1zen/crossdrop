@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Security module: Ed25519 identity, session management, replay protection, HMAC.
 //!
 //! Provides:

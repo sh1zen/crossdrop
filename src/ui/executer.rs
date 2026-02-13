@@ -11,7 +11,7 @@ use crate::ui::traits::{Action, Component, Handler};
 use crate::utils::hash::get_or_create_secret;
 use crate::utils::log_buffer::LogBuffer;
 use crate::utils::sos::SignalOfStop;
-use crate::workers::app::{AcceptingFileOffer, AcceptingFolderOffer, App, ChatTarget, FileDirection, FileRecord, Message, MessageSender, Mode, FileTransferStatus};
+use crate::workers::app::{App, ChatTarget, Message, MessageSender, Mode};
 use crate::workers::args::Args;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -33,8 +33,6 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UIPopup {
     None,
-    FileOffer,
-    FolderOffer,
     TransactionOffer,
     RemoteFileRequest,
     RemoteFolderRequest,
@@ -47,8 +45,6 @@ pub struct UIContext {
     pub current_mode: Mode,
     /// Quale popup è attivo, se presente
     pub active_popup: UIPopup,
-    /// Se siamo in modalità editing path per i file offer
-    pub file_path_editing: bool,
 }
 
 impl UIContext {
@@ -56,7 +52,6 @@ impl UIContext {
         Self {
             current_mode: Mode::Home,
             active_popup: UIPopup::None,
-            file_path_editing: false,
         }
     }
 
@@ -69,7 +64,6 @@ impl UIContext {
     pub fn switch_mode(&mut self, new_mode: Mode) {
         self.current_mode = new_mode;
         self.active_popup = UIPopup::None;
-        self.file_path_editing = false;
     }
 }
 
@@ -394,12 +388,6 @@ impl UIExecuter {
 
             // Renderizza popup overlay
             match context.active_popup {
-                UIPopup::FileOffer if app.accepting_file.is_some() => {
-                    save_path_popup.render_file(f, app);
-                }
-                UIPopup::FolderOffer if app.accepting_folder.is_some() => {
-                    save_path_popup.render_folder(f, app);
-                }
                 UIPopup::TransactionOffer if app.engine.has_pending_incoming() => {
                     save_path_popup.render_transaction_from_engine(f, app);
                 }
@@ -561,13 +549,6 @@ impl UIExecuter {
             && self.app.engine.has_pending_incoming()
         {
             self.handle_transaction_offer_key(node, key).await
-        } else if self.context.active_popup == UIPopup::FileOffer && self.app.accepting_file.is_some()
-        {
-            self.handle_file_offer_key(node, key).await
-        } else if self.context.active_popup == UIPopup::FolderOffer
-            && self.app.accepting_folder.is_some()
-        {
-            self.handle_folder_offer_key(node, key).await
         } else if self.context.active_popup == UIPopup::RemoteFileRequest
             && self.app.remote_file_request.is_some()
         {
@@ -578,280 +559,6 @@ impl UIExecuter {
             self.handle_remote_folder_request_key(node, key).await
         } else {
             false
-        }
-    }
-
-    /// Gestisce i tasti per il file offer popup
-    async fn handle_file_offer_key(&mut self, node: &PeerNode, key: KeyCode) -> bool {
-        match key {
-            KeyCode::Tab | KeyCode::BackTab => {
-                let forward = matches!(key, KeyCode::Tab);
-                self.app.file_offer_button_focus = cycle_focus(self.app.file_offer_button_focus, forward);
-                self.app.file_path_editing = self.app.file_offer_button_focus == 2;
-                self.context.file_path_editing = self.app.file_path_editing;
-            }
-            KeyCode::Enter => {
-                if self.app.file_path_editing {
-                    self.app.file_offer_button_focus = 0;
-                    self.app.file_path_editing = false;
-                    self.context.file_path_editing = false;
-                    return false;
-                }
-
-                let af = self.app.accepting_file.take().unwrap();
-                let button_focus = self.app.file_offer_button_focus;
-                self.app.file_offer_button_focus = 0;
-                self.app.file_path_editing = false;
-                self.context.file_path_editing = false;
-                self.context.active_popup = UIPopup::None;
-
-                if button_focus == 0 {
-                    // Download button
-                    self.process_file_offer_accept(node, af).await;
-                } else {
-                    // Cancel button
-                    self.process_file_offer_reject(node, af).await;
-                }
-            }
-            KeyCode::Backspace => {
-                if self.app.file_path_editing {
-                    if let Some(af) = &mut self.app.accepting_file {
-                        af.save_path_input.pop();
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                if self.app.file_path_editing {
-                    if let Some(af) = &mut self.app.accepting_file {
-                        af.save_path_input.push(c);
-                    }
-                } else if c == 'n' || c == 'N' || c == 'c' || c == 'C' {
-                    let af = self.app.accepting_file.take().unwrap();
-                    self.app.file_offer_button_focus = 0;
-                    self.app.file_path_editing = false;
-                    self.context.file_path_editing = false;
-                    self.context.active_popup = UIPopup::None;
-                    self.process_file_offer_reject(node, af).await;
-                }
-            }
-            KeyCode::Esc => {
-                if self.app.file_path_editing {
-                    self.app.file_offer_button_focus = 0;
-                    self.app.file_path_editing = false;
-                    self.context.file_path_editing = false;
-                } else {
-                    let af = self.app.accepting_file.take().unwrap();
-                    self.app.file_offer_button_focus = 0;
-                    self.app.file_path_editing = false;
-                    self.context.file_path_editing = false;
-                    self.context.active_popup = UIPopup::None;
-                    self.process_file_offer_reject(node, af).await;
-                }
-            }
-            _ => {}
-        }
-        false
-    }
-
-    /// Gestisce i tasti per il folder offer popup
-    async fn handle_folder_offer_key(&mut self, node: &PeerNode, key: KeyCode) -> bool {
-        match key {
-            KeyCode::Tab | KeyCode::BackTab => {
-                let forward = matches!(key, KeyCode::Tab);
-                self.app.folder_offer_button_focus = cycle_focus(self.app.folder_offer_button_focus, forward);
-                self.app.folder_path_editing = self.app.folder_offer_button_focus == 2;
-            }
-            KeyCode::Enter => {
-                if self.app.folder_path_editing {
-                    self.app.folder_offer_button_focus = 0;
-                    self.app.folder_path_editing = false;
-                    return false;
-                }
-
-                let af = self.app.accepting_folder.take().unwrap();
-                let button_focus = self.app.folder_offer_button_focus;
-                self.app.folder_offer_button_focus = 0;
-                self.app.folder_path_editing = false;
-                self.context.active_popup = UIPopup::None;
-
-                if button_focus == 0 {
-                    self.process_folder_offer_accept(node, af).await;
-                } else {
-                    self.process_folder_offer_reject(node, af).await;
-                }
-            }
-            KeyCode::Backspace => {
-                if self.app.folder_path_editing {
-                    if let Some(af) = &mut self.app.accepting_folder {
-                        af.save_path_input.pop();
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                if self.app.folder_path_editing {
-                    if let Some(af) = &mut self.app.accepting_folder {
-                        af.save_path_input.push(c);
-                    }
-                } else if c == 'n' || c == 'N' || c == 'c' || c == 'C' {
-                    let af = self.app.accepting_folder.take().unwrap();
-                    self.app.folder_offer_button_focus = 0;
-                    self.app.folder_path_editing = false;
-                    self.context.active_popup = UIPopup::None;
-                    self.process_folder_offer_reject(node, af).await;
-                }
-            }
-            KeyCode::Esc => {
-                if self.app.folder_path_editing {
-                    self.app.folder_offer_button_focus = 0;
-                    self.app.folder_path_editing = false;
-                } else {
-                    let af = self.app.accepting_folder.take().unwrap();
-                    self.app.folder_offer_button_focus = 0;
-                    self.app.folder_path_editing = false;
-                    self.context.active_popup = UIPopup::None;
-                    self.process_folder_offer_reject(node, af).await;
-                }
-            }
-            _ => {}
-        }
-        false
-    }
-
-    // Helper methods per processare le azioni dei popup
-    async fn process_file_offer_accept(&mut self, node: &PeerNode, af: AcceptingFileOffer) {
-        let dest_path = af.save_path_input.clone();
-        let node = node.clone();
-        let filename = af.filename.clone();
-        let peer_display = get_display_name(&self.app, &af.peer_id).to_string();
-
-        if af.is_remote {
-            if let Some(remote_path) = af.remote_path {
-                tokio::spawn(async move {
-                    match node
-                        .fetch_remote_path(&af.peer_id, remote_path, false)
-                        .await
-                    {
-                        Ok(()) => {
-                            tracing::debug!(
-                                "Remote file '{}' download started from {}",
-                                filename,
-                                peer_display
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to download remote file '{}' from {}: {}",
-                                filename,
-                                peer_display,
-                                e
-                            );
-                        }
-                    }
-                });
-            }
-        } else {
-            tokio::spawn(async move {
-                tracing::debug!(
-                    "Sending file acceptance response for {} from {}",
-                    filename,
-                    peer_display
-                );
-                match node
-                    .respond_to_file_offer(&af.peer_id, af.file_id, true, Some(dest_path.clone()))
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::debug!("File offer response sent successfully for '{}'", filename);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to accept file '{}' from {} with save path '{}': {}",
-                            filename,
-                            peer_display,
-                            dest_path,
-                            e
-                        );
-                    }
-                }
-            });
-        }
-        self.app.notify
-            .info(format!("Downloading: {}", af.filename));
-    }
-
-    async fn process_file_offer_reject(&mut self, node: &PeerNode, af: AcceptingFileOffer) {
-        if !af.is_remote {
-            let file_id = af.file_id;
-            let node = node.clone();
-            let filename = af.filename.clone();
-            tokio::spawn(async move {
-                let _ = node
-                    .respond_to_file_offer(&af.peer_id, af.file_id, false, None)
-                    .await;
-            });
-            
-            // Track the rejection
-            self.app.file_transfer_status.insert(file_id, FileTransferStatus::Rejected);
-            self.app.rejected_transfers.insert(file_id, (filename.clone(), Some("User declined".to_string())));
-            
-            self.app.notify
-                .warn(format!("Rejected: {}", af.filename));
-        } else {
-            self.app.notify
-                .warn(format!("Cancelled: {}", af.filename));
-        }
-    }
-
-    async fn process_folder_offer_accept(&mut self, node: &PeerNode, af: AcceptingFolderOffer) {
-        self.app
-            .folder_progress
-            .insert(af.folder_id, (0, af.file_count));
-        let node = node.clone();
-        let dirname = af.dirname.clone();
-
-        if af.is_remote {
-            if let Some(remote_path) = af.remote_path {
-                let dirname_clone = dirname.clone();
-                tokio::spawn(async move {
-                    match node.fetch_remote_path(&af.peer_id, remote_path, true).await {
-                        Ok(()) => {
-                            tracing::debug!("Remote folder '{}' download started", dirname_clone);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to download remote folder '{}': {}",
-                                dirname_clone,
-                                e
-                            );
-                        }
-                    }
-                });
-            }
-        } else {
-            tokio::spawn(async move {
-                let _ = node
-                    .respond_to_folder_offer(&af.peer_id, af.folder_id, true)
-                    .await;
-            });
-        }
-        self.app.notify
-            .info(format!("Downloading: {}", dirname));
-    }
-
-    async fn process_folder_offer_reject(&mut self, node: &PeerNode, af: AcceptingFolderOffer) {
-        if !af.is_remote {
-            let node = node.clone();
-            let dirname = af.dirname.clone();
-            tokio::spawn(async move {
-                let _ = node
-                    .respond_to_folder_offer(&af.peer_id, af.folder_id, false)
-                    .await;
-            });
-            self.app.notify
-                .warn(format!("Rejected: {}", dirname));
-        } else {
-            self.app.notify
-                .warn(format!("Cancelled: {}", af.dirname));
         }
     }
 
@@ -1410,18 +1117,6 @@ impl UIExecuter {
                             save_path.to_string(),
                         );
                     }
-                } else if msg.starts_with("REMOTE_FETCH_FILE:") {
-                    let path = msg.trim_start_matches("REMOTE_FETCH_FILE:").to_string();
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = node.offer_file("all", &path).await;
-                    });
-                } else if msg.starts_with("REMOTE_FETCH_FOLDER:") {
-                    let path = msg.trim_start_matches("REMOTE_FETCH_FOLDER:").to_string();
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = node.offer_folder("all", &path).await;
-                    });
                 } else {
                     self.app.set_status(msg);
                 }
@@ -1455,27 +1150,9 @@ impl UIExecuter {
                 }
             }
 
-            // ── File/Folder events handled by engine popup system ────────
-            AppEvent::FileOffered { peer_id, .. } => {
-                // If there's a pending remote save path for this peer,
-                // auto-accept instead of showing a popup.
-                if let Some(save_path) = self.app.pending_remote_save_paths.remove(&peer_id) {
-                    if let Some(pi) = self.app.engine.pending_incoming_mut() {
-                        pi.save_path_input = save_path.clone();
-                    }
-                    // Auto-accept
-                    if let Ok(outcome) = self.app.engine.accept_incoming(save_path) {
-                        if let Some(status) = outcome.status {
-                            self.app.notify.info(status);
-                        }
-                        self.execute_engine_actions(node, outcome.actions).await;
-                    }
-                } else if self.app.engine.has_pending_incoming() {
-                    self.context.active_popup = UIPopup::TransactionOffer;
-                }
-            }
+            // ── Transaction events handled by engine popup system ────────
             AppEvent::TransactionRequested { peer_id, .. } => {
-                // Same auto-accept logic for transaction-based transfers
+                // Auto-accept if there's a pending remote save path for this peer
                 if let Some(save_path) = self.app.pending_remote_save_paths.remove(&peer_id) {
                     if let Some(pi) = self.app.engine.pending_incoming_mut() {
                         pi.save_path_input = save_path.clone();
@@ -1491,123 +1168,11 @@ impl UIExecuter {
                 }
             }
 
-            // ── Legacy folder offer auto-accept ──────────────────────────
-            AppEvent::FolderOffered {
-                peer_id,
-                folder_id,
-                dirname,
-                file_count,
-                total_size,
-            } => {
-                self.app.folder_transactions.insert(
-                    folder_id,
-                    (peer_id.clone(), dirname.clone(), total_size, file_count, 0),
-                );
-                let node = node.clone();
-                tokio::spawn(async move {
-                    let _ = node
-                        .respond_to_folder_offer(&peer_id, folder_id, true)
-                        .await;
-                });
-                self.app.notify.info(format!("Downloading: {}", dirname));
-            }
-            AppEvent::FolderComplete { peer_id, folder_id } => {
-                self.app.folder_progress.remove(&folder_id);
-                self.app.file_to_folder.retain(|_, fid| *fid != folder_id);
-                if let Some((_, dirname, total_size, file_count, _)) =
-                    self.app.folder_transactions.remove(&folder_id)
-                {
-                    self.app.file_history.push(FileRecord {
-                        direction: FileDirection::Received,
-                        peer_id: peer_id.clone(),
-                        filename: format!("{} ({} files)", dirname, file_count),
-                        filesize: total_size,
-                        path: None,
-                        timestamp: Instant::now(),
-                    });
-                }
-            }
-
-            // Transfer events already fully handled by engine
-            AppEvent::SendProgress {
-                _peer_id: _,
-                file_id,
-                filename,
-                sent_chunks,
-                total_chunks,
-                wire_bytes: _,
-            } => {
-                // For legacy sends (not tracked by engine transactions),
-                // update the UI send_progress so active transfers show up.
-                if self.app.engine.transactions().transaction_id_for_file(&file_id).is_none() {
-                    self.app.send_progress.insert(
-                        file_id,
-                        (filename, sent_chunks, total_chunks),
-                    );
-                }
-            }
-            AppEvent::SendComplete {
-                peer_id,
-                file_id,
-                success,
-            } => {
-                // For legacy sends, record in file history and clean up progress.
-                if self.app.engine.transactions().transaction_id_for_file(&file_id).is_none() {
-                    if let Some((filename, _, total_chunks)) = self.app.send_progress.remove(&file_id) {
-                        if success {
-                            let filesize = total_chunks as u64 * crate::core::config::CHUNK_SIZE as u64;
-                            self.app.file_history.push(FileRecord {
-                                direction: FileDirection::Sent,
-                                peer_id: peer_id.clone(),
-                                filename,
-                                filesize,
-                                path: None,
-                                timestamp: Instant::now(),
-                            });
-                        }
-                    }
-                }
-            }
-            AppEvent::FileProgress {
-                _peer_id: _,
-                file_id,
-                filename,
-                received_chunks,
-                total_chunks,
-                wire_bytes: _,
-            } => {
-                // For legacy receives (not tracked by engine transactions),
-                // update the UI file_progress so active transfers show up.
-                if self.app.engine.transactions().transaction_id_for_file(&file_id).is_none() {
-                    self.app.file_progress.insert(
-                        file_id,
-                        (filename, received_chunks, total_chunks),
-                    );
-                }
-            }
-            AppEvent::FileComplete {
-                peer_id,
-                file_id,
-                filename,
-                path,
-            } => {
-                // For legacy receives, record in file history and clean up progress.
-                if self.app.engine.transactions().transaction_id_for_file(&file_id).is_none() {
-                    self.app.file_progress.remove(&file_id);
-                    let filesize = std::fs::metadata(&path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    self.app.file_history.push(FileRecord {
-                        direction: FileDirection::Received,
-                        peer_id: peer_id.clone(),
-                        filename,
-                        filesize,
-                        path: Some(path),
-                        timestamp: Instant::now(),
-                    });
-                }
-            }
-            AppEvent::FileRejected { .. }
+            // Transfer events — already processed by engine.process_event() above
+            AppEvent::SendProgress { .. }
+            | AppEvent::SendComplete { .. }
+            | AppEvent::FileProgress { .. }
+            | AppEvent::FileComplete { .. }
             | AppEvent::TransactionAccepted { .. }
             | AppEvent::TransactionRejected { .. }
             | AppEvent::TransactionCompleted { .. }
@@ -1634,9 +1199,32 @@ impl UIExecuter {
                     peer_id,
                     transaction_id,
                     display_name,
-                    manifest,
+                    mut manifest,
                     total_size,
+                    source_path,
                 } => {
+                    // Compute Merkle roots for all files before sending the manifest.
+                    // This pre-commits the integrity data so the receiver can verify.
+                    if let Some(ref src) = source_path {
+                        use crate::core::pipeline::merkle::compute_file_merkle_root;
+                        let src_path = std::path::Path::new(src);
+                        let is_folder = manifest.parent_dir.is_some();
+                        for entry in &mut manifest.files {
+                            let file_path = if is_folder {
+                                // For folders, source_path is the folder root's parent
+                                src_path.parent().unwrap_or(src_path).join(&entry.relative_path)
+                            } else {
+                                src_path.to_path_buf()
+                            };
+                            if let Ok(data) = tokio::fs::read(&file_path).await {
+                                let root = compute_file_merkle_root(&data, crate::core::config::CHUNK_SIZE);
+                                entry.merkle_root = Some(root);
+                            }
+                        }
+                        // Re-sign the manifest now that Merkle roots are populated
+                        self.app.engine.sign_manifest(&mut manifest);
+                    }
+
                     let node = node.clone();
                     let event_tx = node.event_tx().clone();
                     tokio::spawn(async move {
@@ -1708,8 +1296,7 @@ impl UIExecuter {
                     filename,
                 } => {
                     // Use send_file_data which sends directly with the
-                    // Transaction's file_id — NOT the legacy offer_file which
-                    // generates a new UUID and re-negotiates acceptance.
+                    // Transaction's file_id.
                     let node = node.clone();
                     let event_tx = node.event_tx().clone();
                     tokio::spawn(async move {
@@ -1954,26 +1541,6 @@ impl UIExecuter {
                             }
                         }
                     }
-                }
-                EngineAction::AcceptLegacyFileOffer {
-                    peer_id,
-                    file_id,
-                    dest_path,
-                } => {
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = node
-                            .respond_to_file_offer(&peer_id, file_id, true, Some(dest_path))
-                            .await;
-                    });
-                }
-                EngineAction::RejectLegacyFileOffer { peer_id, file_id } => {
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let _ = node
-                            .respond_to_file_offer(&peer_id, file_id, false, None)
-                            .await;
-                    });
                 }
             }
         }

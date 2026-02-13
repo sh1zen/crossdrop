@@ -331,8 +331,6 @@ impl Handler for ChatPanel {
                             });
                             let peer_count = app.peers.len() as u64;
                             app.engine.record_message_sent(msg_len * peer_count);
-                            app.stats.messages_sent += peer_count;
-                            app.stats.bytes_sent += msg_len * peer_count;
 
                             // Network: still sent individually to each peer
                             let node = node.clone();
@@ -355,8 +353,6 @@ impl Handler for ChatPanel {
                                 created_at: Instant::now(),
                             });
                             app.engine.record_message_sent(msg_len);
-                            app.stats.messages_sent += 1;
-                            app.stats.bytes_sent += msg_len;
 
                             // Use DM protocol so receiver routes to peer chat
                             let node = node.clone();

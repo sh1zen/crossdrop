@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Transfer pipeline: chunking, Merkle trees, sender/receiver async pipelines.
 //!
 //! This module implements the high-performance, multi-stage file transfer

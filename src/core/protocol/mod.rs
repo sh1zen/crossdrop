@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Secure transfer protocol: integrates security, pipeline, and transaction.
 //!
 //! This module coordinates all secure transfer operations including:

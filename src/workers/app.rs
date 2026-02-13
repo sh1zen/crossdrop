@@ -1,10 +1,9 @@
-use crate::core::config::TYPING_TIMEOUT_SECS;
 use crate::core::engine::TransferEngine;
-use crate::core::transaction::TransactionManager;
 use crate::ui::notify::NotifyManager;
 use std::collections::HashMap;
 use std::time::Instant;
 use uuid::Uuid;
+use crate::core::config::TYPING_TIMEOUT_SECS;
 
 /// Connectivity state of a peer — orthogonal to identity and chat state.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -232,34 +231,6 @@ impl TypingState {
     }
 }
 
-pub struct PendingFileOffer {
-    pub peer_id: String,
-    pub _file_id: Uuid,
-    pub _filename: String,
-    pub _filesize: u64,
-    pub _total_size: u64,
-}
-
-pub struct PendingFolderOffer {
-    pub peer_id: String,
-    pub folder_id: Uuid,
-    pub dirname: String,
-    pub _file_count: u32,
-    pub _total_size: u64,
-}
-
-/// A legacy pending file offer for backward compatibility.
-pub struct AcceptingFileOffer {
-    pub peer_id: String,
-    pub file_id: Uuid,
-    pub filename: String,
-    pub filesize: u64,
-    pub _total_size: u64,
-    pub save_path_input: String,
-    pub is_remote: bool,
-    pub remote_path: Option<String>,
-}
-
 /// A pending remote file request with editable download path.
 pub struct RemoteFileRequest {
     pub peer_id: String,
@@ -281,48 +252,6 @@ pub struct RemoteFolderRequest {
     pub button_focus: usize,
     pub is_path_editing: bool,
 }
-
-/// A legacy pending folder offer for backward compatibility.
-pub struct AcceptingFolderOffer {
-    pub peer_id: String,
-    pub folder_id: Uuid,
-    pub dirname: String,
-    pub file_count: u32,
-    pub total_size: u64,
-    pub is_remote: bool,
-    pub remote_path: Option<String>,
-    pub save_path_input: String,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum FileDirection {
-    Sent,
-    Received,
-}
-
-#[derive(Clone)]
-pub enum FileTransferStatus {
-    Rejected,
-}
-
-#[derive(Clone)]
-pub struct FileRecord {
-    pub direction: FileDirection,
-    pub peer_id: String,
-    pub filename: String,
-    pub filesize: u64,
-    pub path: Option<String>,
-    pub timestamp: Instant,
-}
-
-#[derive(Default)]
-pub struct DataStats {
-    pub bytes_sent: u64,
-    pub messages_sent: u64,
-}
-
-/// NOTE: DataStats above is kept for backward compatibility during transition.
-/// The authoritative stats are in TransferEngine.stats().
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct RemoteEntry {
@@ -361,33 +290,6 @@ pub struct App {
     /// Per-peer connectivity status (Online / Offline).
     pub peer_status: HashMap<String, PeerStatus>,
     pub selected_peer_idx: usize,
-
-    // File offers
-    pub pending_offers: Vec<PendingFileOffer>,
-    pub accepting_file: Option<AcceptingFileOffer>,
-    pub file_progress: HashMap<Uuid, (String, u32, u32)>,
-    pub send_progress: HashMap<Uuid, (String, u32, u32)>,
-    pub rejected_transfers: HashMap<Uuid, (String, Option<String>)>, // file_id -> (filename, reason)
-    pub file_transfer_status: HashMap<Uuid, FileTransferStatus>, // Track status of transfers
-    pub file_offer_button_focus: usize, // 0 = Accept, 1 = Reject
-    pub file_path_editing: bool,
-
-    // Folder offers
-    pub pending_folder_offers: Vec<PendingFolderOffer>,
-    pub accepting_folder: Option<AcceptingFolderOffer>,
-    pub folder_progress: HashMap<Uuid, (u32, u32)>,
-    pub folder_offer_button_focus: usize, // 0 = Accept, 1 = Reject
-    pub folder_path_editing: bool,
-    /// Maps file_id to folder_id for tracking which folder a file belongs to
-    pub file_to_folder: HashMap<Uuid, Uuid>,
-    /// Tracks folder transactions: folder_id -> (peer_id, dirname, total_size, file_count, received_count)
-    pub folder_transactions: HashMap<Uuid, (String, String, u64, u32, u32)>,
-
-    // File history
-    pub file_history: Vec<FileRecord>,
-
-    // Data statistics
-    pub stats: DataStats,
 
     // Connect
     pub connect_ticket_input: String,
@@ -429,10 +331,6 @@ pub struct App {
     /// The TransferEngine owns ALL transfer state and logic.
     /// No transfer logic exists outside the engine.
     pub engine: TransferEngine,
-
-    // ── Legacy fields (kept for transition, delegate to engine) ──────────
-    /// Legacy transaction manager reference — use engine.transactions() instead.
-    pub transactions: TransactionManager,
 }
 
 impl App {
@@ -454,23 +352,6 @@ impl App {
             peer_keys: HashMap::new(),
             peer_status: HashMap::new(),
             selected_peer_idx: 0,
-            pending_offers: Vec::new(),
-            accepting_file: None,
-            file_progress: HashMap::new(),
-            send_progress: HashMap::new(),
-            rejected_transfers: HashMap::new(),
-            file_transfer_status: HashMap::new(),
-            file_offer_button_focus: 0,
-            file_path_editing: false,
-            pending_folder_offers: Vec::new(),
-            accepting_folder: None,
-            folder_progress: HashMap::new(),
-            folder_offer_button_focus: 0,
-            folder_path_editing: false,
-            file_to_folder: HashMap::new(),
-            folder_transactions: HashMap::new(),
-            file_history: Vec::new(),
-            stats: DataStats::default(),
             connect_ticket_input: String::new(),
             send_file_path: String::new(),
             log_scroll: 0,
@@ -490,35 +371,12 @@ impl App {
             notify: NotifyManager::new(),
             connecting_peers: HashMap::new(),
             engine: TransferEngine::new(),
-            transactions: TransactionManager::new(),
         }
     }
 
     /// Peer attualmente selezionato nella vista Files
     pub fn files_peer(&self) -> Option<&String> {
         self.peers.get(self.files_peer_idx)
-    }
-
-    /// File history filtrata per peer + search
-    pub fn filtered_file_history(&self) -> Vec<&FileRecord> {
-        let peer = match self.files_peer() {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
-
-        let search = self.files_search.to_lowercase();
-
-        self.file_history
-            .iter()
-            .filter(|r| &r.peer_id == peer)
-            .filter(|r| {
-                if search.is_empty() {
-                    true
-                } else {
-                    r.filename.to_lowercase().contains(&search)
-                }
-            })
-            .collect()
     }
 
     /// Build the list of chat targets for the sidebar: Room + each peer.
@@ -559,25 +417,6 @@ impl App {
         // Clean up ephemeral typing indicator
         self.typing.remove_peer(peer_id);
 
-        // Clean up pending offers from this peer (they can't complete)
-        self.pending_offers.retain(|o| o.peer_id != peer_id);
-        self.pending_folder_offers.retain(|o| o.peer_id != peer_id);
-
-        // Clean up folder transactions from this peer
-        self.folder_transactions.retain(|_, (pid, _, _, _, _)| pid != peer_id);
-
-        // Clear accepting state if it's from this peer
-        if let Some(ref af) = self.accepting_file {
-            if af.peer_id == peer_id {
-                self.accepting_file = None;
-            }
-        }
-        if let Some(ref af) = self.accepting_folder {
-            if af.peer_id == peer_id {
-                self.accepting_folder = None;
-            }
-        }
-
         // If we're viewing this peer's remote filesystem, exit remote mode
         if self.mode == Mode::Remote && self.remote_peer.as_deref() == Some(peer_id) {
             self.mode = Mode::Peers;
@@ -602,25 +441,6 @@ impl App {
         self.peer_keys.remove(peer_id);
         self.typing.remove_peer(peer_id);
         self.unread.remove_peer(peer_id);
-
-        // Clean up pending offers from this peer
-        self.pending_offers.retain(|o| o.peer_id != peer_id);
-        self.pending_folder_offers.retain(|o| o.peer_id != peer_id);
-
-        // Clean up folder transactions from this peer
-        self.folder_transactions.retain(|_, (pid, _, _, _, _)| pid != peer_id);
-
-        // Clear accepting state if it's from this peer
-        if let Some(ref af) = self.accepting_file {
-            if af.peer_id == peer_id {
-                self.accepting_file = None;
-            }
-        }
-        if let Some(ref af) = self.accepting_folder {
-            if af.peer_id == peer_id {
-                self.accepting_folder = None;
-            }
-        }
 
         // If we're viewing this peer's remote filesystem, exit remote mode
         if self.mode == Mode::Remote && self.remote_peer.as_deref() == Some(peer_id) {

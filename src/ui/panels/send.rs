@@ -150,54 +150,6 @@ impl Component for SendPanel {
             ])));
         }
 
-        // Legacy send progress (backward compatibility for non-transaction transfers)
-        for (filename, sent, total) in app.send_progress.values() {
-            let bar = self.progress_bar.render(*sent, *total, Color::Cyan);
-            let short_name = truncate_filename(filename, 20);
-            progress_items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    " -> ",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(short_name, Style::default().fg(Color::White)),
-                Span::raw(" "),
-                bar.spans[0].clone(),
-                bar.spans[1].clone(),
-                bar.spans[2].clone(),
-                bar.spans[3].clone(),
-                Span::styled(
-                    format!(" ({}/{})", sent, total),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])));
-        }
-
-        // Legacy receive progress
-        for (filename, recv, total) in app.file_progress.values() {
-            let bar = self.progress_bar.render(*recv, *total, Color::Cyan);
-            let short_name = truncate_filename(filename, 20);
-            progress_items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    " <- ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(short_name, Style::default().fg(Color::White)),
-                Span::raw(" "),
-                bar.spans[0].clone(),
-                bar.spans[1].clone(),
-                bar.spans[2].clone(),
-                bar.spans[3].clone(),
-                Span::styled(
-                    format!(" ({}/{})", recv, total),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])));
-        }
-
         let progress_list = List::new(progress_items).block(
             Block::default()
                 .title(" Active Transfers ")

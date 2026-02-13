@@ -125,12 +125,27 @@ impl TransactionFile {
 // ── Transaction Manifest (sent over the wire) ────────────────────────────────
 
 /// The file manifest sent from sender to receiver as part of the transfer request.
+///
+/// Includes cryptographic security fields: the sender signs the manifest
+/// content and the receiver validates the signature before ACK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionManifest {
     /// List of files in this transaction with relative paths and sizes.
     pub files: Vec<ManifestEntry>,
     /// Parent directory name, if this is a folder transfer.
     pub parent_dir: Option<String>,
+    /// Sender's public key (identity).
+    #[serde(default)]
+    pub sender_id: Option<[u8; 32]>,
+    /// HMAC signature over manifest content by the sender.
+    #[serde(default)]
+    pub signature: Option<[u8; 32]>,
+    /// Per-session nonce seed for deterministic nonce derivation.
+    #[serde(default)]
+    pub nonce_seed: Option<[u8; 32]>,
+    /// Manifest expiration time (Unix timestamp seconds).
+    #[serde(default)]
+    pub expiration_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,10 +281,10 @@ impl Transaction {
             // Use the file_id from the manifest so sender and receiver
             // share the same identifiers for ACK / resume.
             let file_id = entry.file_id;
-            file_map.insert(
-                file_id,
-                TransactionFile::new(file_id, entry.relative_path.clone(), entry.filesize),
-            );
+            let mut tf = TransactionFile::new(file_id, entry.relative_path.clone(), entry.filesize);
+            // Copy Merkle root from manifest for integrity verification on receive
+            tf.merkle_root = entry.merkle_root;
+            file_map.insert(file_id, tf);
             file_order.push(file_id);
         }
 
@@ -567,11 +582,6 @@ impl Transaction {
         }
     }
 
-    /// Create a serializable snapshot (convenience, no source_path).
-    pub fn to_snapshot(&self) -> TransactionSnapshot {
-        self.to_snapshot_with_source(None)
-    }
-
     /// Restore a Transaction from a persisted snapshot.
     pub fn from_snapshot(snap: &TransactionSnapshot) -> Self {
         let mut file_map = HashMap::new();
@@ -644,7 +654,41 @@ impl Transaction {
         TransactionManifest {
             files,
             parent_dir: self.parent_dir.clone(),
+            sender_id: None,
+            signature: None,
+            nonce_seed: None,
+            expiration_time: None,
         }
+    }
+
+    /// Compute the canonical bytes used for manifest signing.
+    /// Covers all content except the signature itself.
+    pub fn manifest_content_bytes(manifest: &TransactionManifest) -> Vec<u8> {
+        let mut data = Vec::new();
+        if let Some(ref pd) = manifest.parent_dir {
+            data.extend_from_slice(pd.as_bytes());
+        }
+        if let Some(ref sender) = manifest.sender_id {
+            data.extend_from_slice(sender);
+        }
+        if let Some(ref seed) = manifest.nonce_seed {
+            data.extend_from_slice(seed);
+        }
+        if let Some(exp) = manifest.expiration_time {
+            data.extend_from_slice(&exp.to_be_bytes());
+        }
+        for f in &manifest.files {
+            data.extend_from_slice(f.file_id.as_bytes());
+            data.extend_from_slice(f.relative_path.as_bytes());
+            data.extend_from_slice(&f.filesize.to_be_bytes());
+            if let Some(tc) = f.total_chunks {
+                data.extend_from_slice(&tc.to_be_bytes());
+            }
+            if let Some(ref mr) = f.merkle_root {
+                data.extend_from_slice(mr);
+            }
+        }
+        data
     }
 }
 
@@ -699,11 +743,6 @@ impl TransactionManager {
         } else {
             None
         }
-    }
-
-    /// Get the transaction ID for a file ID.
-    pub fn transaction_id_for_file(&self, file_id: &Uuid) -> Option<Uuid> {
-        self.file_to_transaction.get(file_id).copied()
     }
 
     /// Move a transaction from active to history.

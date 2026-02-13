@@ -7,7 +7,6 @@ use crate::workers::args::Args;
 use anyhow::{Context, Result};
 use iroh::SecretKey;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
@@ -40,13 +39,6 @@ pub enum AppEvent {
     TypingReceived {
         peer_id: String,
     },
-    FileOffered {
-        peer_id: String,
-        file_id: Uuid,
-        filename: String,
-        filesize: u64,
-        total_size: u64, // Total for aggregated progress
-    },
     FileProgress {
         _peer_id: String,
         file_id: Uuid,
@@ -75,21 +67,8 @@ pub enum AppEvent {
         file_id: Uuid,
         filename: String,
         path: String,
-    },
-    FileRejected {
-        file_id: Uuid,
-        reason: Option<String>,
-    },
-    FolderOffered {
-        peer_id: String,
-        folder_id: Uuid,
-        dirname: String,
-        file_count: u32,
-        total_size: u64,
-    },
-    FolderComplete {
-        peer_id: String,
-        folder_id: Uuid,
+        /// Merkle root computed from received chunk hashes.
+        merkle_root: [u8; 32],
     },
     DisplayNameReceived {
         peer_id: String,
@@ -228,23 +207,12 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         ConnectionMessage::TypingReceived => AppEvent::TypingReceived {
             peer_id: pid.to_string(),
         },
-        ConnectionMessage::FileSaved { file_id, filename, path } => AppEvent::FileComplete {
+        ConnectionMessage::FileSaved { file_id, filename, path, merkle_root } => AppEvent::FileComplete {
             peer_id: pid.to_string(),
             file_id,
             filename,
             path,
-        },
-        ConnectionMessage::FileOffered {
-            file_id,
-            filename,
-            filesize,
-            total_size,
-        } => AppEvent::FileOffered {
-            peer_id: pid.to_string(),
-            file_id,
-            filename,
-            filesize,
-            total_size,
+            merkle_root,
         },
         ConnectionMessage::FileProgress {
             file_id,
@@ -279,22 +247,6 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             file_id,
             success,
         },
-        ConnectionMessage::FolderOffered {
-            folder_id,
-            dirname,
-            file_count,
-            total_size,
-        } => AppEvent::FolderOffered {
-            peer_id: pid.to_string(),
-            folder_id,
-            dirname,
-            file_count,
-            total_size,
-        },
-        ConnectionMessage::FolderComplete { folder_id } => AppEvent::FolderComplete {
-            peer_id: pid.to_string(),
-            folder_id,
-        },
         ConnectionMessage::DisplayNameReceived(name) => AppEvent::DisplayNameReceived {
             peer_id: pid.to_string(),
             name,
@@ -316,16 +268,7 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
                 is_folder,
             }
         }
-        ConnectionMessage::FileCompleted { file_id, filename, path } => AppEvent::FileComplete {
-            peer_id: pid.to_string(),
-            file_id,
-            filename,
-            path,
-        },
-        ConnectionMessage::FileRejected { file_id, reason } => AppEvent::FileRejected {
-            file_id,
-            reason,
-        },
+
         // ── Transaction-level events ─────────────────────────────────────
         ConnectionMessage::TransactionRequested {
             transaction_id,
@@ -878,117 +821,6 @@ impl PeerNode {
         }
     }
 
-    // ── Files ────────────────────────────────────────────────────────────
-
-    pub async fn offer_file(&self, peer_id: &str, file_path: &str) -> Result<bool> {
-        let file_bytes = tokio::fs::read(file_path).await?;
-        let filename = std::path::Path::new(file_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        // Ensure filename doesn't exceed reasonable length to avoid JSON encoding issues
-        let safe_filename = if filename.len() > 1024 {
-            format!(
-                "{}...{}",
-                &filename[..500],
-                &filename[filename.len() - 500..]
-            )
-        } else {
-            filename.clone()
-        };
-
-        tracing::info!(
-            "Offering file '{}' to {} ({} bytes)",
-            safe_filename,
-            peer_id,
-            file_bytes.len()
-        );
-        conn.send_file_with_offer(file_bytes, safe_filename).await
-    }
-
-    pub async fn respond_to_file_offer(
-        &self,
-        peer_id: &str,
-        file_id: Uuid,
-        accepted: bool,
-        dest_path: Option<String>,
-    ) -> Result<()> {
-        let peers = self.peers.lock().await;
-        peers
-            .get(peer_id)
-            .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-            .connection
-            .send_file_response(file_id, accepted, dest_path)
-            .await
-    }
-
-    // ── Folders ──────────────────────────────────────────────────────────
-
-    pub async fn offer_folder(&self, peer_id: &str, folder_path: &str) -> Result<bool> {
-        let root = Path::new(folder_path).to_path_buf();
-        let dirname = root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "folder".to_string());
-
-        let mut files = Vec::new();
-        let mut total_size: u64 = 0;
-        collect_folder_files(&root, &root, &mut files, &mut total_size).await?;
-
-        if files.is_empty() {
-            return Err(anyhow::anyhow!("Folder is empty"));
-        }
-
-        let file_count = files.len() as u32;
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        tracing::info!(
-            "Offering folder '{}' to {} ({} files, {} bytes)",
-            dirname,
-            peer_id,
-            file_count,
-            total_size
-        );
-        let (folder_id, accepted) = conn.offer_folder(&dirname, file_count, total_size).await?;
-        if !accepted {
-            return Ok(false);
-        }
-        conn.send_folder_files(folder_id, files).await?;
-        Ok(true)
-    }
-
-    pub async fn respond_to_folder_offer(
-        &self,
-        peer_id: &str,
-        folder_id: Uuid,
-        accepted: bool,
-    ) -> Result<()> {
-        let peers = self.peers.lock().await;
-        peers
-            .get(peer_id)
-            .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-            .connection
-            .send_folder_response(folder_id, accepted)
-            .await
-    }
-
     // ── Direct file send (Transaction protocol) ─────────────────────────
 
     /// Send a single file directly using a Transaction file_id.
@@ -1020,38 +852,6 @@ impl PeerNode {
             file_id
         );
         conn.send_file(file_id, file_bytes, filename).await
-    }
-
-    /// Send a single file directly, resuming from a given chunk offset.
-    /// Chunks before `start_chunk` are hashed but not transmitted.
-    pub async fn send_file_data_resuming(
-        &self,
-        peer_id: &str,
-        file_id: Uuid,
-        file_path: &str,
-        filename: &str,
-        start_chunk: u32,
-    ) -> Result<()> {
-        let file_bytes = tokio::fs::read(file_path).await?;
-
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        tracing::info!(
-            "Resuming file '{}' ({} bytes) to {} [txn file_id={}, start_chunk={}]",
-            filename,
-            file_bytes.len(),
-            peer_id,
-            file_id,
-            start_chunk,
-        );
-        conn.send_file_resuming(file_id, file_bytes, filename, start_chunk).await
     }
 
     /// Send multiple files for a folder transfer using Transaction file_ids.
@@ -1555,36 +1355,4 @@ impl PeerNode {
             .event_tx
             .send(AppEvent::Info(format!("[{}] {}", short_id(peer_id), msg)));
     }
-}
-
-// ── Folder collection ────────────────────────────────────────────────────────
-
-async fn collect_folder_files(
-    root: &Path,
-    current: &Path,
-    files: &mut Vec<(String, Vec<u8>)>,
-    total_size: &mut u64,
-) -> Result<()> {
-    let mut entries = tokio::fs::read_dir(current).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let file_type = entry.file_type().await?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if file_type.is_dir() {
-            Box::pin(collect_folder_files(root, &path, files, total_size)).await?;
-        } else if file_type.is_file() {
-            let bytes = tokio::fs::read(&path).await?;
-            *total_size += bytes.len() as u64;
-            let root_parent = root.parent().unwrap_or(root);
-            let relative = path
-                .strip_prefix(root_parent)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.push((relative, bytes));
-        }
-    }
-    Ok(())
 }

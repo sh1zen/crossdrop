@@ -11,13 +11,14 @@
 //! The UI layer reads state and dispatches commands; the transport layer
 //! sends/receives raw frames. All coordination happens here.
 
-use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES};
+use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES, TRANSACTION_TIMEOUT};
 use crate::core::initializer::AppEvent;
 use crate::core::persistence::Persistence;
 use crate::core::protocol::coordinator::TransferCoordinator;
 use crate::core::security::identity::PeerIdentity;
+use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
-    ManifestEntry, ResumeInfo, Transaction, TransactionDirection, TransactionManifest,
+    ResumeInfo, Transaction, TransactionDirection, TransactionManifest,
     TransactionManager, TransactionState,
 };
 use anyhow::{anyhow, Result};
@@ -41,6 +42,8 @@ pub enum EngineAction {
         display_name: String,
         manifest: TransactionManifest,
         total_size: u64,
+        /// Source path for computing Merkle roots before sending.
+        source_path: Option<String>,
     },
     /// Send a TransactionResponse (accept / reject).
     SendTransactionResponse {
@@ -90,22 +93,11 @@ pub enum EngineAction {
         peer_id: String,
         transaction_id: Uuid,
     },
-    /// Handle a remote fetch (legacy path — sender side).
+    /// Handle a remote fetch (sender side).
     HandleRemoteFetch {
         peer_id: String,
         path: String,
         is_folder: bool,
-    },
-    /// Accept a legacy file offer (wrap in transaction).
-    AcceptLegacyFileOffer {
-        peer_id: String,
-        file_id: Uuid,
-        dest_path: String,
-    },
-    /// Reject a legacy file offer.
-    RejectLegacyFileOffer {
-        peer_id: String,
-        file_id: Uuid,
     },
 }
 
@@ -147,10 +139,6 @@ pub struct PendingIncoming {
     pub save_path_input: String,
     pub button_focus: usize,
     pub path_editing: bool,
-    /// Whether this originated from a legacy FileOffer (not Transaction protocol).
-    pub is_legacy_file: bool,
-    /// For legacy file offers, the original file_id from the sender.
-    pub legacy_file_id: Option<Uuid>,
 }
 
 // ── Data Statistics ──────────────────────────────────────────────────────────
@@ -206,11 +194,11 @@ pub struct TransferEngine {
     /// Maps outbound transaction_id to the local source path (for sending after acceptance).
     source_paths: HashMap<Uuid, String>,
     /// Secure transfer coordinator for authentication, replay protection, and manifest enforcement.
-    #[allow(dead_code)]
     coordinator: Option<TransferCoordinator>,
-    /// Our peer identity (long-term Ed25519 key pair).
-    #[allow(dead_code)]
+    /// Our peer identity (long-term key pair for signing manifests and resume requests).
     identity: Option<PeerIdentity>,
+    /// Replay protection: monotonic counters per transaction.
+    replay_guard: ReplayGuard,
 }
 
 impl TransferEngine {
@@ -232,23 +220,21 @@ impl TransferEngine {
             source_paths: HashMap::new(),
             coordinator,
             identity,
+            replay_guard: ReplayGuard::new(),
         }
     }
 
     /// Access the transfer coordinator (for secure operations).
-    #[allow(dead_code)]
     pub fn coordinator(&self) -> Option<&TransferCoordinator> {
         self.coordinator.as_ref()
     }
 
     /// Access the transfer coordinator mutably.
-    #[allow(dead_code)]
     pub fn coordinator_mut(&mut self) -> Option<&mut TransferCoordinator> {
         self.coordinator.as_mut()
     }
 
     /// Access our peer identity.
-    #[allow(dead_code)]
     pub fn identity(&self) -> Option<&PeerIdentity> {
         self.identity.as_ref()
     }
@@ -283,6 +269,75 @@ impl TransferEngine {
         self.transactions.active_count() < MAX_CONCURRENT_TRANSACTIONS
     }
 
+    // ── Manifest Security ────────────────────────────────────────────────
+
+    /// Sign a transaction manifest with our peer identity.
+    /// Sets sender_id, nonce_seed, expiration_time, and computes the HMAC signature.
+    pub fn sign_manifest(&self, manifest: &mut TransactionManifest) {
+        if let Some(ref identity) = self.identity {
+            manifest.sender_id = Some(identity.public_key);
+            manifest.nonce_seed = Some(rand::random());
+            manifest.expiration_time = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + TRANSACTION_TIMEOUT.as_secs(),
+            );
+            let content = Transaction::manifest_content_bytes(manifest);
+            manifest.signature = Some(identity.sign(&content));
+        }
+    }
+
+    /// Validate a manifest's signature against the declared sender_id.
+    /// Returns true if the signature is valid or if no signature is present
+    /// (backward compatibility during upgrade window).
+    pub fn validate_manifest_signature(&self, manifest: &TransactionManifest) -> bool {
+        match (
+            &manifest.sender_id,
+            &manifest.signature,
+        ) {
+            (Some(sender_id), Some(signature)) => {
+                // Check expiration
+                if let Some(exp) = manifest.expiration_time {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now >= exp {
+                        warn!(event = "manifest_expired", "Received expired manifest");
+                        return false;
+                    }
+                }
+                // Verify signature: reconstruct SignedPayload and validate signer
+                let content = Transaction::manifest_content_bytes(manifest);
+                let signed = crate::core::security::identity::SignedPayload {
+                    data: content,
+                    signature: *signature,
+                    signer: *sender_id,
+                };
+                PeerIdentity::verify_signed(&signed, sender_id)
+            }
+            // No security fields present — accept (will be required in future)
+            _ => true,
+        }
+    }
+
+    /// Register a transaction with the replay guard.
+    fn register_replay_guard(&mut self, transaction_id: Uuid) {
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + TRANSACTION_TIMEOUT.as_secs();
+        self.replay_guard.register_transaction(transaction_id, expiration);
+    }
+
+    /// Get the identity's public key (for wire messages).
+    pub fn identity_public_key(&self) -> Option<[u8; 32]> {
+        self.identity.as_ref().map(|id| id.public_key)
+    }
+
     // ── Initiating Outbound Transfers ────────────────────────────────────
 
     /// Initiate a single-file send. Creates Transaction, returns action to
@@ -308,9 +363,15 @@ impl TransferEngine {
             None,
             vec![(filename.to_string(), filesize)],
         );
-        let manifest = txn.build_manifest();
+        let mut manifest = txn.build_manifest();
         let txn_id = txn.id;
         let total_size = txn.total_size;
+
+        // Sign the manifest with our identity
+        self.sign_manifest(&mut manifest);
+
+        // Register with replay guard
+        self.register_replay_guard(txn_id);
 
         self.source_paths.insert(txn_id, file_path.to_string());
         self.transactions.insert(txn);
@@ -327,6 +388,7 @@ impl TransferEngine {
                 display_name: filename.to_string(),
                 manifest,
                 total_size,
+                source_path: Some(file_path.to_string()),
             }],
             status: Some(format!("Sending {}...", filename)),
         })
@@ -360,10 +422,16 @@ impl TransferEngine {
             Some(dirname.to_string()),
             files,
         );
-        let manifest = txn.build_manifest();
+        let mut manifest = txn.build_manifest();
         let txn_id = txn.id;
         let total_size = txn.total_size;
         let files_len = txn.file_order.len();
+
+        // Sign the manifest with our identity
+        self.sign_manifest(&mut manifest);
+
+        // Register with replay guard
+        self.register_replay_guard(txn_id);
 
         self.source_paths.insert(txn_id, folder_path.to_string());
         self.transactions.insert(txn);
@@ -380,6 +448,7 @@ impl TransferEngine {
                 display_name: dirname.to_string(),
                 manifest,
                 total_size,
+                source_path: Some(folder_path.to_string()),
             }],
             status: Some(format!("Sending folder {}...", dirname)),
         })
@@ -395,20 +464,6 @@ impl TransferEngine {
             .ok_or_else(|| anyhow!("No pending incoming transaction"))?;
 
         info!(event = "transfer_accepted", transaction_id = %pending.transaction_id, display_name = %pending.display_name, dest = %dest_path, "Incoming transfer accepted");
-
-        // Handle legacy file offer acceptance
-        if pending.is_legacy_file {
-            if let Some(legacy_file_id) = pending.legacy_file_id {
-                return Ok(EngineOutcome {
-                    actions: vec![EngineAction::AcceptLegacyFileOffer {
-                        peer_id: pending.peer_id.clone(),
-                        file_id: legacy_file_id,
-                        dest_path: dest_path.clone(),
-                    }],
-                    status: Some(format!("Downloading: {}", pending.display_name)),
-                });
-            }
-        }
 
         let mut txn = Transaction::new_inbound(
             pending.transaction_id,
@@ -470,19 +525,6 @@ impl TransferEngine {
         info!(event = "transfer_rejected", transaction_id = %pending.transaction_id, display_name = %pending.display_name, "Incoming transfer rejected by user");
 
         let display_name = pending.display_name.clone();
-
-        // Handle legacy file offer rejection
-        if pending.is_legacy_file {
-            if let Some(legacy_file_id) = pending.legacy_file_id {
-                return Ok(EngineOutcome {
-                    actions: vec![EngineAction::RejectLegacyFileOffer {
-                        peer_id: pending.peer_id.clone(),
-                        file_id: legacy_file_id,
-                    }],
-                    status: Some(format!("Rejected: {}", display_name)),
-                });
-            }
-        }
 
         // Create and immediately reject a transaction for history
         let mut txn = Transaction::new_inbound(
@@ -596,10 +638,6 @@ impl TransferEngine {
                         let txn_id = txn.id;
                         self.persist_active_transaction(&txn_id);
                     }
-                } else {
-                    // Legacy transfer without engine transaction — still count bytes
-                    self.stats.raw_bytes_received += CHUNK_SIZE as u64;
-                    self.stats.bytes_received += *wire_bytes;
                 }
                 EngineOutcome::empty()
             }
@@ -629,10 +667,6 @@ impl TransferEngine {
                         let txn_id = txn.id;
                         self.persist_active_transaction(&txn_id);
                     }
-                } else {
-                    // Legacy transfer without engine transaction
-                    self.stats.raw_bytes_sent += CHUNK_SIZE as u64;
-                    self.stats.bytes_sent += *wire_bytes;
                 }
                 EngineOutcome::empty()
             }
@@ -667,9 +701,6 @@ impl TransferEngine {
                             status: Some(format!("Transfer complete: {}", txn_display)),
                         };
                     }
-                } else if *success {
-                    // Legacy transfer — still count
-                    self.stats.files_sent += 1;
                 }
                 if *success {
                     EngineOutcome::with_status("Sent successfully")
@@ -681,124 +712,55 @@ impl TransferEngine {
             AppEvent::FileComplete {
                 file_id,
                 filename,
+                merkle_root,
                 ..
             } => {
                 if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
+                    // Verify Merkle root against the manifest if available
+                    if let Some(file_entry) = txn.files.get(file_id) {
+                        if let Some(expected_root) = &file_entry.merkle_root {
+                            if expected_root != merkle_root {
+                                warn!(
+                                    event = "merkle_root_mismatch",
+                                    file_id = %file_id,
+                                    transaction_id = %txn.id,
+                                    "Merkle root mismatch for file — data integrity violation"
+                                );
+                            } else {
+                                debug!(
+                                    event = "merkle_root_verified",
+                                    file_id = %file_id,
+                                    transaction_id = %txn.id,
+                                    "Merkle root verified for file"
+                                );
+                            }
+                        } else {
+                            // Store the computed Merkle root for future reference
+                            // (manifest didn't include one, but we computed it on receive)
+                        }
+                    }
+
                     txn.complete_file(*file_id, true);
+                    // Store the received Merkle root in the transaction file entry
+                    if let Some(tf) = txn.files.get_mut(file_id) {
+                        tf.merkle_root = Some(*merkle_root);
+                    }
                     self.stats.files_received += 1;
                     debug!(event = "file_received", file_id = %file_id, transaction_id = %txn.id, filename = %filename, "File received successfully");
                     let txn_id = txn.id;
                     if txn.check_completion() {
                         let display_name = txn.display_name.clone();
                         info!(event = "transfer_complete", transaction_id = %txn_id, direction = "inbound", name = %display_name, "Inbound transfer complete");
+                        // Clean up replay guard for completed transaction
+                        self.replay_guard.remove_transaction(&txn_id);
                         self.archive_transaction(txn_id);
                         return EngineOutcome::with_status(format!(
                             "Transfer complete: {}",
                             display_name
                         ));
                     }
-                } else {
-                    // Legacy transfer without engine transaction
-                    self.stats.files_received += 1;
                 }
                 EngineOutcome::with_status(format!("Received: {}", filename))
-            }
-
-            AppEvent::FileRejected {
-                file_id, reason, ..
-            } => {
-                if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
-                    let txn_id = txn.id;
-                    warn!(event = "file_rejected", file_id = %file_id, transaction_id = %txn_id, reason = ?reason, "File transfer rejected");
-                    txn.reject(reason.clone());
-                    self.archive_transaction(txn_id);
-                }
-                let reason_str = reason.as_deref().unwrap_or("unknown reason");
-                EngineOutcome::with_status(format!("Transfer rejected: {}", reason_str))
-            }
-
-            // ── Legacy file/folder offers (wrap in Transaction) ──────────
-
-            AppEvent::FileOffered {
-                peer_id,
-                file_id,
-                filename,
-                filesize,
-                total_size,
-            } => {
-                // Check if this file belongs to an existing accepted transaction.
-                if self.transactions.transaction_id_for_file(file_id).is_some() {
-                    // Already tracked — auto-accept via transport layer
-                    return EngineOutcome::empty();
-                }
-
-                // ── Security: sanitize filename from legacy offers ────────
-                // Legacy file offers don't go through SecureManifest validation,
-                // so we must reject path traversal attempts here.
-                let sanitized_filename = match crate::core::protocol::manifest::normalize_path(filename) {
-                    Ok(name) => name,
-                    Err(e) => {
-                        warn!(
-                            event = "legacy_offer_path_rejected",
-                            peer_id = %peer_id,
-                            filename = %filename,
-                            error = %e,
-                            "Rejected legacy file offer with invalid filename"
-                        );
-                        return EngineOutcome::with_status(format!(
-                            "Rejected: invalid filename"
-                        ));
-                    }
-                };
-
-                // Unsolicited file offer — create ad-hoc pending transaction.
-                let save_dir = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".to_string());
-
-                // Only show popup if we don't already have one
-                if self.pending_incoming.is_some() {
-                    // Queue it — for now just accept (auto-accept unsolicited per spec)
-                    return EngineOutcome::empty();
-                }
-
-                let txn_id = Uuid::new_v4();
-                let manifest = TransactionManifest {
-                    files: vec![ManifestEntry {
-                        file_id: *file_id,
-                        relative_path: sanitized_filename.clone(),
-                        filesize: *filesize,
-                        merkle_root: None,
-                        total_chunks: None,
-                    }],
-                    parent_dir: None,
-                };
-
-                self.pending_incoming = Some(PendingIncoming {
-                    peer_id: peer_id.clone(),
-                    transaction_id: txn_id,
-                    display_name: sanitized_filename.clone(),
-                    manifest,
-                    total_size: *total_size,
-                    save_path_input: save_dir,
-                    button_focus: 0,
-                    path_editing: false,
-                    is_legacy_file: true,
-                    legacy_file_id: Some(*file_id),
-                });
-
-                EngineOutcome::with_status(format!("File offered: {}", sanitized_filename))
-            }
-
-            AppEvent::FolderOffered { .. } => {
-                // Legacy folder offer — auto-accept and track
-                self.stats.metadata_bytes += 128; // estimate for folder metadata
-                EngineOutcome::empty() // Folders are auto-accepted via legacy path
-            }
-
-            AppEvent::FolderComplete { .. } => {
-                self.stats.metadata_bytes += 64;
-                EngineOutcome::empty()
             }
 
             // ── Transaction-level events ─────────────────────────────────
@@ -810,6 +772,21 @@ impl TransferEngine {
                 manifest,
                 total_size,
             } => {
+                // Validate manifest signature
+                if !self.validate_manifest_signature(manifest) {
+                    warn!(event = "manifest_signature_invalid", transaction_id = %transaction_id, "Rejecting transfer with invalid manifest signature");
+                    return EngineOutcome {
+                        actions: vec![EngineAction::SendTransactionResponse {
+                            peer_id: peer_id.clone(),
+                            transaction_id: *transaction_id,
+                            accepted: false,
+                            dest_path: None,
+                            reason: Some("Invalid manifest signature".to_string()),
+                        }],
+                        status: Some("Transfer rejected: invalid manifest signature".to_string()),
+                    };
+                }
+
                 // Check capacity
                 if !self.can_start_transfer() {
                     return EngineOutcome {
@@ -826,6 +803,9 @@ impl TransferEngine {
                     };
                 }
 
+                // Register with replay guard (receiver side)
+                self.register_replay_guard(*transaction_id);
+
                 let save_dir = std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| ".".to_string());
@@ -839,8 +819,6 @@ impl TransferEngine {
                     save_path_input: save_dir,
                     button_focus: 0,
                     path_editing: false,
-                    is_legacy_file: false,
-                    legacy_file_id: None,
                 });
 
                 info!(event = "transfer_requested", transaction_id = %transaction_id, display_name = %display_name, total_size, file_count = manifest.files.len(), "Incoming transfer request received");
@@ -1379,7 +1357,6 @@ impl TransferEngine {
                         snapshot.expiration_time = Some(secure_snap.expiration_time);
                         snapshot.last_counter =
                             Some(secure_snap.replay_state.last_seen_counter);
-                        persistence.secure_transfers.insert(*txn_id, secure_snap);
                     }
                 }
 
@@ -1430,6 +1407,9 @@ impl TransferEngine {
             });
         }
         self.transactions.archive(&txn_id);
+
+        // Clean up replay guard entry for this transaction
+        self.replay_guard.remove_transaction(&txn_id);
 
         // Persist removal — use unwrap_or_default to handle corrupted files
         let mut p = Persistence::load().unwrap_or_default();

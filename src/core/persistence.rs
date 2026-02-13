@@ -1,4 +1,3 @@
-use crate::core::protocol::coordinator::SecureTransferSnapshot;
 use crate::core::transaction::TransactionSnapshot;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -7,24 +6,16 @@ use std::path::PathBuf;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TransferState {
-    pub file_id: Uuid,
-    pub filename: String,
-    pub total_chunks: u32,
-    pub received_chunks: u32,
-    pub dest_path: Option<PathBuf>,
-}
-
+/// Transaction-only persistence for resume support.
+///
+/// All file transfers are represented as transactions. There is no
+/// per-file legacy state — every transfer has a transaction ID,
+/// manifest, and full lifecycle.
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Persistence {
-    pub transfers: HashMap<Uuid, TransferState>,
     /// Transaction-level persistence for resume support.
     #[serde(default)]
     pub transactions: HashMap<Uuid, TransactionSnapshot>,
-    /// Secure transfer snapshots for resumable transfers.
-    #[serde(default)]
-    pub secure_transfers: HashMap<Uuid, SecureTransferSnapshot>,
 }
 
 impl Persistence {
@@ -41,7 +32,7 @@ impl Persistence {
             error!(event = "persistence_parse_failure", path = %path.display(), error = %e, "Failed to parse persistence state");
             e
         })?;
-        debug!(event = "persistence_loaded", transactions = p.transactions.len(), transfers = p.transfers.len(), "Persistence state loaded");
+        debug!(event = "persistence_loaded", transactions = p.transactions.len(), "Persistence state loaded");
         Ok(p)
     }
 
@@ -54,27 +45,6 @@ impl Persistence {
     /// Remove a completed transaction from persistence.
     pub fn remove_transaction(&mut self, id: &Uuid) -> Result<()> {
         self.transactions.remove(id);
-        self.secure_transfers.remove(id);
-        self.save()
-    }
-
-    /// Save a secure transfer snapshot for resume.
-    #[allow(dead_code)]
-    pub fn save_secure_transfer(&mut self, snapshot: SecureTransferSnapshot) -> Result<()> {
-        self.secure_transfers.insert(snapshot.transaction_id, snapshot);
-        self.save()
-    }
-
-    /// Load a secure transfer snapshot by transaction ID.
-    #[allow(dead_code)]
-    pub fn get_secure_transfer(&self, id: &Uuid) -> Option<&SecureTransferSnapshot> {
-        self.secure_transfers.get(id)
-    }
-
-    /// Remove a secure transfer snapshot.
-    #[allow(dead_code)]
-    pub fn remove_secure_transfer(&mut self, id: &Uuid) -> Result<()> {
-        self.secure_transfers.remove(id);
         self.save()
     }
 
