@@ -238,8 +238,7 @@ pub fn validate_manifest(manifest: &SecureManifest) -> Result<()> {
         }
 
         // Validate chunk count matches file size
-        let expected_chunks =
-            ((file.file_size as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
+        let expected_chunks = crate::core::transaction::compute_total_chunks(file.file_size);
         if file.total_chunks != expected_chunks {
             return Err(anyhow!(
                 "Chunk count mismatch for {}: expected {}, got {}",
@@ -272,7 +271,7 @@ pub fn build_manifest_entry(
 ) -> Result<SecureManifestEntry> {
     let normalized_path = normalize_path(relative_path)?;
     let file_id = compute_file_id(&normalized_path, file_size, mtime_secs);
-    let total_chunks = ((file_size as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
+    let total_chunks = crate::core::transaction::compute_total_chunks(file_size);
     let merkle_root = compute_file_merkle_root(file_data, CHUNK_SIZE);
 
     Ok(SecureManifestEntry {

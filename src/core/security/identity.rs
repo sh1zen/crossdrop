@@ -62,6 +62,13 @@ impl PeerIdentity {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, &identity.secret)?;
+            // Restrict file permissions on Unix: owner read/write only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                std::fs::set_permissions(path, perms)?;
+            }
             Ok(identity)
         }
     }
@@ -98,15 +105,30 @@ impl PeerIdentity {
     }
 
     /// Verify a signed payload against a known public key.
-    /// Since we use HMAC(secret, data) for signing, verification requires
-    /// re-deriving — but in a P2P context we verify by checking the HMAC
-    /// matches when the verifier also knows (or can derive) the secret.
     ///
-    /// For cross-peer verification, we use a challenge-response scheme:
+    /// **Security note**: This scheme uses HMAC(secret, data) for signing.
+    /// Without the secret key, full signature verification is not possible.
+    /// This method only validates that the declared signer matches the
+    /// expected public key using constant-time comparison (preventing
+    /// timing side-channels). For full cryptographic verification when
+    /// the secret is available, use `verify_with_secret()` instead.
+    ///
+    /// In production flows, cross-peer verification relies on the
+    /// challenge-response scheme negotiated during session establishment:
     /// the verifier sends a nonce, the prover signs it, and the verifier
     /// checks against the expected public key derivation.
     pub fn verify_signed(payload: &SignedPayload, expected_signer: &[u8; 32]) -> bool {
-        payload.signer == *expected_signer
+        crate::utils::crypto::constant_time_eq(&payload.signer, expected_signer)
+    }
+
+    /// Verify a signed payload when the signer's secret key is available.
+    ///
+    /// This performs **full HMAC verification**: recomputes HMAC(secret, data)
+    /// and compares using constant-time equality.  Use this when you hold the
+    /// secret (e.g. verifying your own prior signatures, or in test).
+    pub fn verify_with_secret(payload: &SignedPayload, secret: &[u8; 32]) -> bool {
+        let expected_sig = hmac_sign(secret, &payload.data);
+        crate::utils::crypto::constant_time_eq(&expected_sig, &payload.signature)
     }
 
     /// Secret key reference (for session key derivation).
@@ -115,43 +137,9 @@ impl PeerIdentity {
     }
 }
 
-/// HMAC-SHA3-256 for signing.
+/// HMAC-SHA3-256 for signing — delegates to the centralized implementation.
 fn hmac_sign(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 136;
-
-    let actual_key = if key.len() > BLOCK_SIZE {
-        let mut h = Sha3_256::new();
-        h.update(key);
-        let digest = h.finalize();
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..32].copy_from_slice(&digest);
-        k
-    } else {
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..key.len()].copy_from_slice(key);
-        k
-    };
-
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        ipad[i] ^= actual_key[i];
-        opad[i] ^= actual_key[i];
-    }
-
-    let mut inner = Sha3_256::new();
-    inner.update(&ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha3_256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    let result = outer.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    crate::utils::crypto::hmac_sha3_256(key, data)
 }
 
 #[cfg(test)]

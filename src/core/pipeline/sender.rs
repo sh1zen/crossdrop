@@ -15,7 +15,7 @@
 
 use crate::core::pipeline::chunk::compute_chunk_hash;
 use crate::core::pipeline::merkle::MerkleTree;
-use crate::core::transaction::CHUNK_SIZE;
+use crate::core::transaction::{compute_total_chunks, CHUNK_SIZE};
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use anyhow::{anyhow, Result};
 use brotli::CompressorWriter;
@@ -58,12 +58,12 @@ impl Default for SenderConfig {
         Self {
             chunk_size: CHUNK_SIZE,
             window_size: 32,
-            max_memory: 64 * 1024 * 1024, // 64 MB
+            max_memory: 256 * 1024 * 1024, // 256 MB
             max_chunk_retries: 3,
             max_transaction_retries: 50,
-            compression_quality: 4,
-            compression_workers: 2,
-            encryption_workers: 2,
+            compression_quality: 6,
+            compression_workers: 4,
+            encryption_workers: 4,
             prefetch_depth: 8,
         }
     }
@@ -132,67 +132,8 @@ impl SenderPipeline {
         encryption_key: &[u8; 32],
         chunk_tx: &mpsc::Sender<SenderEvent>,
     ) -> Result<[u8; 32]> {
-        let chunk_size = self.config.chunk_size;
-        let total_chunks = ((file_data.len() as f64) / (chunk_size as f64)).ceil().max(1.0) as u32;
-
-        let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(total_chunks as usize);
-        let mut file_hasher = Sha3_256::new();
-
-        // Backpressure semaphore: limits in-flight chunks
-        let semaphore = Arc::new(Semaphore::new(self.config.window_size));
-
-        for chunk_index in 0..total_chunks {
-            let start = (chunk_index as usize) * chunk_size;
-            let end = std::cmp::min(start + chunk_size, file_data.len());
-            let raw_chunk = &file_data[start..end];
-            let raw_size = raw_chunk.len();
-
-            // Update file hash
-            file_hasher.update(raw_chunk);
-
-            // Compute chunk hash
-            let chunk_hash = compute_chunk_hash(raw_chunk);
-            chunk_hashes.push(chunk_hash);
-
-            // Compression
-            let compressed = compress_chunk(raw_chunk, self.config.compression_quality)?;
-
-            // Encryption (AES-256-GCM)
-            let wire_payload = encrypt_chunk(encryption_key, &compressed)?;
-
-            // Acquire backpressure permit
-            let _permit = semaphore.clone().acquire_owned().await
-                .map_err(|_| anyhow!("Backpressure semaphore closed"))?;
-
-            let pipeline_chunk = PipelineChunk {
-                file_id,
-                chunk_index,
-                chunk_hash,
-                wire_payload,
-                raw_size,
-            };
-
-            chunk_tx.send(SenderEvent::ChunkReady(pipeline_chunk)).await
-                .map_err(|_| anyhow!("Chunk channel closed"))?;
-        }
-
-        // Compute Merkle root
-        let merkle_tree = MerkleTree::build(&chunk_hashes);
-        let merkle_root = *merkle_tree.root();
-
-        // Compute file hash
-        let file_hash_result = file_hasher.finalize();
-        let mut file_hash = [0u8; 32];
-        file_hash.copy_from_slice(&file_hash_result);
-
-        chunk_tx.send(SenderEvent::FileProcessed {
-            file_id,
-            merkle_root,
-            total_chunks,
-            file_hash,
-        }).await.map_err(|_| anyhow!("Event channel closed"))?;
-
-        Ok(merkle_root)
+        self.process_file_data(file_id, file_data, encryption_key, chunk_tx)
+            .await
     }
 
     /// Process multiple files for a transaction.
@@ -220,23 +161,43 @@ impl SenderPipeline {
         Ok(merkle_roots)
     }
 
-    /// Process a file from disk (streaming read), avoiding loading the entire
-    /// file into memory at once.
+    /// Process a file from disk (streaming read).
+    ///
+    /// Reads the file into memory then delegates to `process_file_data`
+    /// for the chunking → compression → encryption pipeline.
     pub async fn process_file_streaming(
         &self,
         file_id: Uuid,
         _transaction_id: Uuid,
         file_path: &Path,
-        file_size: u64,
+        _file_size: u64,
+        encryption_key: &[u8; 32],
+        chunk_tx: &mpsc::Sender<SenderEvent>,
+    ) -> Result<[u8; 32]> {
+        let file_data = tokio::fs::read(file_path).await?;
+        self.process_file_data(file_id, &file_data, encryption_key, chunk_tx)
+            .await
+    }
+
+    /// Core chunk processing pipeline shared by `process_file` and
+    /// `process_file_streaming`.
+    ///
+    /// Processes raw file bytes through: chunking → hashing → compression →
+    /// encryption → channel send, with backpressure via a semaphore.
+    async fn process_file_data(
+        &self,
+        file_id: Uuid,
+        file_data: &[u8],
         encryption_key: &[u8; 32],
         chunk_tx: &mpsc::Sender<SenderEvent>,
     ) -> Result<[u8; 32]> {
         let chunk_size = self.config.chunk_size;
-        let total_chunks = ((file_size as f64) / (chunk_size as f64)).ceil().max(1.0) as u32;
+        let total_chunks = compute_total_chunks(file_data.len() as u64);
         let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(total_chunks as usize);
         let mut file_hasher = Sha3_256::new();
 
-        let file_data = tokio::fs::read(file_path).await?;
+        // Backpressure semaphore: limits in-flight chunks
+        let semaphore = Arc::new(Semaphore::new(self.config.window_size));
 
         for chunk_index in 0..total_chunks {
             let start = (chunk_index as usize) * chunk_size;
@@ -244,21 +205,22 @@ impl SenderPipeline {
             let raw_chunk = &file_data[start..end];
 
             file_hasher.update(raw_chunk);
-            let chunk_hash = compute_chunk_hash(raw_chunk);
-            chunk_hashes.push(chunk_hash);
 
-            let compressed = compress_chunk(raw_chunk, self.config.compression_quality)?;
-            let wire_payload = encrypt_chunk(encryption_key, &compressed)?;
+            let pipeline_chunk = build_pipeline_chunk(
+                file_id, chunk_index, raw_chunk,
+                encryption_key, self.config.compression_quality,
+            )?;
+            chunk_hashes.push(pipeline_chunk.chunk_hash);
 
-            let pipeline_chunk = PipelineChunk {
-                file_id,
-                chunk_index,
-                chunk_hash,
-                wire_payload,
-                raw_size: raw_chunk.len(),
-            };
+            let _permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("Backpressure semaphore closed"))?;
 
-            chunk_tx.send(SenderEvent::ChunkReady(pipeline_chunk)).await
+            chunk_tx
+                .send(SenderEvent::ChunkReady(pipeline_chunk))
+                .await
                 .map_err(|_| anyhow!("Chunk channel closed"))?;
         }
 
@@ -269,12 +231,15 @@ impl SenderPipeline {
         let mut file_hash = [0u8; 32];
         file_hash.copy_from_slice(&file_hash_result);
 
-        chunk_tx.send(SenderEvent::FileProcessed {
-            file_id,
-            merkle_root,
-            total_chunks,
-            file_hash,
-        }).await.map_err(|_| anyhow!("Event channel closed"))?;
+        chunk_tx
+            .send(SenderEvent::FileProcessed {
+                file_id,
+                merkle_root,
+                total_chunks,
+                file_hash,
+            })
+            .await
+            .map_err(|_| anyhow!("Event channel closed"))?;
 
         Ok(merkle_root)
     }
@@ -299,17 +264,11 @@ impl SenderPipeline {
                 continue;
             }
             let raw_chunk = &file_data[start..end];
-            let chunk_hash = compute_chunk_hash(raw_chunk);
-            let compressed = compress_chunk(raw_chunk, self.config.compression_quality)?;
-            let wire_payload = encrypt_chunk(encryption_key, &compressed)?;
 
-            let pipeline_chunk = PipelineChunk {
-                file_id,
-                chunk_index,
-                chunk_hash,
-                wire_payload,
-                raw_size: raw_chunk.len(),
-            };
+            let pipeline_chunk = build_pipeline_chunk(
+                file_id, chunk_index, raw_chunk,
+                encryption_key, self.config.compression_quality,
+            )?;
 
             chunk_tx.send(SenderEvent::ChunkReady(pipeline_chunk)).await
                 .map_err(|_| anyhow!("Chunk channel closed"))?;
@@ -345,6 +304,29 @@ fn encrypt_chunk(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
     Ok(out)
+}
+
+/// Build a `PipelineChunk` from raw data: hash → compress → encrypt.
+///
+/// This is the single pipeline stage that every outbound chunk passes
+/// through, whether it's a first send or a requeue for resume.
+fn build_pipeline_chunk(
+    file_id: Uuid,
+    chunk_index: u32,
+    raw_chunk: &[u8],
+    encryption_key: &[u8; 32],
+    compression_quality: u32,
+) -> Result<PipelineChunk> {
+    let chunk_hash = compute_chunk_hash(raw_chunk);
+    let compressed = compress_chunk(raw_chunk, compression_quality)?;
+    let wire_payload = encrypt_chunk(encryption_key, &compressed)?;
+    Ok(PipelineChunk {
+        file_id,
+        chunk_index,
+        chunk_hash,
+        wire_payload,
+        raw_size: raw_chunk.len(),
+    })
 }
 
 // ── Retry Tracker ────────────────────────────────────────────────────────────

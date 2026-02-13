@@ -77,7 +77,7 @@ impl Handler for IdPanel {
     fn handle_key(&mut self, app: &mut App, _node: &PeerNode, key: KeyCode) -> Option<Action> {
         match key {
             KeyCode::Esc => {
-                app.status.clear();
+                app.notify.clear();
                 Some(Action::SwitchMode(crate::workers::app::Mode::Home))
             }
             KeyCode::Char('c') | KeyCode::Char('C') => {

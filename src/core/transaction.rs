@@ -23,6 +23,18 @@ use uuid::Uuid;
 /// Every module that computes total_chunks or byte offsets MUST use this.
 pub const CHUNK_SIZE: usize = 48 * 1024;
 
+/// Compute the total number of chunks for a file of the given size.
+///
+/// This is the **single source of truth** for chunk count computation.
+/// All modules MUST use this instead of duplicating the formula.
+///
+/// Invariant: always returns at least 1 (even for zero-size, though zero-size
+/// files are rejected by manifest validation).
+#[inline]
+pub fn compute_total_chunks(file_size: u64) -> u32 {
+    ((file_size as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32
+}
+
 // ── Transaction State Machine ────────────────────────────────────────────────
 
 /// All possible states a Transaction can be in.
@@ -98,7 +110,7 @@ pub struct TransactionFile {
 
 impl TransactionFile {
     pub fn new(file_id: Uuid, relative_path: String, filesize: u64) -> Self {
-        let total_chunks = ((filesize as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
+        let total_chunks = compute_total_chunks(filesize);
         Self {
             file_id,
             relative_path,
@@ -428,6 +440,53 @@ impl Transaction {
 
     // ── Resume support ───────────────────────────────────────────────────
 
+    /// Validate a resume request against the transaction's current state.
+    ///
+    /// Checks:
+    /// 1. Transaction is in a resumable state (Active, Interrupted, or Resumable).
+    /// 2. Transaction is outbound (we are the sender; receiver drives resume).
+    /// 3. Retry limit has not been exceeded.
+    /// 4. All referenced file_ids exist in the transaction manifest.
+    ///
+    /// Returns `Ok(())` if valid, `Err(reason)` if the request must be rejected.
+    pub fn validate_resume_request(
+        &self,
+        resume_info: &ResumeInfo,
+        max_retries: u32,
+    ) -> Result<(), &'static str> {
+        // State check: must be in a resumable-compatible state
+        if self.state != TransactionState::Resumable
+            && self.state != TransactionState::Interrupted
+            && self.state != TransactionState::Active
+        {
+            return Err("Invalid transaction state for resume");
+        }
+
+        // Direction check: only outbound transactions accept resume requests
+        if self.direction != TransactionDirection::Outbound {
+            return Err("Resume rejected: wrong direction");
+        }
+
+        // Retry limit
+        if self.resume_count >= max_retries {
+            return Err("Resume rejected: retry limit exceeded");
+        }
+
+        // Manifest integrity: all referenced file_ids must exist
+        for file_id in &resume_info.completed_files {
+            if !self.files.contains_key(file_id) {
+                return Err("Resume rejected: unknown file in request");
+            }
+        }
+        for file_id in resume_info.partial_offsets.keys() {
+            if !self.files.contains_key(file_id) {
+                return Err("Resume rejected: unknown file in request");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Apply resume info from the receiver: mark completed files as done.
     pub fn apply_resume_info(&mut self, info: &ResumeInfo) {
         self.resume_count += 1;
@@ -438,12 +497,22 @@ impl Transaction {
                 file.transferred_chunks = file.total_chunks;
                 file.verified = Some(true);
             } else {
-                // Reset progress for incomplete files — the sender will
+                // Reset ALL state for incomplete files — the sender will
                 // re-send ALL chunks from 0 because the receiver's
-                // in-memory buffer is lost on reconnect.  Keeping the
-                // old transferred_chunks would cause the sender to skip
-                // chunks that the receiver no longer has.
+                // in-memory buffer is lost on reconnect.
+                //
+                // It is critical to reset `completed` because a prior
+                // SendComplete{success:false} (fired when the connection
+                // drops mid-send) marks the file as completed even though
+                // it was never fully transferred.  Without this reset the
+                // ResendFiles handler would skip the file entirely,
+                // silently losing it.
+                file.completed = false;
+                file.verified = None;
                 file.transferred_chunks = 0;
+                if let Some(ref mut bitmap) = file.chunk_bitmap {
+                    *bitmap = ChunkBitmap::new(file.total_chunks);
+                }
             }
         }
 

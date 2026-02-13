@@ -1,5 +1,6 @@
 use crate::core::engine::TransferEngine;
 use crate::core::transaction::TransactionManager;
+use crate::ui::notify::NotifyManager;
 use std::collections::HashMap;
 use std::time::Instant;
 use uuid::Uuid;
@@ -418,8 +419,8 @@ pub struct App {
     /// with the stored save path instead of showing a popup.
     pub pending_remote_save_paths: HashMap<String, String>,
 
-    // Status
-    pub status: String,
+    // Notifications (user-facing status bar)
+    pub notify: NotifyManager,
 
     // Connecting status
     pub connecting_peers: HashMap<String, String>,
@@ -486,7 +487,7 @@ impl App {
             remote_file_request: None,
             remote_folder_request: None,
             pending_remote_save_paths: HashMap::new(),
-            status: String::new(),
+            notify: NotifyManager::new(),
             connecting_peers: HashMap::new(),
             engine: TransferEngine::new(),
             transactions: TransactionManager::new(),
@@ -534,11 +535,11 @@ impl App {
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
-        self.status = msg.into();
+        self.notify.info(msg);
     }
 
     pub fn push_error(&mut self, msg: impl Into<String>) {
-        self.status = msg.into();
+        self.notify.error(msg);
     }
 
     pub fn add_peer(&mut self, peer_id: String) {

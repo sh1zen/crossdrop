@@ -76,25 +76,8 @@ impl PeerRegistry {
     /// Persist the registry to disk.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let content = serde_json::to_string_pretty(self)?;
-
-        // Atomic write: write to a temporary file then rename.
-        // This prevents corruption if the process is killed mid-write,
-        // which would break auto-reconnection on restart.
-        let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &content).map_err(|e| {
-            error!(event = "peer_registry_save_failure", path = %tmp_path.display(), error = %e, "Failed to write peer registry temp file");
-            e
-        })?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            error!(event = "peer_registry_rename_failure", from = %tmp_path.display(), to = %path.display(), error = %e, "Failed to rename peer registry temp file");
-            let _ = std::fs::remove_file(&tmp_path);
-            e
-        })?;
-        Ok(())
+        crate::utils::atomic_write::atomic_write(&path, content.as_bytes())
     }
 
     /// Record that a peer has connected.

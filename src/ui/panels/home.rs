@@ -151,7 +151,7 @@ impl Handler for HomePanel {
             }
             KeyCode::Enter => {
                 if let Some(mode) = Self::index_to_mode(sel) {
-                    app.status.clear();
+                    app.notify.clear();
                     if mode == Mode::Chat {
                         app.chat_target = ChatTarget::Room;
                         app.chat_sidebar_idx = 0;

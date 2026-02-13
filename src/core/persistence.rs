@@ -47,27 +47,8 @@ impl Persistence {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let content = serde_json::to_string_pretty(self)?;
-
-        // Atomic write: write to a temporary file then rename.
-        // This prevents corruption if the process is killed mid-write
-        // (e.g. power loss, crash). The rename is atomic on all major
-        // filesystems (NTFS, ext4, APFS).
-        let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &content).map_err(|e| {
-            error!(event = "persistence_save_failure", path = %tmp_path.display(), error = %e, "Failed to write persistence temp file");
-            e
-        })?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            error!(event = "persistence_rename_failure", from = %tmp_path.display(), to = %path.display(), error = %e, "Failed to rename persistence temp file");
-            // Attempt cleanup of the temp file on rename failure
-            let _ = std::fs::remove_file(&tmp_path);
-            e
-        })?;
-        Ok(())
+        crate::utils::atomic_write::atomic_write(&path, content.as_bytes())
     }
 
     /// Remove a completed transaction from persistence.

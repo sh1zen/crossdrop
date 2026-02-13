@@ -439,10 +439,11 @@ impl UIExecuter {
                 "Enter: select file/folder | Backspace: up to parent | f: fetch folder | Esc: back"
             }
         };
-        let help_line = if app.status.is_empty() {
-            Paragraph::new(help).style(Style::default().fg(Color::DarkGray))
+        let help_line = if let Some(notif) = app.notify.current() {
+            Paragraph::new(format!(" {} {}", notif.level.icon(), notif.message))
+                .style(Style::default().fg(notif.level.color()))
         } else {
-            Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::Yellow))
+            Paragraph::new(help).style(Style::default().fg(Color::DarkGray))
         };
         f.render_widget(help_line, chunks[0]);
 
@@ -772,8 +773,8 @@ impl UIExecuter {
                 }
             });
         }
-        self.app
-            .set_status(format!("Downloading file: {}", af.filename));
+        self.app.notify
+            .info(format!("Downloading: {}", af.filename));
     }
 
     async fn process_file_offer_reject(&mut self, node: &PeerNode, af: AcceptingFileOffer) {
@@ -791,11 +792,11 @@ impl UIExecuter {
             self.app.file_transfer_status.insert(file_id, FileTransferStatus::Rejected);
             self.app.rejected_transfers.insert(file_id, (filename.clone(), Some("User declined".to_string())));
             
-            self.app
-                .set_status(format!("Cancelled file: {}", af.filename));
+            self.app.notify
+                .warn(format!("Rejected: {}", af.filename));
         } else {
-            self.app
-                .set_status(format!("Cancelled download: {}", af.filename));
+            self.app.notify
+                .warn(format!("Cancelled: {}", af.filename));
         }
     }
 
@@ -831,8 +832,8 @@ impl UIExecuter {
                     .await;
             });
         }
-        self.app
-            .set_status(format!("Downloading folder: {}", dirname));
+        self.app.notify
+            .info(format!("Downloading: {}", dirname));
     }
 
     async fn process_folder_offer_reject(&mut self, node: &PeerNode, af: AcceptingFolderOffer) {
@@ -844,11 +845,11 @@ impl UIExecuter {
                     .respond_to_folder_offer(&af.peer_id, af.folder_id, false)
                     .await;
             });
-            self.app
-                .set_status(format!("Cancelled folder: {}", dirname));
+            self.app.notify
+                .warn(format!("Rejected: {}", dirname));
         } else {
-            self.app
-                .set_status(format!("Cancelled download: {}", af.dirname));
+            self.app.notify
+                .warn(format!("Cancelled: {}", af.dirname));
         }
     }
 
@@ -900,9 +901,9 @@ impl UIExecuter {
                             }
                         }
                     });
-                    self.app.set_status(format!("Requesting file: {}", req.filename));
+                    self.app.notify.info(format!("Requesting: {}", req.filename));
                 } else {
-                    self.app.set_status(format!("Cancelled request: {}", req.filename));
+                    self.app.notify.warn(format!("Cancelled: {}", req.filename));
                 }
             }
             KeyCode::Backspace => {
@@ -919,7 +920,7 @@ impl UIExecuter {
                     } else if c == 'n' || c == 'N' || c == 'c' || c == 'C' {
                         let req = self.app.remote_file_request.take().unwrap();
                         self.context.active_popup = UIPopup::None;
-                        self.app.set_status(format!("Cancelled request: {}", req.filename));
+                        self.app.notify.warn(format!("Cancelled: {}", req.filename));
                     }
                 }
             }
@@ -933,7 +934,7 @@ impl UIExecuter {
                 }
                 let req = self.app.remote_file_request.take().unwrap();
                 self.context.active_popup = UIPopup::None;
-                self.app.set_status(format!("Cancelled request: {}", req.filename));
+                self.app.notify.warn(format!("Cancelled: {}", req.filename));
             }
             _ => {}
         }
@@ -982,9 +983,9 @@ impl UIExecuter {
                             }
                         }
                     });
-                    self.app.set_status(format!("Requesting folder: {}", req.dirname));
+                    self.app.notify.info(format!("Requesting: {}", req.dirname));
                 } else {
-                    self.app.set_status(format!("Cancelled request: {}", req.dirname));
+                    self.app.notify.warn(format!("Cancelled: {}", req.dirname));
                 }
             }
             KeyCode::Backspace => {
@@ -1001,7 +1002,7 @@ impl UIExecuter {
                     } else if c == 'n' || c == 'N' || c == 'c' || c == 'C' {
                         let req = self.app.remote_folder_request.take().unwrap();
                         self.context.active_popup = UIPopup::None;
-                        self.app.set_status(format!("Cancelled request: {}", req.dirname));
+                        self.app.notify.warn(format!("Cancelled: {}", req.dirname));
                     }
                 }
             }
@@ -1015,7 +1016,7 @@ impl UIExecuter {
                 }
                 let req = self.app.remote_folder_request.take().unwrap();
                 self.context.active_popup = UIPopup::None;
-                self.app.set_status(format!("Cancelled request: {}", req.dirname));
+                self.app.notify.warn(format!("Cancelled: {}", req.dirname));
             }
             _ => {}
         }
@@ -1068,12 +1069,13 @@ impl UIExecuter {
                     match self.app.engine.accept_incoming(dest_path) {
                         Ok(outcome) => {
                             if let Some(status) = outcome.status {
-                                self.app.set_status(status);
+                                self.app.notify.success(status);
                             }
                             self.execute_engine_actions(node, outcome.actions).await;
                         }
                         Err(e) => {
-                            self.app.set_status(format!("Error accepting transfer: {}", e));
+                            tracing::error!(event = "accept_failed", error = %e);
+                            self.app.notify.error("Accept failed");
                         }
                     }
                 } else {
@@ -1081,12 +1083,13 @@ impl UIExecuter {
                     match self.app.engine.reject_incoming() {
                         Ok(outcome) => {
                             if let Some(status) = outcome.status {
-                                self.app.set_status(status);
+                                self.app.notify.warn(status);
                             }
                             self.execute_engine_actions(node, outcome.actions).await;
                         }
                         Err(e) => {
-                            self.app.set_status(format!("Error rejecting transfer: {}", e));
+                            tracing::error!(event = "reject_failed", error = %e);
+                            self.app.notify.error("Reject failed");
                         }
                     }
                 }
@@ -1103,12 +1106,13 @@ impl UIExecuter {
                     match self.app.engine.reject_incoming() {
                         Ok(outcome) => {
                             if let Some(status) = outcome.status {
-                                self.app.set_status(status);
+                                self.app.notify.warn(status);
                             }
                             self.execute_engine_actions(node, outcome.actions).await;
                         }
                         Err(e) => {
-                            self.app.set_status(format!("Error: {}", e));
+                            tracing::error!(event = "reject_failed", error = %e);
+                            self.app.notify.error("Action failed");
                         }
                     }
                 }
@@ -1144,12 +1148,13 @@ impl UIExecuter {
                     match self.app.engine.reject_incoming() {
                         Ok(outcome) => {
                             if let Some(status) = outcome.status {
-                                self.app.set_status(status);
+                                self.app.notify.warn(status);
                             }
                             self.execute_engine_actions(node, outcome.actions).await;
                         }
                         Err(e) => {
-                            self.app.set_status(format!("Error: {}", e));
+                            tracing::error!(event = "reject_failed", error = %e);
+                            self.app.notify.error("Action failed");
                         }
                     }
                 }
@@ -1181,7 +1186,7 @@ impl UIExecuter {
 
         // Apply engine outcome (actions + status)
         if let Some(status) = outcome.status {
-            self.app.set_status(status);
+            self.app.notify.info(status);
         }
         self.execute_engine_actions(node, outcome.actions).await;
 
@@ -1216,7 +1221,7 @@ impl UIExecuter {
                 let has_resume_actions = !resume_outcome.actions.is_empty();
                 let action_count = resume_outcome.actions.len();
                 if let Some(status) = resume_outcome.status {
-                    self.app.set_status(status);
+                    self.app.notify.info(status);
                 }
                 if has_resume_actions {
                     info!(
@@ -1230,16 +1235,16 @@ impl UIExecuter {
 
                 info!(event = "peer_online", peer = %crate::core::initializer::short_id_pub(&peer_id), "Peer state: offline → online");
                 if !has_resume_actions {
-                    self.app.set_status(format!(
-                        "Peer connected: {}",
+                    self.app.notify.success(format!(
+                        "Connected: {}",
                         get_display_name(&self.app, &peer_id)
                     ));
                 }
             }
             AppEvent::PeerDisconnected { peer_id, explicit } => {
                 self.app.connecting_peers.remove(&peer_id);
-                // Engine already transitioned transactions to Resumable and persisted;
-                // do NOT call interrupt_peer() here as it would overwrite Resumable → Interrupted.
+                // Engine already interrupted and persisted transactions as Resumable;
+                // no additional transaction handling needed here.
 
                 // Clean up the stale entry from PeerNode so the peer
                 // slot is freed and the remote side can reconnect inbound.
@@ -1250,8 +1255,8 @@ impl UIExecuter {
                     info!(event = "peer_removed", peer = %crate::core::initializer::short_id_pub(&peer_id), "Peer explicitly disconnected and removed");
                     self.app.remove_peer(&peer_id);
                     self.peer_registry.peer_removed(&peer_id);
-                    self.app.set_status(format!(
-                        "Peer disconnected: {}",
+                    self.app.notify.warn(format!(
+                        "Disconnected: {}",
                         get_display_name(&self.app, &peer_id)
                     ));
                 } else {
@@ -1259,8 +1264,8 @@ impl UIExecuter {
                     warn!(event = "peer_offline", peer = %crate::core::initializer::short_id_pub(&peer_id), "Peer state: online → offline (connection lost)");
                     self.app.set_peer_offline(&peer_id);
                     self.peer_registry.peer_disconnected(&peer_id);
-                    self.app.set_status(format!(
-                        "Peer offline: {}",
+                    self.app.notify.warn(format!(
+                        "Connection lost: {}",
                         get_display_name(&self.app, &peer_id)
                     ));
 
@@ -1439,7 +1444,7 @@ impl UIExecuter {
                 if self.context.current_mode == Mode::Remote
                     && self.app.remote_peer.as_deref() == Some(&peer_id)
                 {
-                    self.app.set_status("Peer does not allow remote access");
+                    self.app.notify.warn("Remote access disabled");
                     self.context.switch_mode(Mode::Peers);
                     self.app.mode = Mode::Peers;
                     self.app.remote_peer = None;
@@ -1457,7 +1462,7 @@ impl UIExecuter {
                     // Auto-accept
                     if let Ok(outcome) = self.app.engine.accept_incoming(save_path) {
                         if let Some(status) = outcome.status {
-                            self.app.set_status(status);
+                            self.app.notify.info(status);
                         }
                         self.execute_engine_actions(node, outcome.actions).await;
                     }
@@ -1473,7 +1478,7 @@ impl UIExecuter {
                     }
                     if let Ok(outcome) = self.app.engine.accept_incoming(save_path) {
                         if let Some(status) = outcome.status {
-                            self.app.set_status(status);
+                            self.app.notify.info(status);
                         }
                         self.execute_engine_actions(node, outcome.actions).await;
                     }
@@ -1500,12 +1505,7 @@ impl UIExecuter {
                         .respond_to_folder_offer(&peer_id, folder_id, true)
                         .await;
                 });
-                self.app.set_status(format!(
-                    "Downloading folder: {} ({} files, {})",
-                    dirname,
-                    file_count,
-                    format_file_size(total_size)
-                ));
+                self.app.notify.info(format!("Downloading: {}", dirname));
             }
             AppEvent::FolderComplete { peer_id, folder_id } => {
                 self.app.folder_progress.remove(&folder_id);

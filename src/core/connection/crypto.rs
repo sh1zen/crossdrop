@@ -31,7 +31,6 @@
 //! key from the new ECDH secret, with the previous key mixed in as salt
 //! to guarantee forward secrecy.
 
-use sha3::{Digest, Sha3_256};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -87,43 +86,9 @@ pub fn derive_session_key(
     hmac_sha3_256(&prk, &expand_msg)
 }
 
-/// HMAC-SHA3-256 (RFC 2104 with SHA3-256).
+/// HMAC-SHA3-256 — delegates to the centralized implementation in `utils::crypto`.
 fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 136; // SHA3-256 rate (1088 bits)
-
-    let actual_key = if key.len() > BLOCK_SIZE {
-        let mut h = Sha3_256::new();
-        h.update(key);
-        let digest = h.finalize();
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..32].copy_from_slice(&digest);
-        k
-    } else {
-        let mut k = [0u8; BLOCK_SIZE];
-        k[..key.len()].copy_from_slice(key);
-        k
-    };
-
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        ipad[i] ^= actual_key[i];
-        opad[i] ^= actual_key[i];
-    }
-
-    let mut inner = Sha3_256::new();
-    inner.update(&ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha3_256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    let result = outer.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    crate::utils::crypto::hmac_sha3_256(key, data)
 }
 
 // ── SessionKeyManager ────────────────────────────────────────────────────────
