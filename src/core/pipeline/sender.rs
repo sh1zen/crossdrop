@@ -13,9 +13,10 @@
 //! - Retry limits per chunk and per transaction
 //! - Buffer pooling to reduce allocations
 
+use crate::core::config::CHUNK_SIZE;
 use crate::core::pipeline::chunk::compute_chunk_hash;
 use crate::core::pipeline::merkle::MerkleTree;
-use crate::core::transaction::{compute_total_chunks, CHUNK_SIZE};
+use crate::core::transaction::compute_total_chunks;
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use anyhow::{anyhow, Result};
 use brotli::CompressorWriter;

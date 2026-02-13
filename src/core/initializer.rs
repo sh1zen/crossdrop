@@ -1059,8 +1059,7 @@ impl PeerNode {
         folder_path: &str,
         file_entries: Vec<(Uuid, String)>, // (file_id, relative_path)
     ) -> Result<()> {
-        const MAX_PREFETCH_FILES: usize = 24;
-        const MAX_PREFETCH_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
+        use crate::core::config::{MAX_PREFETCH_FILES, MAX_PREFETCH_BYTES};
 
         let root = std::path::Path::new(folder_path);
         let root_parent = root.parent().unwrap_or(root);
@@ -1433,12 +1432,10 @@ impl PeerNode {
     ) {
         use crate::core::connection::webrtc::ControlMessage;
 
-        const PING_INTERVAL: Duration = Duration::from_secs(10);
-        const PONG_TIMEOUT: Duration = Duration::from_secs(60);
-        /// Number of consecutive ping send failures before declaring offline.
-        /// A single transient failure (e.g. control channel momentarily not
-        /// open under heavy load) must NOT trigger disconnection.
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        use crate::core::config::{
+            PING_INTERVAL, PONG_TIMEOUT,
+            MAX_CONSECUTIVE_PING_FAILURES as MAX_CONSECUTIVE_FAILURES,
+        };
 
         let event_tx = self.event_tx.clone();
         let peers = self.peers.clone();

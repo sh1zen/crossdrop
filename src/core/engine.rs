@@ -11,13 +11,14 @@
 //! The UI layer reads state and dispatches commands; the transport layer
 //! sends/receives raw frames. All coordination happens here.
 
+use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS};
 use crate::core::initializer::AppEvent;
 use crate::core::persistence::Persistence;
 use crate::core::protocol::coordinator::TransferCoordinator;
 use crate::core::security::identity::PeerIdentity;
 use crate::core::transaction::{
     ManifestEntry, ResumeInfo, Transaction, TransactionDirection, TransactionManifest,
-    TransactionManager, TransactionState, CHUNK_SIZE,
+    TransactionManager, TransactionState,
 };
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -25,11 +26,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-/// Maximum number of simultaneously active (non-terminal) transactions.
-pub const MAX_CONCURRENT_TRANSACTIONS: usize = 3;
 
 // ── Engine Actions ───────────────────────────────────────────────────────────
 
@@ -1439,19 +1435,14 @@ impl Default for TransferEngine {
 
 // ── Abuse & Safety Controls ─────────────────────────────────────────────────
 
-/// Constants for abuse prevention.
-#[allow(dead_code)]
+/// Re-export safety constants from the centralized config for backward compat.
+#[allow(dead_code, unused_imports)]
 pub mod safety {
-    use std::time::Duration;
-
-    /// Maximum retries per chunk before giving up.
-    pub const MAX_CHUNK_RETRIES: usize = 3;
-    /// Maximum total retries per transaction.
-    pub const MAX_TRANSACTION_RETRIES: usize = 100;
-    /// Transaction timeout (after which it expires).
-    pub const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
-    /// Maximum memory budget for buffered chunks (128 MB).
-    pub const MAX_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
-    /// Maximum concurrent chunks in pipeline.
-    pub const MAX_PIPELINE_DEPTH: usize = 64;
+    pub use crate::core::config::{
+        MAX_CHUNK_RETRIES,
+        MAX_TRANSACTION_RETRIES,
+        TRANSACTION_TIMEOUT,
+        MAX_MEMORY_BUDGET,
+        MAX_PIPELINE_DEPTH,
+    };
 }

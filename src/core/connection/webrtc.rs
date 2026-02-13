@@ -46,13 +46,11 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const CHUNK_SIZE: usize = 48 * 1024; // 48KB chunks — safe for SCTP message size limits
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
-const DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
-const CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
-const PIPELINE_SIZE: usize = 32; // Larger pipeline — early-chunk buffering prevents stalls
-const MAX_RETRIES: usize = 3;
+use crate::core::config::{
+    CHUNK_SIZE, CONNECTION_TIMEOUT, DATA_CHANNEL_TIMEOUT,
+    CHUNK_ACK_TIMEOUT, ICE_GATHER_TIMEOUT, PIPELINE_SIZE,
+    MAX_SEND_RETRIES as MAX_RETRIES,
+};
 
 // ── Binary Frame Format ──────────────────────────────────────────────────────
 //

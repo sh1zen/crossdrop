@@ -12,16 +12,13 @@
 //!
 //! There is exactly one Transaction per transfer request.
 
+pub use crate::core::config::CHUNK_SIZE;
 use crate::core::pipeline::chunk::ChunkBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
-
-/// Canonical chunk size in bytes. Must match the constant in webrtc.rs.
-/// Every module that computes total_chunks or byte offsets MUST use this.
-pub const CHUNK_SIZE: usize = 48 * 1024;
 
 /// Compute the total number of chunks for a file of the given size.
 ///

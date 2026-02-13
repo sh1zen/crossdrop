@@ -6,7 +6,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-const MAX_ENTRIES: usize = 500;
+use crate::core::config::MAX_LOG_ENTRIES as MAX_ENTRIES;
 
 #[derive(Clone)]
 pub struct LogEntry {

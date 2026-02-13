@@ -13,9 +13,9 @@
 //! - Chunk bitmap for resume support
 //! - Incremental Merkle tree reconstruction
 
+use crate::core::config::CHUNK_SIZE;
 use crate::core::pipeline::chunk::{ChunkBitmap, compute_chunk_hash};
 use crate::core::pipeline::merkle::IncrementalMerkleBuilder;
-use crate::core::transaction::CHUNK_SIZE;
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 use anyhow::{anyhow, Result};
 use brotli::Decompressor;

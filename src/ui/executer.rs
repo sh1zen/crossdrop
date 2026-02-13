@@ -197,8 +197,10 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
                     // and give remote peers time to come online.
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-                    const MAX_RETRIES: u32 = 3;
-                    const RETRY_DELAYS: [u64; 3] = [5, 15, 30];
+                    use crate::core::config::{
+                        INITIAL_CONNECT_MAX_RETRIES as MAX_RETRIES,
+                        INITIAL_CONNECT_RETRY_DELAYS as RETRY_DELAYS,
+                    };
 
                     for attempt in 0..=MAX_RETRIES {
                         if attempt > 0 {
@@ -1280,8 +1282,10 @@ impl UIExecuter {
                             let pid = peer_id.clone();
                             info!(event = "auto_reconnect_after_disconnect", peer = %crate::core::initializer::short_id_pub(&pid), "Spawning auto-reconnect after connection loss");
                             tokio::spawn(async move {
-                                const MAX_RETRIES: u32 = 5;
-                                const RETRY_DELAYS: [u64; 5] = [3, 5, 10, 20, 30];
+                                use crate::core::config::{
+                                    RECONNECT_MAX_RETRIES as MAX_RETRIES,
+                                    RECONNECT_RETRY_DELAYS as RETRY_DELAYS,
+                                };
 
                                 for attempt in 0..MAX_RETRIES {
                                     let delay = RETRY_DELAYS.get(attempt as usize).copied().unwrap_or(30);
@@ -1551,7 +1555,7 @@ impl UIExecuter {
                 if self.app.engine.transactions().transaction_id_for_file(&file_id).is_none() {
                     if let Some((filename, _, total_chunks)) = self.app.send_progress.remove(&file_id) {
                         if success {
-                            let filesize = total_chunks as u64 * crate::core::transaction::CHUNK_SIZE as u64;
+                            let filesize = total_chunks as u64 * crate::core::config::CHUNK_SIZE as u64;
                             self.app.file_history.push(FileRecord {
                                 direction: FileDirection::Sent,
                                 peer_id: peer_id.clone(),

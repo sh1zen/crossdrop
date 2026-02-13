@@ -12,9 +12,9 @@
 //! - Sender refuses requests outside the manifest
 //! - No path traversal allowed
 
+use crate::core::config::CHUNK_SIZE;
 use crate::core::pipeline::merkle::compute_file_merkle_root;
 use crate::core::security::identity::PeerIdentity;
-use crate::core::transaction::CHUNK_SIZE;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};

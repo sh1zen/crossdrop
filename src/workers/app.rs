@@ -1,3 +1,4 @@
+use crate::core::config::TYPING_TIMEOUT_SECS;
 use crate::core::engine::TransferEngine;
 use crate::core::transaction::TransactionManager;
 use crate::ui::notify::NotifyManager;
@@ -193,7 +194,6 @@ impl UnreadTracker {
 ///
 /// * Peer-specific — does **not** create message entries.
 /// * Auto-expires after `TYPING_TIMEOUT_SECS`.
-const TYPING_TIMEOUT_SECS: u64 = 3;
 
 pub struct TypingState {
     /// peer_id → when the peer last signalled "typing".
