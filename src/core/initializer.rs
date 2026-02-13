@@ -591,12 +591,10 @@ impl PeerNode {
 
         webrtc_conn.wait_data_channels_open().await?;
 
-        self.connecting_notify(&peer_id, "Data channels open (control + data)");
-
-        if let Some(name) = &self.args.display_name {
-            let _ = webrtc_conn.send_display_name(name.clone()).await;
-        }
-
+        // Insert the peer into the map IMMEDIATELY after data channels open.
+        // The remote side can start sending control messages (e.g. resume
+        // requests) as soon as channels are open, and the resume action
+        // handlers need the peer to be in the map to send responses.
         // Atomic check-and-insert: if another connection (inbound) won the race, drop ours
         {
             let mut peers = self.peers.lock().await;
@@ -612,6 +610,12 @@ impl PeerNode {
                     last_pong: last_pong.clone(),
                 },
             );
+        }
+
+        self.connecting_notify(&peer_id, "Data channels open (control + data)");
+
+        if let Some(name) = &self.args.display_name {
+            let _ = webrtc_conn.send_display_name(name.clone()).await;
         }
 
         // Spawn heartbeat monitor
@@ -727,12 +731,10 @@ impl PeerNode {
 
         webrtc_conn.wait_data_channels_open().await?;
 
-        if let Some(name) = &self.args.display_name {
-            let _ = webrtc_conn.send_display_name(name.clone()).await;
-        }
-
-        // Insert the new connection, evicting any stale entry that appeared in the meantime.
-        // Do NOT close the old connection — let it drop naturally.
+        // Insert the peer into the map IMMEDIATELY after data channels open.
+        // The remote side can start sending control messages (e.g. resume
+        // requests) as soon as channels are open, and the resume action
+        // handlers need the peer to be in the map to send responses.
         {
             let mut peers = self.peers.lock().await;
             if let Some(_old) = peers.remove(&peer_id) {
@@ -746,6 +748,10 @@ impl PeerNode {
                     last_pong: last_pong.clone(),
                 },
             );
+        }
+
+        if let Some(name) = &self.args.display_name {
+            let _ = webrtc_conn.send_display_name(name.clone()).await;
         }
 
         // Spawn heartbeat monitor
@@ -1369,6 +1375,27 @@ impl PeerNode {
     /// Used to detect stale disconnect events from evicted connections.
     pub async fn is_peer_connected(&self, peer_id: &str) -> bool {
         self.peers.lock().await.contains_key(peer_id)
+    }
+
+    /// Wait for a peer to appear in the connection map.
+    ///
+    /// Returns `true` if the peer became available within the timeout.
+    /// This is used by resume action handlers to tolerate the race where
+    /// a control-channel message (e.g. `TransactionResumeRequested`) is
+    /// forwarded to the event loop before the connection setup has finished
+    /// inserting the peer into the map.
+    pub async fn wait_for_peer(&self, peer_id: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(50);
+        loop {
+            if self.peers.lock().await.contains_key(peer_id) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Pre-register file destinations so that incoming Metadata frames can

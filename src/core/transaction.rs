@@ -203,6 +203,11 @@ pub struct Transaction {
     pub reject_reason: Option<String>,
     /// Number of resume attempts.
     pub resume_count: u32,
+    /// Timestamp when the transaction was last activated via resume.
+    /// Used to prevent `handle_peer_reconnected` from re-interrupting a
+    /// transfer that was just resumed (race between data-channel resume
+    /// messages and the PeerConnected event).
+    pub resumed_at: Option<Instant>,
 }
 
 impl Transaction {
@@ -241,6 +246,7 @@ impl Transaction {
             finished_at: None,
             reject_reason: None,
             resume_count: 0,
+            resumed_at: None,
         }
     }
 
@@ -281,6 +287,7 @@ impl Transaction {
             finished_at: None,
             reject_reason: None,
             resume_count: 0,
+            resumed_at: None,
         }
     }
 
@@ -514,6 +521,7 @@ impl Transaction {
         }
 
         self.state = TransactionState::Active;
+        self.resumed_at = Some(Instant::now());
     }
 
     // ── Snapshot (persistence) ─────────────────────────────────────────────
@@ -612,6 +620,7 @@ impl Transaction {
             finished_at: None,
             reject_reason: snap.reject_reason.clone(),
             resume_count: snap.resume_count,
+            resumed_at: None,
         }
     }
 

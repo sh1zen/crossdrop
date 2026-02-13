@@ -52,7 +52,7 @@ impl NotifyLevel {
     /// Single-char prefix for the notification (for quick visual scan).
     pub fn icon(self) -> &'static str {
         match self {
-            NotifyLevel::Info => "ℹ",
+            NotifyLevel::Info => "(i)",
             NotifyLevel::Success => "✓",
             NotifyLevel::Warning => "⚠",
             NotifyLevel::Error => "✗",

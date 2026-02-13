@@ -1131,12 +1131,22 @@ impl TransferEngine {
         //    A peer that just reconnected means the old connection is dead.
         //    Transactions stuck in Active are zombies — running on a dead
         //    WebRTC data channel.  Transition them so they can be resumed.
+        //
+        //    EXCEPTION: skip transactions that were resumed very recently
+        //    (within the last 30 s).  A `TransactionResumeRequested` control
+        //    message can arrive via the data channel BEFORE this `PeerConnected`
+        //    event is processed.  In that case the transaction has already been
+        //    activated by the resume handler and is actively transferring on the
+        //    NEW connection — transitioning it back to Resumable would stall it.
+        let recently_resumed_cutoff = std::time::Duration::from_secs(30);
         let active_txn_ids: Vec<Uuid> = self
             .transactions
             .active
             .iter()
             .filter(|(_, t)| {
-                t.peer_id == peer_id && t.state == TransactionState::Active
+                t.peer_id == peer_id
+                    && t.state == TransactionState::Active
+                    && !t.resumed_at.map_or(false, |at| at.elapsed() < recently_resumed_cutoff)
             })
             .map(|(id, _)| *id)
             .collect();

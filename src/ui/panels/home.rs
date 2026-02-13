@@ -89,7 +89,7 @@ impl Component for HomePanel {
                     Span::styled(" 📂  ".to_string(), Style::default().fg(Color::Cyan)),
                     Span::raw(mode.label()),
                     Span::styled(
-                        format!(" ({})", app.file_history.len()),
+                        format!(" ({})", app.engine.transfer_history().len()),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])),

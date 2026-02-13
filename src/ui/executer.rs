@@ -1764,6 +1764,14 @@ impl UIExecuter {
                 } => {
                     let node = node.clone();
                     tokio::spawn(async move {
+                        // Wait for the peer to appear in the connection map.
+                        // The resume request can arrive via the data channel
+                        // before the connection setup has finished registering
+                        // the peer.
+                        if !node.wait_for_peer(&peer_id, std::time::Duration::from_secs(5)).await {
+                            tracing::error!("Failed to accept resume: peer {} not connected after wait", peer_id);
+                            return;
+                        }
                         if let Err(e) =
                             node.accept_transaction_resume(&peer_id, transaction_id).await
                         {
@@ -1840,6 +1848,11 @@ impl UIExecuter {
                                 file_entries.len(), transaction_id
                             );
                             tokio::spawn(async move {
+                                // Wait for the peer to appear in the connection map.
+                                if !node.wait_for_peer(&peer_id, std::time::Duration::from_secs(5)).await {
+                                    tracing::error!("Resume folder send error: peer {} not connected after wait", peer_id);
+                                    return;
+                                }
                                 if let Err(e) = node
                                     .send_folder_data(&peer_id, &source_path, file_entries)
                                     .await
@@ -1860,6 +1873,11 @@ impl UIExecuter {
                                     filename, transaction_id
                                 );
                                 tokio::spawn(async move {
+                                    // Wait for the peer to appear in the connection map.
+                                    if !node.wait_for_peer(&peer_id, std::time::Duration::from_secs(5)).await {
+                                        tracing::error!("Resume file send error: peer {} not connected after wait", peer_id);
+                                        return;
+                                    }
                                     if let Err(e) = node
                                         .send_file_data(&peer_id, file_id, &source_path, &filename)
                                         .await
