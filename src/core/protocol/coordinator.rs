@@ -9,6 +9,10 @@
 //! It acts as the central authority that validates all operations against
 //! the manifest and security constraints.
 
+use crate::core::config::{
+    MAX_CHUNK_RETRIES, MAX_TRANSACTION_RETRIES,
+    TRANSACTION_TIMEOUT as DEFAULT_TRANSACTION_TIMEOUT,
+};
 use crate::core::pipeline::chunk::ChunkBitmap;
 use crate::core::pipeline::sender::{RetryTracker, SenderConfig};
 use crate::core::protocol::manifest::{SecureManifest, SecureManifestEntry};
@@ -21,17 +25,6 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
 use uuid::Uuid;
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-/// Maximum retries per chunk.
-pub const MAX_CHUNK_RETRIES: usize = 3;
-
-/// Maximum total retries per transaction.
-pub const MAX_TRANSACTION_RETRIES: usize = 100;
-
-/// Default transaction timeout.
-pub const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
 // ── Transfer State ───────────────────────────────────────────────────────────
 

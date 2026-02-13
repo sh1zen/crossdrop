@@ -1,3 +1,4 @@
+use crate::core::config::PORT_RETRY_ATTEMPTS;
 use crate::core::connection::ticket::Ticket;
 use crate::workers::args::RelayModeOption;
 use anyhow::Context;
@@ -8,8 +9,6 @@ use iroh::{Endpoint, SecretKey};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 use tokio::select;
-
-const PORT_RETRY_ATTEMPTS: u16 = 10;
 
 pub struct Iroh {
     endpoint: Option<Endpoint>,

@@ -191,7 +191,7 @@ pub async fn handshake_answerer(
 
 // ── Key rotation protocol ────────────────────────────────────────────────────
 
-pub const KEY_ROTATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+pub use crate::core::config::KEY_ROTATION_INTERVAL;
 
 pub fn prepare_rotation() -> EphemeralKeypair {
     EphemeralKeypair::generate()

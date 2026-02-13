@@ -6,16 +6,11 @@
 //! - Transaction expiration timestamps
 //! - Session key export for AEAD encryption
 
+use crate::core::config::TRANSACTION_TIMEOUT as DEFAULT_TRANSACTION_LIFETIME;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-
-/// Default transaction lifetime: 24 hours.
-pub const DEFAULT_TRANSACTION_LIFETIME: Duration = Duration::from_secs(24 * 3600);
-
-/// Maximum transaction lifetime: 72 hours.
-pub const MAX_TRANSACTION_LIFETIME: Duration = Duration::from_secs(72 * 3600);
 
 /// A secure session context for a single transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]

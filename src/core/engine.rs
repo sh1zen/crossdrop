@@ -11,7 +11,7 @@
 //! The UI layer reads state and dispatches commands; the transport layer
 //! sends/receives raw frames. All coordination happens here.
 
-use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS};
+use crate::core::config::{CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_TRANSACTION_RETRIES};
 use crate::core::initializer::AppEvent;
 use crate::core::persistence::Persistence;
 use crate::core::protocol::coordinator::TransferCoordinator;
@@ -1004,7 +1004,7 @@ impl TransferEngine {
                     // Centralized validation of resume request preconditions
                     if let Err(reason) = txn.validate_resume_request(
                         resume_info,
-                        safety::MAX_TRANSACTION_RETRIES as u32,
+                        MAX_TRANSACTION_RETRIES as u32,
                     ) {
                         warn!(
                             event = "resume_rejected",
@@ -1431,18 +1431,4 @@ impl Default for TransferEngine {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ── Abuse & Safety Controls ─────────────────────────────────────────────────
-
-/// Re-export safety constants from the centralized config for backward compat.
-#[allow(dead_code, unused_imports)]
-pub mod safety {
-    pub use crate::core::config::{
-        MAX_CHUNK_RETRIES,
-        MAX_TRANSACTION_RETRIES,
-        TRANSACTION_TIMEOUT,
-        MAX_MEMORY_BUDGET,
-        MAX_PIPELINE_DEPTH,
-    };
 }

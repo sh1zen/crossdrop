@@ -29,13 +29,8 @@ pub const MAX_CHUNK_RETRIES: usize = 3;
 pub const MAX_TRANSACTION_RETRIES: usize = 100;
 
 /// Transaction timeout (after which it expires).
+/// Also used as the default transaction lifetime and secure manifest expiry.
 pub const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
-
-/// Maximum memory budget for buffered chunks (128 MB).
-pub const MAX_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
-
-/// Maximum concurrent chunks in pipeline.
-pub const MAX_PIPELINE_DEPTH: usize = 64;
 
 /// Maximum retries for WebRTC chunk send operations.
 pub const MAX_SEND_RETRIES: usize = 3;
@@ -53,6 +48,12 @@ pub const CHUNK_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for ICE candidate gathering.
 pub const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Session key rotation interval (1 hour).
+pub const KEY_ROTATION_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Number of port-binding attempts when starting the Iroh endpoint.
+pub const PORT_RETRY_ATTEMPTS: u16 = 10;
 
 // ── Heartbeat / Keep-alive ───────────────────────────────────────────────────
 
