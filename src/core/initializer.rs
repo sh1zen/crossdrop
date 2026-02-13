@@ -428,6 +428,16 @@ impl PeerNode {
     // ── Connect (outbound) ───────────────────────────────────────────────
 
     pub async fn connect_to(&self, ticket_str: String) -> Result<()> {
+        self.connect_to_inner(ticket_str, false).await
+    }
+
+    /// Like `connect_to` but suppresses per-peer status bar notifications.
+    /// Used for auto-reconnect where a single summary message is shown instead.
+    pub async fn connect_to_quiet(&self, ticket_str: String) -> Result<()> {
+        self.connect_to_inner(ticket_str, true).await
+    }
+
+    async fn connect_to_inner(&self, ticket_str: String, quiet: bool) -> Result<()> {
         let ticket = Ticket::parse(ticket_str.clone())?;
         let peer_id = format!("{}", ticket.address.id);
 
@@ -436,10 +446,12 @@ impl PeerNode {
             let peers = self.peers.lock().await;
             if peers.contains_key(&peer_id) {
                 debug!(event = "connect_skipped", peer = %short_id(&peer_id), "Already connected, skipping");
-                let _ = self.event_tx.send(AppEvent::Info(format!(
-                    "[{}] Already connected, skipping",
-                    short_id(&peer_id)
-                )));
+                if !quiet {
+                    let _ = self.event_tx.send(AppEvent::Info(format!(
+                        "[{}] Already connected, skipping",
+                        short_id(&peer_id)
+                    )));
+                }
                 return Ok(());
             }
         }
@@ -458,7 +470,9 @@ impl PeerNode {
         };
 
         self.connecting_notify(&peer_id, "Resolving peer via Iroh...");
-        self.send_info(&peer_id, "Establishing peer connection...");
+        if !quiet {
+            self.send_info(&peer_id, "Establishing peer connection...");
+        }
 
         let connection = tokio::time::timeout(Duration::from_secs(30), self.iroh.connect(ticket))
             .await

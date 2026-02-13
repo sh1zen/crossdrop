@@ -219,6 +219,11 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
 
         if !peers_to_reconnect.is_empty() {
             info!(event = "auto_reconnect_start", count = peers_to_reconnect.len(), "Attempting to reconnect to known peers");
+            executer.app.set_status(format!(
+                "Resuming {} connection{}...",
+                peers_to_reconnect.len(),
+                if peers_to_reconnect.len() == 1 { "" } else { "s" }
+            ));
             for (peer_id, ticket, display_name) in peers_to_reconnect {
                 // Pre-populate display name if we have one from last session
                 if let Some(name) = &display_name {
@@ -256,7 +261,7 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
                             "Reconnecting to peer"
                         );
 
-                        match node_clone.connect_to(ticket.clone()).await {
+                        match node_clone.connect_to_quiet(ticket.clone()).await {
                             Ok(()) => break,
                             Err(e) => {
                                 if attempt == MAX_RETRIES {
@@ -1070,7 +1075,7 @@ impl UIExecuter {
                                         "Attempting auto-reconnect after disconnect"
                                     );
 
-                                    match node_clone.connect_to(ticket.clone()).await {
+                                    match node_clone.connect_to_quiet(ticket.clone()).await {
                                         Ok(()) => {
                                             info!(
                                                 event = "auto_reconnect_success",
