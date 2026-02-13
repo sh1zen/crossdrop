@@ -428,7 +428,7 @@ impl UIExecuter {
 
         // Linea di aiuto basata sulla modalità
         let help = match mode {
-            Mode::Home => "Up/Down: navigate | Enter: select | c: copy ticket | Esc: quit",
+            Mode::Home => "Up/Down: navigate | Enter: select ",
             Mode::Chat => "Enter: send | /help: commands | Tab/Shift+Tab: switch chat | Esc: back",
             Mode::Send => "Enter: send file/folder | Tab/Up/Down: peer | Esc: back",
             Mode::Connect => "Enter: connect | Esc: back",
