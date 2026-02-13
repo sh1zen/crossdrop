@@ -1626,7 +1626,9 @@ impl UIExecuter {
     /// This is the ONLY place where the UI layer talks to the network
     /// for transfer-related operations.
     async fn execute_engine_actions(&mut self, node: &PeerNode, actions: Vec<EngineAction>) {
-        for action in actions {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<EngineAction> = actions.into();
+        while let Some(action) = queue.pop_front() {
             match action {
                 EngineAction::SendTransactionRequest {
                     peer_id,
@@ -1899,14 +1901,59 @@ impl UIExecuter {
                     path,
                     is_folder,
                 } => {
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        if is_folder {
-                            let _ = node.offer_folder(&peer_id, &path).await;
-                        } else {
-                            let _ = node.offer_file(&peer_id, &path).await;
+                    if is_folder {
+                        // Collect folder metadata (paths + sizes) without reading contents
+                        match collect_folder_metadata(&path).await {
+                            Ok((dirname, files)) => {
+                                if files.is_empty() {
+                                    tracing::warn!("Remote fetch: folder '{}' is empty", path);
+                                } else {
+                                    match self.app.engine.initiate_folder_send(&peer_id, &dirname, files, &path) {
+                                        Ok(outcome) => {
+                                            if let Some(status) = outcome.status {
+                                                self.app.notify.info(status);
+                                            }
+                                            for a in outcome.actions {
+                                                queue.push_back(a);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Remote fetch: failed to initiate folder send for '{}': {}", path, e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Remote fetch: failed to read folder metadata for '{}': {}", path, e);
+                            }
                         }
-                    });
+                    } else {
+                        match tokio::fs::metadata(&path).await {
+                            Ok(meta) => {
+                                let filesize = meta.len();
+                                let filename = std::path::Path::new(&path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "file".to_string());
+                                match self.app.engine.initiate_file_send(&peer_id, &filename, filesize, &path) {
+                                    Ok(outcome) => {
+                                        if let Some(status) = outcome.status {
+                                            self.app.notify.info(status);
+                                        }
+                                        for a in outcome.actions {
+                                            queue.push_back(a);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Remote fetch: failed to initiate file send for '{}': {}", path, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Remote fetch: failed to read file metadata for '{}': {}", path, e);
+                            }
+                        }
+                    }
                 }
                 EngineAction::AcceptLegacyFileOffer {
                     peer_id,
@@ -1931,4 +1978,48 @@ impl UIExecuter {
             }
         }
     }
+}
+
+/// Collect folder file metadata (relative paths + sizes) without reading file contents.
+/// Returns `(dirname, Vec<(relative_path, filesize)>)`.
+async fn collect_folder_metadata(folder_path: &str) -> anyhow::Result<(String, Vec<(String, u64)>)> {
+    use std::path::Path;
+
+    let root = Path::new(folder_path).to_path_buf();
+    let dirname = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "folder".to_string());
+
+    let mut files = Vec::new();
+    collect_folder_metadata_recursive(&root, &root, &mut files).await?;
+    Ok((dirname, files))
+}
+
+/// Recursively collect (relative_path, filesize) entries for a folder.
+async fn collect_folder_metadata_recursive(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    files: &mut Vec<(String, u64)>,
+) -> anyhow::Result<()> {
+    let mut entries = tokio::fs::read_dir(current).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            Box::pin(collect_folder_metadata_recursive(root, &path, files)).await?;
+        } else if file_type.is_file() {
+            let meta = tokio::fs::metadata(&path).await?;
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.push((relative, meta.len()));
+        }
+    }
+    Ok(())
 }

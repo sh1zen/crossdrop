@@ -1324,7 +1324,6 @@ impl WebRTCConnection {
     }
 
     /// Access the `SessionKeyManager` if one was established during handshake.
-    #[allow(dead_code)]
     pub fn key_manager(&self) -> Option<&SessionKeyManager> {
         self.key_manager.as_ref()
     }
