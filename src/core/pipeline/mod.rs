@@ -4,4 +4,7 @@
 //! pipeline with integrity verification, compression, and encryption.
 
 pub mod chunk;
+pub mod chunk_sizer;
 pub mod merkle;
+pub mod receiver;
+pub mod sender;

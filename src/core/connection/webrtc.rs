@@ -2,11 +2,13 @@
 //! - Uses compact binary framing for file chunks (no JSON overhead)
 //! - JSON-serialized ChannelPayload for control messages only
 //! - File transfer protocol: FileOffer -> FileResponse -> Metadata -> Chunk* -> Hash -> HashResult
-//! - Chunked transfer with ACK, pipelined 8 at a time, SHA3-256 verification
+//! - Chunked transfer pipelined in batches, SHA3-256 verification
+//! - Reliable delivery delegated to WebRTC SCTP (no application-level ACKs)
 //! - AES-256-GCM encryption with per-peer keys
-//! - Brotli compression before encryption (File → Compress → Encrypt → Send)
+//! - Brotli compression for control messages only (chunks skip compression)
 
 use crate::core::connection::crypto::SessionKeyManager;
+use crate::core::pipeline::receiver::StreamingFileWriter;
 use crate::core::security::message_auth::{AuthenticatedMessage, MessageAuthenticator};
 use crate::core::transaction::{ResumeInfo, TransactionManifest};
 use aes_gcm::{
@@ -17,7 +19,6 @@ use anyhow::{anyhow, Context, Result};
 use brotli::{CompressorWriter, Decompressor};
 use bytes::{BufMut, Bytes};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -28,10 +29,11 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::{SettingEngine, SctpMaxMessageSize};
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
@@ -47,8 +49,8 @@ use webrtc::peer_connection::RTCPeerConnection;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 use crate::core::config::{
-    CHUNK_ACK_TIMEOUT, CHUNK_SIZE, CONNECTION_TIMEOUT, DATA_CHANNEL_TIMEOUT, ICE_GATHER_TIMEOUT,
-    MAX_SEND_RETRIES as MAX_RETRIES, PIPELINE_SIZE,
+    CHUNK_SIZE, CONNECTION_TIMEOUT, DATA_CHANNEL_TIMEOUT, ICE_GATHER_TIMEOUT,
+    MAX_PENDING_CHUNKS_PER_FILE, MAX_PENDING_FILE_IDS, PIPELINE_SIZE,
 };
 
 // ── Binary Frame Format ──────────────────────────────────────────────────────
@@ -60,14 +62,14 @@ use crate::core::config::{
 // Frame types:
 //   0x01 = Control (JSON-encoded ControlMessage)
 //   0x02 = Chunk   (binary: 16 bytes file_id + 4 bytes seq + raw data)
-//   0x03 = Ack     (binary: 16 bytes file_id + 4 bytes seq)
 //
 // This eliminates JSON+base64 overhead for bulk data transfer.
-// A 48KB chunk costs exactly 48KB + 21 bytes overhead instead of ~130KB with JSON+base64.
+// A 256 KB chunk costs 256 KB + 21 bytes framing + 29 bytes AES-GCM envelope
+// instead of ~700 KB with JSON+base64.
+// Reliable delivery is guaranteed by WebRTC's SCTP layer (no application-level ACKs).
 
 const FRAME_CONTROL: u8 = 0x01;
 const FRAME_CHUNK: u8 = 0x02;
-const FRAME_ACK: u8 = 0x03;
 
 /// Well-known channel ID used as `transaction_id` in [`AuthenticatedMessage`]
 /// for chat HMAC authentication. Provides domain separation from file-transfer
@@ -254,18 +256,8 @@ pub enum ConnectionMessage {
 
 // ── Internal state ───────────────────────────────────────────────────────────
 
-struct SendFileState {
-    pending_acks: HashMap<u32, oneshot::Sender<()>>,
-}
-
 struct ReceiveFileState {
-    filename: String,
-    total_chunks: u32,
-    received_chunks: u32,
-    buffer: Vec<u8>,
-    dest_path: Option<PathBuf>,
-    /// Per-chunk SHA3-256 hashes collected incrementally for Merkle tree.
-    chunk_hashes: Vec<Option<[u8; 32]>>,
+    writer: StreamingFileWriter,
 }
 
 // ── Encryption helpers ───────────────────────────────────────────────────────
@@ -330,15 +322,6 @@ fn encode_chunk_frame(file_id: Uuid, seq: u32, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Encode a binary ack frame: [0x03][16 bytes uuid][4 bytes seq BE]
-fn encode_ack_frame(file_id: Uuid, seq: u32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 16 + 4);
-    buf.put_u8(FRAME_ACK);
-    buf.extend_from_slice(file_id.as_bytes());
-    buf.put_u32(seq);
-    buf
-}
-
 /// Encode a control frame: [0x01][json bytes]
 fn encode_control_frame(msg: &ControlMessage) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)?;
@@ -363,7 +346,6 @@ pub struct WebRTCConnection {
     control_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
     data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
     app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
-    send_state: Arc<RwLock<HashMap<Uuid, SendFileState>>>,
     _recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
     _pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>>,
     accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
@@ -397,7 +379,14 @@ impl WebRTCConnection {
     async fn create_webrtc_api() -> Result<webrtc::api::API> {
         let mut me = MediaEngine::default();
         let reg = register_default_interceptors(Registry::new(), &mut me)?;
+
+        // Raise SCTP send limit so 256 KB+ chunks survive compression
+        // expansion + AES-GCM overhead without hitting the default 64 KB cap.
+        let mut se = SettingEngine::default();
+        se.set_sctp_max_message_size_can_send(SctpMaxMessageSize::Unbounded);
+
         Ok(APIBuilder::new()
+            .with_setting_engine(se)
             .with_media_engine(me)
             .with_interceptor_registry(reg)
             .build())
@@ -509,7 +498,6 @@ impl WebRTCConnection {
 
         let control_channel_lock = Arc::new(RwLock::new(None));
         let data_channel_lock = Arc::new(RwLock::new(None));
-        let send_state = Arc::new(RwLock::new(HashMap::new()));
         let recv_state = Arc::new(RwLock::new(HashMap::new()));
         let pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -522,11 +510,16 @@ impl WebRTCConnection {
         let chat_send_counter = Arc::new(RwLock::new(0u64));
         let chat_recv_counter = Arc::new(RwLock::new(0u64));
 
-        let cdc = pc.create_data_channel("control", None).await?;
+        // Explicit ordered + fully reliable (SCTP default, no partial reliability).
+        // Not setting max_retransmits / max_packet_life_time = unlimited retransmits.
+        let dc_init = Some(RTCDataChannelInit {
+            ordered: Some(true),
+            ..Default::default()
+        });
+        let cdc = pc.create_data_channel("control", dc_init.clone()).await?;
         let ra = Arc::new(remote_access);
         Self::attach_dc_handlers(
             &cdc,
-            send_state.clone(),
             recv_state.clone(),
             pending_chunks.clone(),
             accepted_destinations.clone(),
@@ -540,10 +533,9 @@ impl WebRTCConnection {
         .await;
         *control_channel_lock.write().await = Some(cdc);
 
-        let ddc = pc.create_data_channel("data", None).await?;
+        let ddc = pc.create_data_channel("data", dc_init).await?;
         Self::attach_dc_handlers(
             &ddc,
-            send_state.clone(),
             recv_state.clone(),
             pending_chunks.clone(),
             accepted_destinations.clone(),
@@ -567,7 +559,6 @@ impl WebRTCConnection {
                 control_channel: control_channel_lock,
                 data_channel: data_channel_lock,
                 app_tx,
-                send_state,
                 _recv_state: recv_state,
                 _pending_chunks: pending_chunks,
                 accepted_destinations,
@@ -642,7 +633,6 @@ impl WebRTCConnection {
 
         let control_channel_lock = Arc::new(RwLock::new(None));
         let data_channel_lock = Arc::new(RwLock::new(None));
-        let send_state = Arc::new(RwLock::new(HashMap::new()));
         let recv_state = Arc::new(RwLock::new(HashMap::new()));
         let pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -651,7 +641,6 @@ impl WebRTCConnection {
         {
             let cl = control_channel_lock.clone();
             let dl = data_channel_lock.clone();
-            let ss = send_state.clone();
             let rs = recv_state.clone();
             let pc_chunks = pending_chunks.clone();
             let ad = accepted_destinations.clone();
@@ -671,7 +660,6 @@ impl WebRTCConnection {
             pc.on_data_channel(Box::new(move |dc| {
                 let cl = cl.clone();
                 let dl = dl.clone();
-                let ss = ss.clone();
                 let rs = rs.clone();
                 let pc_chunks = pc_chunks.clone();
                 let ad = ad.clone();
@@ -682,7 +670,7 @@ impl WebRTCConnection {
                 let pr = pr.clone();
                 let crc = crc.clone();
                 Box::pin(async move {
-                    Self::attach_dc_handlers(&dc, ss, rs, pc_chunks, ad, atx, sk, ra, km, pr, crc)
+                    Self::attach_dc_handlers(&dc, rs, pc_chunks, ad, atx, sk, ra, km, pr, crc)
                         .await;
                     let label = dc.label().to_string();
                     if label == "control" {
@@ -710,7 +698,6 @@ impl WebRTCConnection {
                     control_channel: control_channel_lock,
                     data_channel: data_channel_lock,
                     app_tx,
-                    send_state,
                     _recv_state: recv_state,
                     _pending_chunks: pending_chunks,
                     accepted_destinations,
@@ -808,22 +795,43 @@ impl WebRTCConnection {
     // ── Send helpers ─────────────────────────────────────────────────────────
 
     /// Send an encrypted frame on the given data channel.
-    /// Pipeline: plaintext → compress → encrypt → send
+    ///
+    /// Wire envelope: `encrypt( [1-byte compress flag] + [payload] )`
+    ///
+    /// When `compress` is **true** the payload is brotli-compressed before
+    /// encryption (good for small JSON control messages).  When **false** the
+    /// raw payload is sent as-is (avoids wasting CPU on already-compressed
+    /// file data and prevents brotli from *expanding* incompressible content).
     async fn send_encrypted(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
         plaintext: &[u8],
+        compress: bool,
     ) -> Result<usize> {
         if dc.ready_state() != RTCDataChannelState::Open {
             warn!(event = "send_channel_not_open", state = ?dc.ready_state(), "Attempted send on non-open data channel");
             return Err(anyhow!("Data channel not open: {:?}", dc.ready_state()));
         }
-        let compressed = compress_data(plaintext).map_err(|e| {
-            error!(event = "compress_failure", bytes = plaintext.len(), error = %e, "Compression failed before send");
-            e
-        })?;
-        let encrypted = encrypt(key, &compressed).map_err(|e| {
-            error!(event = "encrypt_failure", bytes = compressed.len(), error = %e, "Encryption failed before send");
+
+        // Build envelope: [compress_flag] + [maybe_compressed_plaintext]
+        let envelope = if compress {
+            let compressed = compress_data(plaintext).map_err(|e| {
+                error!(event = "compress_failure", bytes = plaintext.len(), error = %e, "Compression failed before send");
+                e
+            })?;
+            let mut env = Vec::with_capacity(1 + compressed.len());
+            env.push(0x01);
+            env.extend_from_slice(&compressed);
+            env
+        } else {
+            let mut env = Vec::with_capacity(1 + plaintext.len());
+            env.push(0x00);
+            env.extend_from_slice(plaintext);
+            env
+        };
+
+        let encrypted = encrypt(key, &envelope).map_err(|e| {
+            error!(event = "encrypt_failure", bytes = envelope.len(), error = %e, "Encryption failed before send");
             e
         })?;
         let wire_bytes = encrypted.len();
@@ -841,7 +849,7 @@ impl WebRTCConnection {
             .ok_or_else(|| anyhow!("Control channel not available"))?;
         let frame = encode_control_frame(msg)?;
         let key = *self.shared_key.read().await;
-        Self::send_encrypted(&dc, &key, &frame).await?;
+        Self::send_encrypted(&dc, &key, &frame, true).await?;
         Ok(())
     }
 
@@ -852,12 +860,14 @@ impl WebRTCConnection {
         msg: &ControlMessage,
     ) -> Result<()> {
         let frame = encode_control_frame(msg)?;
-        Self::send_encrypted(dc, key, &frame).await?;
+        Self::send_encrypted(dc, key, &frame, true).await?;
         Ok(())
     }
 
     /// Send a binary chunk frame on the data channel.
-    /// Returns the number of bytes sent on the wire (post-compression, post-encryption).
+    /// Returns the number of bytes sent on the wire (post-encryption).
+    /// Chunks are sent **without** brotli compression — file data is
+    /// typically already compressed and brotli would just add latency.
     async fn send_chunk(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
@@ -866,19 +876,7 @@ impl WebRTCConnection {
         payload: &[u8],
     ) -> Result<usize> {
         let frame = encode_chunk_frame(file_id, seq, payload);
-        Self::send_encrypted(dc, key, &frame).await
-    }
-
-    /// Send a binary ack frame on the data channel.
-    async fn send_ack(
-        dc: &Arc<RTCDataChannel>,
-        key: &[u8; 32],
-        file_id: Uuid,
-        seq: u32,
-    ) -> Result<()> {
-        let frame = encode_ack_frame(file_id, seq);
-        Self::send_encrypted(dc, key, &frame).await?;
-        Ok(())
+        Self::send_encrypted(dc, key, &frame, false).await
     }
 
     // ── Public send API ──────────────────────────────────────────────────────
@@ -923,27 +921,37 @@ impl WebRTCConnection {
         self.send_control(&ControlMessage::DisplayName(name)).await
     }
 
-    /// Send file bytes with chunking, ACK pipelining, and hash verification.
+    /// Send a file from disk with streaming read-ahead — no full-file memory allocation.
+    ///
+    /// Uses `pipeline::sender::spawn_reader` to prefetch chunks from disk into
+    /// a bounded channel, and an `AdaptiveChunkSizer` to dynamically tune
+    /// chunk size based on measured throughput.
     pub async fn send_file(
         &self,
         file_id: Uuid,
-        file_bytes: Vec<u8>,
+        file_path: impl Into<PathBuf>,
+        filesize: u64,
         filename: impl Into<String>,
     ) -> Result<()> {
-        self.send_file_resuming(file_id, file_bytes, filename, 0)
+        self.send_file_resuming(file_id, file_path, filesize, filename, 0)
             .await
     }
 
-    /// Send file bytes, skipping the first `start_chunk` chunks (for resume).
+    /// Send a file from disk, skipping the first `start_chunk` chunks (for resume).
     /// Chunks 0..start_chunk are still hashed but NOT transmitted.
+    ///
+    /// Streaming: reads chunks from disk via a prefetch buffer, never holds the
+    /// entire file in memory.
     pub async fn send_file_resuming(
         &self,
         file_id: Uuid,
-        file_bytes: Vec<u8>,
+        file_path: impl Into<PathBuf>,
+        filesize: u64,
         filename: impl Into<String>,
         start_chunk: u32,
     ) -> Result<()> {
         let filename = filename.into();
+        let file_path = file_path.into();
         self.wait_data_channels_open().await?;
 
         let dc = self
@@ -953,8 +961,8 @@ impl WebRTCConnection {
             .clone()
             .ok_or_else(|| anyhow!("Data channel not available"))?;
 
-        let filesize = file_bytes.len() as u64;
-        let total_chunks = ((filesize as f64) / (CHUNK_SIZE as f64)).ceil().max(1.0) as u32;
+        let chunk_size = CHUNK_SIZE;
+        let total_chunks = ((filesize as f64) / (chunk_size as f64)).ceil().max(1.0) as u32;
 
         // Send metadata on control channel first — receiver needs this
         // to create ReceiveFileState before chunks arrive.
@@ -970,123 +978,48 @@ impl WebRTCConnection {
         // The receiver also buffers early-arriving chunks, so this is best-effort.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let send_state = SendFileState {
-            pending_acks: HashMap::with_capacity(total_chunks as usize),
-        };
-        self.send_state.write().await.insert(file_id, send_state);
-
-        let mut hasher = Sha3_256::new();
-        let mut chunk_hashes: Vec<[u8; 32]> = Vec::with_capacity(total_chunks as usize);
         info!(event = "file_send_start", file_id = %file_id, filename = %filename, filesize, total_chunks, start_chunk, "Starting file send");
 
+        // Spawn disk reader with prefetch buffer
+        let (mut chunk_rx, reader_handle) = crate::core::pipeline::sender::spawn_reader(
+            file_path,
+            filesize,
+            total_chunks,
+            chunk_size,
+            start_chunk,
+        );
+
         let mut sent_chunks: u32 = start_chunk;
-        let mut _total_wire_bytes: u64 = 0;
         let key_lock = self.shared_key.clone();
+        let mut batch_wire_bytes: u64 = 0;
+        let mut batch_count: u32 = 0;
 
-        for chunk_batch in (0..total_chunks).collect::<Vec<_>>().chunks(PIPELINE_SIZE) {
-            let mut chunks_data: Vec<(u32, Vec<u8>)> = Vec::new();
+        // Drain prefetched chunks and send them
+        while let Some(read_chunk) = chunk_rx.recv().await {
+            let key = *key_lock.read().await;
+            let wb = Self::send_chunk(&dc, &key, file_id, read_chunk.seq, &read_chunk.data).await?;
+            batch_wire_bytes += wb as u64;
+            batch_count += 1;
+            sent_chunks += 1;
 
-            for &seq in chunk_batch {
-                let start = (seq as usize) * CHUNK_SIZE;
-                let end = std::cmp::min(start + CHUNK_SIZE, file_bytes.len());
-                let chunk = file_bytes[start..end].to_vec();
-                hasher.update(&chunk);
-
-                // Compute per-chunk SHA3-256 hash for Merkle tree
-                {
-                    let mut ch = Sha3_256::new();
-                    ch.update(&chunk);
-                    let result = ch.finalize();
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&result);
-                    chunk_hashes.push(hash);
+            // Report progress every PIPELINE_SIZE chunks
+            if batch_count >= PIPELINE_SIZE as u32 {
+                if let Some(tx) = &self.app_tx {
+                    let _ = tx.send(ConnectionMessage::SendProgress {
+                        file_id,
+                        filename: filename.clone(),
+                        sent_chunks,
+                        total_chunks,
+                        wire_bytes: batch_wire_bytes,
+                    });
                 }
-
-                // Skip already-received chunks (for resume)
-                if seq >= start_chunk {
-                    chunks_data.push((seq, chunk));
-                }
+                batch_wire_bytes = 0;
+                batch_count = 0;
             }
+        }
 
-            let mut remaining = chunks_data;
-            let mut retries = 0;
-            let mut batch_wire_bytes: u64 = 0;
-
-            while !remaining.is_empty() && retries < MAX_RETRIES {
-                let mut tasks: Vec<(u32, tokio::task::JoinHandle<Result<usize>>)> = Vec::new();
-
-                for (seq, chunk) in &remaining {
-                    let (ack_tx, ack_rx) = oneshot::channel();
-                    let seq = *seq;
-                    let chunk = chunk.clone();
-
-                    if let Some(state) = self.send_state.write().await.get_mut(&file_id) {
-                        state.pending_acks.insert(seq, ack_tx);
-                    }
-
-                    let dc_c = dc.clone();
-                    let kl = key_lock.clone();
-                    tasks.push((
-                        seq,
-                        tokio::spawn(async move {
-                            let key = *kl.read().await;
-                            let wb = Self::send_chunk(&dc_c, &key, file_id, seq, &chunk).await?;
-                            timeout(CHUNK_ACK_TIMEOUT, ack_rx)
-                                .await
-                                .map_err(|_| anyhow!("ACK timeout for chunk {}", seq))?
-                                .map_err(|_| anyhow!("ACK channel closed for chunk {}", seq))?;
-                            Ok(wb)
-                        }),
-                    ));
-                }
-
-                let mut failed: Vec<u32> = Vec::new();
-                for (seq, task) in tasks {
-                    match task.await {
-                        Ok(Ok(wb)) => {
-                            batch_wire_bytes += wb as u64;
-                        }
-                        Ok(Err(e)) => {
-                            warn!(
-                                "Chunk {} failed: {}, retry {}/{}",
-                                seq,
-                                e,
-                                retries + 1,
-                                MAX_RETRIES
-                            );
-                            failed.push(seq);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Chunk {} panic: {}, retry {}/{}",
-                                seq,
-                                e,
-                                retries + 1,
-                                MAX_RETRIES
-                            );
-                            failed.push(seq);
-                        }
-                    }
-                }
-
-                remaining.retain(|(s, _)| failed.contains(s));
-                if !failed.is_empty() {
-                    retries += 1;
-                }
-            }
-
-            if !remaining.is_empty() {
-                error!(event = "chunk_send_exhausted", file_id = %file_id, retries = MAX_RETRIES, failed_chunks = remaining.len(), "Chunk send failed after max retries");
-                return Err(anyhow!(
-                    "Failed to send chunks after {} retries",
-                    MAX_RETRIES
-                ));
-            }
-
-            _total_wire_bytes += batch_wire_bytes;
-            // Only count chunks that were actually sent (not skipped)
-            let sent_in_batch = chunk_batch.iter().filter(|&&s| s >= start_chunk).count() as u32;
-            sent_chunks += sent_in_batch;
+        // Report any remaining progress
+        if batch_count > 0 {
             if let Some(tx) = &self.app_tx {
                 let _ = tx.send(ConnectionMessage::SendProgress {
                     file_id,
@@ -1098,17 +1031,22 @@ impl WebRTCConnection {
             }
         }
 
+        // Wait for the reader to finish and get hash results
+        let reader_result = reader_handle
+            .await
+            .map_err(|e| anyhow!("Reader task panicked: {}", e))?
+            .map_err(|e| anyhow!("Reader error: {}", e))?;
+
         // Send final hash + Merkle root on control channel
-        let final_hash = hasher.finalize();
-        let merkle_tree = crate::core::pipeline::merkle::MerkleTree::build(&chunk_hashes);
+        let merkle_tree =
+            crate::core::pipeline::merkle::MerkleTree::build(&reader_result.chunk_hashes);
         self.send_control(&ControlMessage::Hash {
             file_id,
-            sha3_256: final_hash.to_vec(),
+            sha3_256: reader_result.sha3_256,
             merkle_root: Some(*merkle_tree.root()),
         })
         .await?;
 
-        self.send_state.write().await.remove(&file_id);
         Ok(())
     }
 
@@ -1214,7 +1152,6 @@ impl WebRTCConnection {
 
     async fn attach_dc_handlers(
         dc: &Arc<RTCDataChannel>,
-        send_state: Arc<RwLock<HashMap<Uuid, SendFileState>>>,
         recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
         pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>>,
         accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
@@ -1226,7 +1163,6 @@ impl WebRTCConnection {
         chat_recv_counter: Arc<RwLock<u64>>,
     ) {
         let dc_clone = dc.clone();
-        let ss = send_state;
         let rs = recv_state;
         let pc = pending_chunks;
         let ad = accepted_destinations;
@@ -1238,7 +1174,6 @@ impl WebRTCConnection {
         let crc = chat_recv_counter;
 
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            let ss = ss.clone();
             let rs = rs.clone();
             let pc = pc.clone();
             let ad = ad.clone();
@@ -1262,14 +1197,24 @@ impl WebRTCConnection {
                     }
                 };
 
-                // Decompress (Receive → Decrypt → Decompress → Process)
-                let plaintext = match decompress_data(&decrypted) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!(event = "decompress_failure", bytes = decrypted.len(), error = %e, "Decompression failed on incoming frame");
-                        notify_app(&atx, ConnectionMessage::Error(format!("Decompress error: {}", e)));
-                        return;
+                // Envelope: [1-byte compress flag] + [payload]
+                if decrypted.is_empty() {
+                    return;
+                }
+                let compress_flag = decrypted[0];
+                let inner = &decrypted[1..];
+
+                let plaintext = if compress_flag == 0x01 {
+                    match decompress_data(inner) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!(event = "decompress_failure", bytes = inner.len(), error = %e, "Decompression failed on incoming frame");
+                            notify_app(&atx, ConnectionMessage::Error(format!("Decompress error: {}", e)));
+                            return;
+                        }
                     }
+                } else {
+                    inner.to_vec()
                 };
 
                 let wire_bytes = msg.data.len() as u64;
@@ -1287,7 +1232,6 @@ impl WebRTCConnection {
                             if let Err(e) = Self::handle_control(
                                 &dc,
                                 ctrl,
-                                ss,
                                 rs,
                                 pc,
                                 ad,
@@ -1327,61 +1271,41 @@ impl WebRTCConnection {
 
                         let mut map = rs.write().await;
                         if let Some(state) = map.get_mut(&file_id) {
-                            let start = (seq as usize) * CHUNK_SIZE;
-                            let end = start + chunk_data.len();
-                            if end <= state.buffer.len() {
-                                state.buffer[start..end].copy_from_slice(chunk_data);
-                                state.received_chunks += 1;
-
-                                // Hash raw chunk for incremental Merkle tree
-                                if (seq as usize) < state.chunk_hashes.len() {
-                                    let mut ch = Sha3_256::new();
-                                    ch.update(chunk_data);
-                                    let r = ch.finalize();
-                                    let mut h = [0u8; 32];
-                                    h.copy_from_slice(&r);
-                                    state.chunk_hashes[seq as usize] = Some(h);
+                            match state.writer.write_chunk(seq, chunk_data).await {
+                                Ok(()) => {
+                                    if let Some(tx) = &atx {
+                                        let _ = tx.send(ConnectionMessage::FileProgress {
+                                            file_id,
+                                            filename: state.writer.filename().to_string(),
+                                            received_chunks: state.writer.received_chunks(),
+                                            total_chunks: state.writer.total_chunks(),
+                                            wire_bytes,
+                                        });
+                                    }
                                 }
-
-                                if let Some(tx) = &atx {
-                                    let _ = tx.send(ConnectionMessage::FileProgress {
-                                        file_id,
-                                        filename: state.filename.clone(),
-                                        received_chunks: state.received_chunks,
-                                        total_chunks: state.total_chunks,
-                                        wire_bytes,
-                                    });
+                                Err(e) => {
+                                    error!("Chunk {} for {} write error: {}", seq, file_id, e);
                                 }
-                            } else {
-                                error!("Chunk {} for {} out of bounds", seq, file_id);
                             }
 
-                            // Only ACK if we actually tracked this chunk
-                            drop(map);
-                            let ack_key = *sk.read().await;
-                            if let Err(e) = Self::send_ack(&dc, &ack_key, file_id, seq).await {
-                                warn!("Failed to send ACK for chunk {}: {}", seq, e);
-                            }
                         } else {
-                            // Chunk arrived before Metadata — buffer it and ACK later
+                            // Chunk arrived before Metadata — buffer with DoS bounds
                             drop(map);
-                            tracing::debug!("Chunk {} for file {} buffered — Metadata not yet received", seq, file_id);
                             let mut pending = pc.write().await;
-                            pending.entry(file_id).or_default().push((seq, chunk_data.to_vec()));
-                        }
-                    }
-                    FRAME_ACK => {
-                        if payload.len() < 20 {
-                            return;
-                        }
-                        let file_id = Uuid::from_bytes(payload[..16].try_into().unwrap());
-                        let seq = u32::from_be_bytes(payload[16..20].try_into().unwrap());
-
-                        let mut map = ss.write().await;
-                        if let Some(st) = map.get_mut(&file_id) {
-                            if let Some(tx) = st.pending_acks.remove(&seq) {
-                                let _ = tx.send(());
+                            // Limit pending file IDs
+                            if !pending.contains_key(&file_id)
+                                && pending.len() >= MAX_PENDING_FILE_IDS
+                            {
+                                warn!("Dropping pre-metadata chunk for {}: too many pending file IDs", file_id);
+                                return;
                             }
+                            let entry = pending.entry(file_id).or_default();
+                            if entry.len() >= MAX_PENDING_CHUNKS_PER_FILE {
+                                warn!("Dropping pre-metadata chunk {} for {}: pending buffer full", seq, file_id);
+                                return;
+                            }
+                            tracing::debug!("Chunk {} for file {} buffered — Metadata not yet received", seq, file_id);
+                            entry.push((seq, chunk_data.to_vec()));
                         }
                     }
                     _ => {
@@ -1399,7 +1323,6 @@ impl WebRTCConnection {
     async fn handle_control(
         dc: &Arc<RTCDataChannel>,
         msg: ControlMessage,
-        _send_state: Arc<RwLock<HashMap<Uuid, SendFileState>>>,
         recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
         pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>)>>>>,
         accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
@@ -1504,37 +1427,46 @@ impl WebRTCConnection {
                     warn!(event = "zero_size_file", file_id = %file_id, filename = %filename, "Rejected file with zero size");
                     return Err(anyhow!("Cannot receive file with zero size"));
                 }
-                let dest_path = accepted_destinations.write().await.remove(&file_id);
-                tracing::debug!(
-                    "Metadata received for file {} ({}): dest_path found = {}",
-                    file_id,
-                    filename,
-                    dest_path.is_some()
-                );
-                let dest_path = dest_path.map(|dir| {
-                    let safe = sanitize_relative_path(&filename);
-                    dir.join(&safe)
-                });
+                // Compute save path
+                let dest_dir = accepted_destinations.write().await.remove(&file_id);
+                let safe_name = sanitize_relative_path(&filename);
+                let save_path = if let Some(dir) = &dest_dir {
+                    dir.join(&safe_name)
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(&safe_name)
+                };
+
                 tracing::info!(
                     "Receiving file '{}' ({} bytes, {} chunks) to: {}",
                     filename,
                     filesize,
                     total_chunks,
-                    dest_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "current dir".to_string())
+                    save_path.display()
                 );
 
-                let buffer = vec![0u8; filesize as usize];
-                let st = ReceiveFileState {
-                    filename: filename.clone(),
+                // Create streaming writer — writes chunks directly to disk
+                let writer = match StreamingFileWriter::new(
+                    filename.clone(),
+                    filesize,
                     total_chunks,
-                    received_chunks: 0,
-                    buffer,
-                    dest_path,
-                    chunk_hashes: vec![None; total_chunks as usize],
+                    save_path,
+                )
+                .await
+                {
+                    Ok(w) => w,
+                    Err(e) => {
+                        error!(
+                            event = "streaming_writer_create_failed",
+                            file_id = %file_id,
+                            filename = %filename,
+                            error = %e,
+                            "Failed to create streaming file writer"
+                        );
+                        return Err(anyhow!("Failed to create file writer: {}", e));
+                    }
                 };
+
+                let st = ReceiveFileState { writer };
                 recv_state.write().await.insert(file_id, st);
 
                 // Process any chunks that arrived before this Metadata frame
@@ -1551,43 +1483,28 @@ impl WebRTCConnection {
                     let mut map = recv_state.write().await;
                     if let Some(state) = map.get_mut(&file_id) {
                         for (seq, chunk_data) in &buffered {
-                            let start = (*seq as usize) * CHUNK_SIZE;
-                            let end = start + chunk_data.len();
-                            if end <= state.buffer.len() {
-                                state.buffer[start..end].copy_from_slice(chunk_data);
-                                state.received_chunks += 1;
-
-                                // Hash raw chunk for incremental Merkle tree
-                                if (*seq as usize) < state.chunk_hashes.len() {
-                                    let mut ch = Sha3_256::new();
-                                    ch.update(chunk_data);
-                                    let r = ch.finalize();
-                                    let mut h = [0u8; 32];
-                                    h.copy_from_slice(&r);
-                                    state.chunk_hashes[*seq as usize] = Some(h);
+                            match state.writer.write_chunk(*seq, chunk_data).await {
+                                Ok(()) => {
+                                    if let Some(tx) = &app_tx {
+                                        let _ = tx.send(ConnectionMessage::FileProgress {
+                                            file_id,
+                                            filename: state.writer.filename().to_string(),
+                                            received_chunks: state.writer.received_chunks(),
+                                            total_chunks: state.writer.total_chunks(),
+                                            wire_bytes: 0,
+                                        });
+                                    }
                                 }
-
-                                if let Some(tx) = &app_tx {
-                                    let _ = tx.send(ConnectionMessage::FileProgress {
-                                        file_id,
-                                        filename: state.filename.clone(),
-                                        received_chunks: state.received_chunks,
-                                        total_chunks: state.total_chunks,
-                                        wire_bytes: 0, // buffered chunks: wire bytes already counted
-                                    });
+                                Err(e) => {
+                                    error!(
+                                        "Buffered chunk {} for {} write error: {}",
+                                        seq, file_id, e
+                                    );
                                 }
-                            } else {
-                                error!("Buffered chunk {} for {} out of bounds", seq, file_id);
                             }
                         }
                     }
                     drop(map);
-                    // Now send ACKs for all buffered chunks
-                    for (seq, _) in &buffered {
-                        if let Err(e) = Self::send_ack(dc, &key, file_id, *seq).await {
-                            warn!("Failed to send ACK for buffered chunk {}: {}", seq, e);
-                        }
-                    }
                 }
 
                 if let Some(tx) = &app_tx {
@@ -1604,116 +1521,112 @@ impl WebRTCConnection {
             } => {
                 let mut map = recv_state.write().await;
                 if let Some(state) = map.remove(&file_id) {
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&state.buffer);
-                    let local_hash = hasher.finalize();
-                    let ok = local_hash.as_slice() == sha3_256.as_slice();
+                    // Finalize: flush to disk, read back for SHA3-256, build Merkle root
+                    match state.writer.finalize().await {
+                        Ok(finalized) => {
+                            let ok = finalized.sha3_256.as_slice() == sha3_256.as_slice();
 
-                    // Build Merkle root from incrementally collected chunk hashes
-                    let merkle_root = {
-                        let all_present = state.chunk_hashes.iter().all(|h| h.is_some());
-                        if all_present && !state.chunk_hashes.is_empty() {
-                            let leaves: Vec<[u8; 32]> =
-                                state.chunk_hashes.iter().map(|h| h.unwrap()).collect();
-                            *crate::core::pipeline::merkle::MerkleTree::build(&leaves).root()
-                        } else {
-                            [0u8; 32]
-                        }
-                    };
-
-                    // Verify Merkle root against sender's value if provided
-                    if let Some(sender_root) = sender_merkle_root {
-                        if merkle_root != sender_root {
-                            warn!(
-                                event = "merkle_root_mismatch",
-                                file_id = %file_id,
-                                filename = %state.filename,
-                                "Sender/receiver Merkle root mismatch — possible data corruption"
-                            );
-                        } else {
-                            tracing::debug!(
-                                event = "merkle_root_verified",
-                                file_id = %file_id,
-                                "Merkle root matches sender"
-                            );
-                        }
-                    }
-
-                    // Send hash result immediately (before file write) so sender
-                    // knows the verification outcome without waiting for disk I/O.
-                    Self::send_control_on(dc, &key, &ControlMessage::HashResult { file_id, ok })
-                        .await?;
-
-                    if ok {
-                        info!(event = "file_recv_verified", file_id = %file_id, filename = %state.filename, bytes = state.buffer.len(), "File received and hash verified");
-                        let save_path = if let Some(dest) = &state.dest_path {
-                            dest.clone()
-                        } else {
-                            let safe = sanitize_relative_path(&state.filename);
-                            std::env::current_dir().unwrap_or_default().join(&safe)
-                        };
-
-                        // Spawn file write in background so the control channel
-                        // is immediately free to process the next file's Metadata.
-                        let app_tx_clone = app_tx.clone();
-                        let filename = state.filename.clone();
-                        let buffer = state.buffer;
-                        tokio::spawn(async move {
-                            if let Some(parent) = save_path.parent() {
-                                if !parent.exists() {
-                                    let _ = fs::create_dir_all(parent).await;
+                            // Verify Merkle root against sender's value if provided
+                            if let Some(sender_root) = sender_merkle_root {
+                                if finalized.merkle_root != sender_root {
+                                    warn!(
+                                        event = "merkle_root_mismatch",
+                                        file_id = %file_id,
+                                        filename = %finalized.filename,
+                                        "Sender/receiver Merkle root mismatch — possible data corruption"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        event = "merkle_root_verified",
+                                        file_id = %file_id,
+                                        "Merkle root matches sender"
+                                    );
                                 }
                             }
-                            let temp_path = save_path.with_extension(".tmp");
-                            match fs::write(&temp_path, &buffer).await {
-                                Ok(()) => match tokio::fs::rename(&temp_path, &save_path).await {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            "File receive complete: {} ({} bytes)",
-                                            filename,
-                                            buffer.len()
-                                        );
-                                        if let Some(tx) = &app_tx_clone {
-                                            let _ = tx.send(ConnectionMessage::FileSaved {
-                                                file_id,
+
+                            // Send hash result immediately so sender knows the
+                            // outcome without waiting for the atomic rename.
+                            Self::send_control_on(
+                                dc,
+                                &key,
+                                &ControlMessage::HashResult { file_id, ok },
+                            )
+                            .await?;
+
+                            if ok {
+                                info!(
+                                    event = "file_recv_verified",
+                                    file_id = %file_id,
+                                    filename = %finalized.filename,
+                                    bytes = finalized.filesize,
+                                    "File received and hash verified"
+                                );
+
+                                let filename = finalized.filename.clone();
+                                let filesize = finalized.filesize;
+                                let merkle_root = finalized.merkle_root;
+                                let app_tx_clone = app_tx.clone();
+
+                                // Commit (atomic rename) in background so the
+                                // control channel is immediately free.
+                                tokio::spawn(async move {
+                                    match finalized.commit().await {
+                                        Ok(save_path) => {
+                                            tracing::info!(
+                                                "File receive complete: {} ({} bytes)",
                                                 filename,
-                                                path: save_path.to_string_lossy().to_string(),
-                                                merkle_root,
-                                            });
+                                                filesize
+                                            );
+                                            if let Some(tx) = &app_tx_clone {
+                                                let _ = tx.send(ConnectionMessage::FileSaved {
+                                                    file_id,
+                                                    filename,
+                                                    path: save_path.to_string_lossy().to_string(),
+                                                    merkle_root,
+                                                });
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to commit file {}: {}", filename, e);
+                                            if let Some(tx) = &app_tx_clone {
+                                                let _ = tx.send(ConnectionMessage::Error(format!(
+                                                    "Failed to save {}: {}",
+                                                    filename, e
+                                                )));
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        error!(
-                                            "Failed to rename temp file for {}: {}",
-                                            filename, e
-                                        );
-                                        let _ = std::fs::remove_file(&temp_path);
-                                        if let Some(tx) = &app_tx_clone {
-                                            let _ = tx.send(ConnectionMessage::Error(format!(
-                                                "Failed to save {}: {}",
-                                                filename, e
-                                            )));
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Failed to write temp file for {}: {}", filename, e);
-                                    if let Some(tx) = &app_tx_clone {
-                                        let _ = tx.send(ConnectionMessage::Error(format!(
-                                            "Failed to save {}: {}",
-                                            filename, e
-                                        )));
-                                    }
+                                });
+                            } else {
+                                let failed_name = finalized.filename.clone();
+                                error!(
+                                    event = "file_integrity_failure",
+                                    file_id = %file_id,
+                                    filename = %failed_name,
+                                    "File integrity check failed: hash mismatch"
+                                );
+                                finalized.abort().await;
+                                if let Some(tx) = &app_tx {
+                                    let _ = tx.send(ConnectionMessage::Error(format!(
+                                        "Hash mismatch for {}",
+                                        failed_name
+                                    )));
                                 }
                             }
-                        });
-                    } else {
-                        error!(event = "file_integrity_failure", file_id = %file_id, filename = %state.filename, "File integrity check failed: hash mismatch");
-                        if let Some(tx) = &app_tx {
-                            let _ = tx.send(ConnectionMessage::Error(format!(
-                                "Hash mismatch for {}",
-                                state.filename
-                            )));
+                        }
+                        Err(e) => {
+                            error!(
+                                event = "file_finalize_failed",
+                                file_id = %file_id,
+                                error = %e,
+                                "Failed to finalize received file"
+                            );
+                            if let Some(tx) = &app_tx {
+                                let _ = tx.send(ConnectionMessage::Error(format!(
+                                    "Failed to finalize file: {}",
+                                    e
+                                )));
+                            }
                         }
                     }
                 }

@@ -884,7 +884,8 @@ impl PeerNode {
         file_path: &str,
         filename: &str,
     ) -> Result<()> {
-        let file_bytes = tokio::fs::read(file_path).await?;
+        let metadata = tokio::fs::metadata(file_path).await?;
+        let filesize = metadata.len();
 
         let conn = {
             let peers = self.peers.lock().await;
@@ -898,26 +899,23 @@ impl PeerNode {
         tracing::info!(
             "Sending file '{}' ({} bytes) to {} [txn file_id={}]",
             filename,
-            file_bytes.len(),
+            filesize,
             peer_id,
             file_id
         );
-        conn.send_file(file_id, file_bytes, filename).await
+        conn.send_file(file_id, std::path::PathBuf::from(file_path), filesize, filename).await
     }
 
     /// Send multiple files for a folder transfer using Transaction file_ids.
-    /// Uses a parallel preparation pipeline: while file N is sending,
-    /// files N+1..N+k are being read from disk asynchronously.
-    /// Memory is bounded by prefetching at most MAX_PREFETCH_FILES files
-    /// whose cumulative size stays under MAX_PREFETCH_BYTES.
+    /// Each file is streamed from disk — never loaded fully into memory.
+    /// Files are sent sequentially; within each file, the sender pipeline
+    /// uses read-ahead buffering to keep the data channel saturated.
     pub async fn send_folder_data(
         &self,
         peer_id: &str,
         folder_path: &str,
         file_entries: Vec<(Uuid, String)>, // (file_id, relative_path)
     ) -> Result<()> {
-        use crate::core::config::{MAX_PREFETCH_BYTES, MAX_PREFETCH_FILES};
-
         let root = std::path::Path::new(folder_path);
         let root_parent = root.parent().unwrap_or(root);
 
@@ -931,129 +929,55 @@ impl PeerNode {
         };
 
         tracing::info!(
-            "Sending folder '{}' ({} files) to {} via Transaction protocol (parallel prep)",
+            "Sending folder '{}' ({} files) to {} via Transaction protocol (streaming)",
             folder_path,
             file_entries.len(),
             peer_id
         );
 
-        // Semaphore-style backpressure: the producer tracks how many bytes
-        // and how many files are sitting in the channel waiting to be sent.
-        // When either limit is hit the producer pauses until the consumer
-        // drains enough items.
-        let prefetch_bytes = Arc::new(tokio::sync::Mutex::new(0u64));
-        let prefetch_notify = Arc::new(tokio::sync::Notify::new());
-
-        // Channel capacity set to MAX_PREFETCH_FILES — the producer will
-        // self-throttle via the byte counter before filling it completely
-        // for large files, but the bounded channel still caps item count.
-        // Option<Vec<u8>>: None = file read failed, Some = real data.
-        let (prep_tx, mut prep_rx) =
-            mpsc::channel::<(Uuid, String, Option<Vec<u8>>)>(MAX_PREFETCH_FILES);
-
-        // Spawn file preparation task (producer)
-        let root_parent_owned = root_parent.to_path_buf();
-        let entries_for_producer = file_entries;
-        let pb = prefetch_bytes.clone();
-        let pn = prefetch_notify.clone();
-        tokio::spawn(async move {
-            for (file_id, relative_path) in entries_for_producer {
-                let full_path = root_parent_owned.join(&relative_path);
-                match tokio::fs::read(&full_path).await {
-                    Ok(file_bytes) => {
-                        let len = file_bytes.len() as u64;
-
-                        // Wait until there is room under the byte budget
-                        loop {
-                            let current = *pb.lock().await;
-                            // Allow at least one file through even if it
-                            // alone exceeds the budget (current == 0).
-                            if current == 0 || current + len <= MAX_PREFETCH_BYTES {
-                                break;
-                            }
-                            pn.notified().await;
-                        }
-
-                        *pb.lock().await += len;
-
-                        if prep_tx
-                            .send((file_id, relative_path.clone(), Some(file_bytes)))
-                            .await
-                            .is_err()
-                        {
-                            // Consumer dropped — abort preparation
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to read file for folder transfer: {} — {}",
-                            full_path.display(),
-                            e
-                        );
-                        // Signal read failure so the consumer can emit a
-                        // SendComplete{success:false} for this file_id.
-                        if prep_tx
-                            .send((file_id, relative_path.clone(), None))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            // Drop prep_tx to signal end of preparation
-        });
-
-        // Consumer: send files as they become available from the preparation pipeline.
-        // This overlaps disk I/O (preparation of N+1) with network I/O (sending N).
-        // Errors are handled per-file so one failure does not orphan the rest.
         let peer_id_owned = peer_id.to_string();
-        while let Some((file_id, relative_path, file_bytes)) = prep_rx.recv().await {
-            match file_bytes {
-                None => {
-                    // File read failed in producer — notify engine so the
-                    // transaction can still conclude.
+        for (file_id, relative_path) in file_entries {
+            let full_path = root_parent.join(&relative_path);
+
+            let filesize = match tokio::fs::metadata(&full_path).await {
+                Ok(m) => m.len(),
+                Err(e) => {
                     tracing::error!(
-                        "Skipping file '{}' [file_id={}]: read failed",
-                        relative_path,
-                        file_id
+                        "Failed to stat file for folder transfer: {} — {}",
+                        full_path.display(),
+                        e
                     );
                     let _ = self.event_tx.send(AppEvent::SendComplete {
                         _peer_id: peer_id_owned.clone(),
                         file_id,
                         success: false,
                     });
+                    continue;
                 }
-                Some(data) => {
-                    let len = data.len() as u64;
-                    tracing::debug!(
-                        "Sending file '{}' ({} bytes) [file_id={}]",
-                        relative_path,
-                        len,
-                        file_id
-                    );
-                    if let Err(e) = conn.send_file(file_id, data, relative_path.as_str()).await {
-                        tracing::error!(
-                            "Failed to send file '{}' [file_id={}]: {}",
-                            relative_path,
-                            file_id,
-                            e
-                        );
-                        // Notify engine about the failure so the transaction
-                        // does not hang waiting for this file.
-                        let _ = self.event_tx.send(AppEvent::SendComplete {
-                            _peer_id: peer_id_owned.clone(),
-                            file_id,
-                            success: false,
-                        });
-                    }
+            };
 
-                    // Release byte budget so the producer can prefetch more
-                    *prefetch_bytes.lock().await -= len;
-                    prefetch_notify.notify_one();
-                }
+            tracing::debug!(
+                "Sending file '{}' ({} bytes) [file_id={}]",
+                relative_path,
+                filesize,
+                file_id
+            );
+
+            if let Err(e) = conn
+                .send_file(file_id, full_path.clone(), filesize, relative_path.as_str())
+                .await
+            {
+                tracing::error!(
+                    "Failed to send file '{}' [file_id={}]: {}",
+                    relative_path,
+                    file_id,
+                    e
+                );
+                let _ = self.event_tx.send(AppEvent::SendComplete {
+                    _peer_id: peer_id_owned.clone(),
+                    file_id,
+                    success: false,
+                });
             }
         }
 
