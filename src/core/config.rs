@@ -71,6 +71,11 @@ pub const MAX_PENDING_FILE_IDS: usize = 16;
 
 // ── Connection / Network ─────────────────────────────────────────────────────
 
+/// Explicit large SCTP max message size (16 MiB).
+/// Using a concrete value instead of Unbounded (0) because some WebRTC
+/// implementations interpret 0 as "use default 64 KB" rather than unlimited.
+pub const SCTP_MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+
 /// WebRTC peer connection timeout.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
