@@ -1,7 +1,9 @@
 use crate::core::config::TYPING_TIMEOUT_SECS;
+use crate::core::connection::webrtc::WireStats;
 use crate::core::engine::TransferEngine;
 use crate::ui::notify::NotifyManager;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -341,6 +343,10 @@ pub struct App {
     /// The TransferEngine owns ALL transfer state and logic.
     /// No transfer logic exists outside the engine.
     pub engine: TransferEngine,
+
+    // ── Wire-level statistics ────────────────────────────────────────────
+    /// Per-peer wire statistics handles — tracks ALL bytes crossing the network.
+    pub peer_wire_stats: HashMap<String, Arc<WireStats>>,
 }
 
 impl App {
@@ -382,6 +388,7 @@ impl App {
             notify: NotifyManager::new(),
             connecting_peers: HashMap::new(),
             engine: TransferEngine::new(),
+            peer_wire_stats: HashMap::new(),
         }
     }
 
@@ -451,6 +458,7 @@ impl App {
         // Clean up all peer-related data
         self.peer_names.remove(peer_id);
         self.peer_keys.remove(peer_id);
+        self.peer_wire_stats.remove(peer_id);
         self.typing.remove_peer(peer_id);
         self.unread.remove_peer(peer_id);
 
@@ -464,6 +472,16 @@ impl App {
     /// Check if a peer is currently online.
     pub fn is_peer_online(&self, peer_id: &str) -> bool {
         self.peer_status.get(peer_id).copied() == Some(PeerStatus::Online)
+    }
+
+    /// Sum wire-level TX bytes across all peer connections.
+    pub fn total_wire_tx(&self) -> u64 {
+        self.peer_wire_stats.values().map(|ws| ws.total_tx()).sum()
+    }
+
+    /// Sum wire-level RX bytes across all peer connections.
+    pub fn total_wire_rx(&self) -> u64 {
+        self.peer_wire_stats.values().map(|ws| ws.total_rx()).sum()
     }
 
     /// Switch the active chat target and reset unread for it.

@@ -529,13 +529,15 @@ impl UIExecuter {
         };
         f.render_widget(help_line, chunks[0]);
 
-        // Linea di statistiche — reads from TransferEngine (authoritative)
-        // Shows wire bytes (post-compression/encryption) = what crosses the network boundary
+        // Linea di statistiche — reads wire-level bytes from WireStats (authoritative)
+        // Shows ALL bytes crossing the network: file chunks, control, chat, heartbeats, etc.
         let stats = app.engine.stats();
+        let wire_tx = app.total_wire_tx();
+        let wire_rx = app.total_wire_rx();
         let stats_spans = vec![
             Span::styled(" TX: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format_file_size(stats.bytes_sent),
+                format_file_size(wire_tx),
                 Style::default().fg(Color::Green),
             ),
             Span::styled(
@@ -547,7 +549,7 @@ impl UIExecuter {
             ),
             Span::styled("  |  RX: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format_file_size(stats.bytes_received),
+                format_file_size(wire_rx),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
@@ -559,13 +561,13 @@ impl UIExecuter {
             ),
             // Show compression ratio if meaningful data has been transferred
             if stats.raw_bytes_sent > 0
-                && stats.bytes_sent > 0
-                && stats.raw_bytes_sent != stats.bytes_sent
+                && wire_tx > 0
+                && stats.raw_bytes_sent != wire_tx
             {
                 Span::styled(
                     format!(
                         "  | ratio: {:.0}%",
-                        (stats.bytes_sent as f64 / stats.raw_bytes_sent as f64) * 100.0
+                        (wire_tx as f64 / stats.raw_bytes_sent as f64) * 100.0
                     ),
                     Style::default().fg(Color::Magenta),
                 )
@@ -1062,8 +1064,9 @@ impl UIExecuter {
 
         // ── Handle non-transfer events directly ──────────────────────────
         match event {
-            AppEvent::PeerConnected { peer_id } => {
+            AppEvent::PeerConnected { peer_id, wire_stats } => {
                 self.app.connecting_peers.remove(&peer_id);
+                self.app.peer_wire_stats.insert(peer_id.clone(), wire_stats);
                 self.app.add_peer(peer_id.clone());
 
                 if let Some(key) = node.get_peer_key(&peer_id).await {

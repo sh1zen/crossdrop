@@ -1,5 +1,5 @@
 use crate::core::connection::crypto::SessionKeyManager;
-use crate::core::connection::webrtc::{ConnectionMessage, SignalingMessage, WebRTCConnection};
+use crate::core::connection::webrtc::{ConnectionMessage, SignalingMessage, WebRTCConnection, WireStats};
 use crate::core::connection::{Iroh, Ticket};
 use crate::core::transaction::{ResumeInfo, TransactionManifest};
 use crate::utils::sos::SignalOfStop;
@@ -19,6 +19,8 @@ use uuid::Uuid;
 pub enum AppEvent {
     PeerConnected {
         peer_id: String,
+        /// Wire-level statistics handle for this peer connection.
+        wire_stats: Arc<WireStats>,
     },
     PeerDisconnected {
         peer_id: String,
@@ -618,9 +620,10 @@ impl PeerNode {
             .await
             .insert(peer_id.clone(), ticket_str);
 
+        let wire_stats = webrtc_conn.wire_stats();
         tracing::info!("Peer connected: {}", peer_id);
         self.connecting_notify(&peer_id, "Peer fully connected!");
-        let _ = self.event_tx.send(AppEvent::PeerConnected { peer_id });
+        let _ = self.event_tx.send(AppEvent::PeerConnected { peer_id, wire_stats });
         Ok(())
     }
 
@@ -734,6 +737,7 @@ impl PeerNode {
         }
 
         // Spawn heartbeat monitor
+        let wire_stats = webrtc_conn.wire_stats();
         self.spawn_heartbeat(peer_id.clone(), webrtc_conn, last_pong);
 
         // Generate a minimal ticket from the inbound peer's NodeId for future reconnection
@@ -748,7 +752,7 @@ impl PeerNode {
 
         tracing::info!(event = "peer_connected", peer = %short_id(&peer_id), direction = "inbound", "Peer connected (inbound)");
         self.send_info(&peer_id, "✓ Peer fully connected!");
-        let _ = self.event_tx.send(AppEvent::PeerConnected { peer_id });
+        let _ = self.event_tx.send(AppEvent::PeerConnected { peer_id, wire_stats });
         Ok(())
     }
 
