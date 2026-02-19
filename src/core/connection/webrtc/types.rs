@@ -286,7 +286,7 @@ pub enum ConnectionMessage {
 /// Buffered hash parameters when `Hash` arrives before the last chunk.
 ///
 /// Consumed by the chunk handler once `received_chunks == total_chunks`.
-pub(crate) struct PendingHash {
+pub struct PendingHash {
     /// Expected SHA3-256 hash of the complete file.
     pub sha3_256: Vec<u8>,
     /// Expected Merkle root, if the sender provided one.
@@ -304,7 +304,7 @@ impl PendingHash {
 }
 
 /// Live state for one in-progress file receive.
-pub(crate) struct ReceiveFileState {
+pub struct ReceiveFileState {
     /// Streaming writer accumulating chunk data.
     pub writer: StreamingFileWriter,
     /// Buffered hash message — set when `Hash` arrives before the final chunk.

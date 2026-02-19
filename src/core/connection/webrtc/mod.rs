@@ -28,14 +28,14 @@
 
 // ── Sub-modules ───────────────────────────────────────────────────────────────
 
-pub(crate) mod connection;
-pub(crate) mod control;
-pub(crate) mod data;
-pub(crate) mod helpers;
-pub(crate) mod initializer;
-pub(crate) mod receiver;
-pub(crate) mod sender;
-pub(crate) mod types;
+pub mod connection;
+pub mod control;
+pub mod data;
+pub mod helpers;
+pub mod initializer;
+pub mod receiver;
+pub mod sender;
+pub mod types;
 
 // ── Flat re-exports ───────────────────────────────────────────────────────────
 // Child modules (and external callers) can use these without spelling out the
@@ -45,9 +45,9 @@ pub use connection::WebRTCConnection;
 
 pub use types::{ConnectionMessage, ControlMessage, SignalingMessage};
 
-pub(crate) use types::{PendingHash, ReceiveFileState};
+pub use types::{PendingHash, ReceiveFileState};
 
-pub(crate) use helpers::{
+pub use helpers::{
     compress_data, decompress_data, decrypt_with, derive_chat_hmac_key, encrypt,
     encrypt_with, notify_app, sanitize_relative_path,
 };
@@ -55,10 +55,10 @@ pub(crate) use helpers::{
 // ── Frame-type constants ──────────────────────────────────────────────────────
 
 /// Frame tag for JSON-encoded [`ControlMessage`] frames.
-pub(crate) const FRAME_CONTROL: u8 = 0x01;
+pub const FRAME_CONTROL: u8 = 0x01;
 
 /// Frame tag for raw binary chunk frames.
-pub(crate) const FRAME_CHUNK: u8 = 0x02;
+pub const FRAME_CHUNK: u8 = 0x02;
 
 // ── Well-known UUIDs ──────────────────────────────────────────────────────────
 
@@ -67,6 +67,6 @@ pub(crate) const FRAME_CHUNK: u8 = 0x02;
 /// Used as the `transaction_id` in `AuthenticatedMessage` for room/DM chat so
 /// that chat HMACs are cryptographically distinct from file-transfer HMACs
 /// (which use real transaction UUIDs).
-pub(crate) const CHAT_HMAC_CHANNEL: uuid::Uuid = uuid::Uuid::from_bytes([
+pub const CHAT_HMAC_CHANNEL: uuid::Uuid = uuid::Uuid::from_bytes([
     0xC0, 0xDE, 0xCA, 0xFE, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0xC4, 0xA7, 0x01,
 ]);

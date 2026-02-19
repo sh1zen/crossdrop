@@ -135,9 +135,10 @@ async fn wait_for_buffer_space(dc: &Arc<RTCDataChannel>, next_msg_size: usize) -
         return Ok(());
     }
 
+    let buffered_amount = dc.buffered_amount().await;
     info!(
         channel = %dc.label(),
-        buffered = dc.buffered_amount().await,
+        buffered = buffered_amount,
         next_msg = next_msg_size,
         high_watermark = DC_BUFFERED_AMOUNT_HIGH,
         "Applying backpressure - waiting for buffer to drain"
@@ -164,7 +165,8 @@ async fn wait_for_buffer_space(dc: &Arc<RTCDataChannel>, next_msg_size: usize) -
     }
 
     if dc.ready_state() == RTCDataChannelState::Open {
-        warn!(channel = %dc.label(), buffered = dc.buffered_amount().await, "Buffer drain timeout - proceeding anyway");
+        let buffered_amount = dc.buffered_amount().await;
+        warn!(channel = %dc.label(), buffered = buffered_amount, "Buffer drain timeout - proceeding anyway");
         Ok(())
     } else {
         Err(anyhow!(
@@ -182,7 +184,7 @@ impl WebRTCConnection {
     /// Send an encrypted frame on a data channel (derives cipher per call).
     ///
     /// Wire format: `[0x00|0x01] ++ AES-256-GCM([maybe_compressed] plaintext)`
-    pub(crate) async fn send_encrypted(
+    pub async fn send_encrypted(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
         plaintext: &[u8],
@@ -201,7 +203,7 @@ impl WebRTCConnection {
     /// Send an encrypted frame using a pre-initialized cipher (hot-path variant).
     ///
     /// Includes backpressure: blocks if the SCTP send buffer is above the high watermark.
-    pub(crate) async fn send_encrypted_with_cipher(
+    pub async fn send_encrypted_with_cipher(
         dc: &Arc<RTCDataChannel>,
         cipher: &Aes256Gcm,
         plaintext: &[u8],
@@ -219,7 +221,7 @@ impl WebRTCConnection {
     }
 
     /// Wait for `dc` to enter `Open` state, retrying up to `max_retries` times.
-    pub(crate) async fn wait_for_data_channel_open(
+    pub async fn wait_for_data_channel_open(
         dc: &Arc<RTCDataChannel>,
         max_retries: u32,
         retry_delay: Duration,
@@ -265,7 +267,7 @@ impl WebRTCConnection {
     // ── Control channel helpers ───────────────────────────────────────────
 
     /// Encode, compress, and encrypt a control message; return wire bytes sent.
-    pub(crate) async fn send_control_counted(&self, msg: &ControlMessage) -> Result<u64> {
+    pub async fn send_control_counted(&self, msg: &ControlMessage) -> Result<u64> {
         let dc = self
             .control_channel
             .read()
@@ -285,7 +287,7 @@ impl WebRTCConnection {
     }
 
     /// Send a control message on an arbitrary data channel (static helper).
-    pub(crate) async fn send_control_on(
+    pub async fn send_control_on(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
         msg: &ControlMessage,

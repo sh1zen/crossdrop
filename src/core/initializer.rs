@@ -22,25 +22,21 @@ use uuid::Uuid;
 pub enum AppEvent {
     PeerConnected {
         peer_id: String,
-        /// Remote IP address from WebRTC ICE connection.
         remote_ip: Option<String>,
     },
     PeerDisconnected {
         peer_id: String,
-        /// If true, the user explicitly disconnected this peer (full removal).
-        /// If false, the connection was lost (transition to offline).
+        /// `true` = user-initiated removal; `false` = connection lost.
         explicit: bool,
     },
     ChatReceived {
         peer_id: String,
         message: Vec<u8>,
     },
-    /// Direct (1-to-1) message received from a peer.
     DmReceived {
         peer_id: String,
         message: Vec<u8>,
     },
-    /// Ephemeral typing indicator from a peer.
     TypingReceived {
         peer_id: String,
     },
@@ -50,9 +46,7 @@ pub enum AppEvent {
         _filename: String,
         received_chunks: u32,
         _total_chunks: u32,
-        /// Bytes received on the wire (post-compression/encryption).
         wire_bytes: u64,
-        /// Chunk bitmap for persistence (serialized).
         chunk_bitmap_bytes: Option<Vec<u8>>,
     },
     SendProgress {
@@ -61,7 +55,6 @@ pub enum AppEvent {
         _filename: String,
         sent_chunks: u32,
         _total_chunks: u32,
-        /// Bytes sent on the wire (post-compression/encryption).
         wire_bytes: u64,
     },
     SendComplete {
@@ -74,7 +67,6 @@ pub enum AppEvent {
         file_id: Uuid,
         filename: String,
         _path: String,
-        /// Merkle root computed from received chunk hashes.
         merkle_root: [u8; 32],
     },
     DisplayNameReceived {
@@ -94,7 +86,6 @@ pub enum AppEvent {
         path: String,
         is_folder: bool,
     },
-    // ── Transaction-level events ─────────────────────────────────────────
     TransactionRequested {
         peer_id: String,
         transaction_id: Uuid,
@@ -128,19 +119,15 @@ pub enum AppEvent {
         transaction_id: Uuid,
         reason: Option<String>,
     },
-    /// Peer requested retransmission of specific chunks (integrity check failed).
     ChunkRetransmitRequested {
         peer_id: String,
         file_id: Uuid,
-        /// List of chunk indices that need to be resent.
         chunk_indices: Vec<u32>,
     },
-    /// Peer acknowledged transaction completion.
     TransactionCompleteAcked {
         peer_id: String,
         transaction_id: Uuid,
     },
-    /// Receiver confirmed file received and saved.
     FileReceivedAck {
         file_id: Uuid,
     },
@@ -165,38 +152,33 @@ pub struct PeerNode {
     _args: Args,
     iroh: Arc<Iroh>,
     peers: Arc<Mutex<HashMap<String, PeerEntry>>>,
-    /// Stores the ticket string used/generated for each peer connection.
     peer_tickets: Arc<Mutex<HashMap<String, String>>>,
-    /// Guards against duplicate concurrent connection attempts to the same peer.
     connecting: Arc<Mutex<HashSet<String>>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     public_key: iroh::PublicKey,
     remote_access_tx: Arc<tokio::sync::watch::Sender<bool>>,
     remote_access_rx: tokio::sync::watch::Receiver<bool>,
-    /// Current display name, updated from Settings panel.
     display_name_tx: Arc<tokio::sync::watch::Sender<String>>,
     display_name_rx: tokio::sync::watch::Receiver<String>,
-    /// Cumulative wire-level TX/RX bytes - atomic counters for direct updates.
     wire_tx: Arc<AtomicU64>,
     wire_rx: Arc<AtomicU64>,
 }
 
-// ── Key derivation ───────────────────────────────────────────────────────────
+// ── Utility helpers ───────────────────────────────────────────────────────────
 
-fn short_id(id: &str) -> String {
-    if id.len() > 8 {
-        format!("{}…", &id[..8])
-    } else {
-        id.to_string()
-    }
+fn short_id(id: &str) -> &str {
+    let end = id.len().min(8);
+    &id[..end]
 }
 
 /// Public accessor for truncated peer IDs in log messages.
-pub fn short_id_pub(id: &str) -> String {
+pub fn short_id_pub(id: &str) -> &str {
     short_id(id)
 }
 
-/// RAII guard that removes a peer_id from the `connecting` set on drop.
+// ── RAII connecting guard ─────────────────────────────────────────────────────
+
+/// Removes `peer_id` from the `connecting` set when dropped.
 struct ConnectingGuard {
     connecting: Arc<Mutex<HashSet<String>>>,
     peer_id: String,
@@ -206,8 +188,6 @@ impl Drop for ConnectingGuard {
     fn drop(&mut self) {
         let connecting = self.connecting.clone();
         let peer_id = std::mem::take(&mut self.peer_id);
-        // Use try_lock to avoid blocking in the Drop impl.
-        // If the lock is contended we spawn a task to clean up.
         if let Ok(mut set) = connecting.try_lock() {
             set.remove(&peer_id);
         } else {
@@ -221,29 +201,29 @@ impl Drop for ConnectingGuard {
 // ── ConnectionMessage → AppEvent mapping ─────────────────────────────────────
 
 /// Maps a [`ConnectionMessage`] to the corresponding [`AppEvent`].
+///
 /// Returns `None` for `AwakeReceived`, which is handled locally in the
-/// connection task (it notifies the awake check waiter rather than being
-/// forwarded to the application layer).
+/// connection task rather than forwarded to the application layer.
 fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppEvent> {
-    let event = match msg {
-        ConnectionMessage::TextReceived(data) => AppEvent::ChatReceived {
-            peer_id: pid.to_string(),
-            message: data,
+    let peer_id = || pid.to_string();
+
+    Some(match msg {
+        ConnectionMessage::TextReceived(message) => AppEvent::ChatReceived {
+            peer_id: peer_id(),
+            message,
         },
-        ConnectionMessage::DmReceived(data) => AppEvent::DmReceived {
-            peer_id: pid.to_string(),
-            message: data,
+        ConnectionMessage::DmReceived(message) => AppEvent::DmReceived {
+            peer_id: peer_id(),
+            message,
         },
-        ConnectionMessage::TypingReceived => AppEvent::TypingReceived {
-            peer_id: pid.to_string(),
-        },
+        ConnectionMessage::TypingReceived => AppEvent::TypingReceived { peer_id: peer_id() },
         ConnectionMessage::FileSaved {
             file_id,
             filename,
             path,
             merkle_root,
         } => AppEvent::FileComplete {
-            _peer_id: pid.to_string(),
+            _peer_id: peer_id(),
             file_id,
             filename,
             _path: path,
@@ -257,7 +237,7 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             wire_bytes,
             chunk_bitmap_bytes,
         } => AppEvent::FileProgress {
-            _peer_id: pid.to_string(),
+            _peer_id: peer_id(),
             file_id,
             _filename: filename,
             received_chunks,
@@ -272,7 +252,7 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             total_chunks,
             wire_bytes,
         } => AppEvent::SendProgress {
-            _peer_id: pid.to_string(),
+            _peer_id: peer_id(),
             file_id,
             _filename: filename,
             sent_chunks,
@@ -280,38 +260,36 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             wire_bytes,
         },
         ConnectionMessage::SendComplete { file_id, success } => AppEvent::SendComplete {
-            _peer_id: pid.to_string(),
+            _peer_id: peer_id(),
             file_id,
             success,
         },
         ConnectionMessage::DisplayNameReceived(name) => AppEvent::DisplayNameReceived {
-            peer_id: pid.to_string(),
+            peer_id: peer_id(),
             name,
         },
         ConnectionMessage::Debug(s) => AppEvent::Info(s),
         ConnectionMessage::Error(s) => AppEvent::Error(s),
         ConnectionMessage::LsResponse { path, entries } => AppEvent::LsResponse {
-            peer_id: pid.to_string(),
+            peer_id: peer_id(),
             path,
             entries,
         },
-        ConnectionMessage::RemoteAccessDisabled => AppEvent::RemoteAccessDisabled {
-            peer_id: pid.to_string(),
-        },
+        ConnectionMessage::RemoteAccessDisabled => {
+            AppEvent::RemoteAccessDisabled { peer_id: peer_id() }
+        }
         ConnectionMessage::RemoteFetchRequest { path, is_folder } => AppEvent::RemoteFetchRequest {
-            peer_id: pid.to_string(),
+            peer_id: peer_id(),
             path,
             is_folder,
         },
-
-        // ── Transaction-level events ─────────────────────────────────────
         ConnectionMessage::TransactionRequested {
             transaction_id,
             display_name,
             manifest,
             total_size,
         } => AppEvent::TransactionRequested {
-            peer_id: pid.to_string(),
+            peer_id: peer_id(),
             transaction_id,
             display_name,
             manifest,
@@ -343,123 +321,46 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         },
         ConnectionMessage::TransactionResumeRequested { resume_info } => {
             AppEvent::TransactionResumeRequested {
-                peer_id: pid.to_string(),
+                peer_id: peer_id(),
                 resume_info,
             }
         }
         ConnectionMessage::TransactionResumeAccepted { transaction_id } => {
             AppEvent::TransactionResumeAccepted { transaction_id }
         }
-        ConnectionMessage::TransactionResumeRejected { transaction_id, reason } => {
-            AppEvent::TransactionResumeRejected { transaction_id, reason }
-        }
+        ConnectionMessage::TransactionResumeRejected {
+            transaction_id,
+            reason,
+        } => AppEvent::TransactionResumeRejected {
+            transaction_id,
+            reason,
+        },
         ConnectionMessage::ChunkRetransmitRequested {
             file_id,
             chunk_indices,
         } => AppEvent::ChunkRetransmitRequested {
-            peer_id: pid.to_string(),
+            peer_id: peer_id(),
             file_id,
             chunk_indices,
         },
         ConnectionMessage::TransactionCompleteAcked { transaction_id } => {
             AppEvent::TransactionCompleteAcked {
-                peer_id: pid.to_string(),
+                peer_id: peer_id(),
                 transaction_id,
             }
         }
-        ConnectionMessage::FileReceivedAck { file_id } => {
-            AppEvent::FileReceivedAck {
-                file_id,
-            }
-        }
+        ConnectionMessage::FileReceivedAck { file_id } => AppEvent::FileReceivedAck { file_id },
         ConnectionMessage::Disconnected => AppEvent::PeerDisconnected {
-            peer_id: pid.to_string(),
-            explicit: false, // Connection lost, not user-initiated
+            peer_id: peer_id(),
+            explicit: false,
         },
         ConnectionMessage::AwakeReceived => return None,
-    };
-    Some(event)
+    })
 }
 
 // ── PeerNode impl ────────────────────────────────────────────────────────────
 
 impl PeerNode {
-    /// Retransmit specific chunks due to Merkle integrity failure (receiver requested).
-    /// If chunk_indices is empty, retransmit the entire file.
-    pub async fn retransmit_chunks(
-        &self,
-        engine: &mut crate::core::engine::TransferEngine,
-        peer_id: &str,
-        file_id: Uuid,
-        chunk_indices: &[u32],
-    ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        // Get file info from transaction
-        let (txn_id, filesize, relative_path) =
-            if let Some(txn) = engine.find_transaction_by_file_mut(&file_id) {
-                let tf = txn
-                    .files
-                    .get(&file_id)
-                    .ok_or_else(|| anyhow::anyhow!("File not found in transaction: {}", file_id))?;
-                (txn.id, tf.filesize, tf.relative_path.clone())
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Transaction not found for file: {}",
-                    file_id
-                ));
-            };
-
-        let file_path = engine
-            .get_source_path(&txn_id)
-            .ok_or_else(|| anyhow::anyhow!("Source path not found for transaction: {}", txn_id))?;
-
-        // If no specific chunks requested, retransmit entire file
-        if chunk_indices.is_empty() {
-            conn.send_file(
-                file_id,
-                std::path::PathBuf::from(file_path),
-                filesize,
-                &relative_path,
-            )
-            .await
-        } else {
-            // Retransmit specific chunks
-            conn.send_file_chunks(
-                file_id,
-                std::path::PathBuf::from(file_path),
-                filesize,
-                &relative_path,
-                chunk_indices.to_vec(),
-            )
-            .await
-        }
-    }
-
-    /// Send TransactionCompleteAck to peer after processing completion.
-    pub async fn send_transaction_complete_ack(
-        &self,
-        peer_id: &str,
-        transaction_id: Uuid,
-    ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-        conn.send_control(&ControlMessage::TransactionCompleteAck { transaction_id })
-            .await
-    }
     pub async fn new(
         secret_key: SecretKey,
         args: Args,
@@ -471,7 +372,7 @@ impl PeerNode {
         let public_key = secret_key.public();
         let iroh = Arc::new(
             Iroh::new(
-                secret_key.clone(),
+                secret_key,
                 args.relay.clone(),
                 args.ipv4_addr,
                 args.ipv6_addr,
@@ -515,35 +416,36 @@ impl PeerNode {
         &self.event_tx
     }
 
+    // ── Internal: connection event relay ────────────────────────────────
+
     fn create_connection_tx(
         peer_id: String,
         event_tx: mpsc::UnboundedSender<AppEvent>,
         awake_notify: Arc<tokio::sync::Notify>,
     ) -> mpsc::UnboundedSender<ConnectionMessage> {
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ConnectionMessage>();
-        let pid = peer_id;
-        let mut disconnect_sent = false;
         tokio::spawn(async move {
+            let mut disconnect_sent = false;
             while let Some(msg) = conn_rx.recv().await {
-                // Handle AwakeReceived locally — notify the awake check waiter
                 if matches!(msg, ConnectionMessage::AwakeReceived) {
                     awake_notify.notify_one();
                     continue;
                 }
 
-                // Deduplicate Disconnected events — only forward the first one.
-                // WebRTC can fire Disconnected followed by Closed in sequence,
-                // or the same state multiple times. Processing duplicates
-                // causes cascading state transitions in the engine.
+                // Deduplicate Disconnected: WebRTC can fire it multiple times.
                 if matches!(msg, ConnectionMessage::Disconnected) {
                     if disconnect_sent {
-                        debug!(event = "duplicate_disconnect_suppressed", peer = %pid, "Suppressing duplicate Disconnected event");
+                        debug!(
+                            event = "duplicate_disconnect_suppressed",
+                            peer = %short_id(&peer_id),
+                            "Suppressing duplicate Disconnected event"
+                        );
                         continue;
                     }
                     disconnect_sent = true;
                 }
 
-                if let Some(event) = map_connection_to_app_event(&pid, msg) {
+                if let Some(event) = map_connection_to_app_event(&peer_id, msg) {
                     if event_tx.send(event).is_err() {
                         break;
                     }
@@ -553,14 +455,86 @@ impl PeerNode {
         conn_tx
     }
 
+    // ── Internal: peer lookup helpers ────────────────────────────────────
+
+    /// Clone the [`Arc<WebRTCConnection>`] for `peer_id`, or return an error.
+    async fn get_connection(&self, peer_id: &str) -> Result<Arc<WebRTCConnection>> {
+        self.peers
+            .lock()
+            .await
+            .get(peer_id)
+            .map(|e| e.connection.clone())
+            .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))
+    }
+
+    /// Try to get the connection without holding the lock, returning `None` if absent.
+    async fn try_get_connection(&self, peer_id: &str) -> Option<Arc<WebRTCConnection>> {
+        self.peers
+            .lock()
+            .await
+            .get(peer_id)
+            .map(|e| e.connection.clone())
+    }
+
+    // ── Internal: display name ───────────────────────────────────────────
+
+    async fn send_display_name_if_set(&self, conn: &WebRTCConnection) {
+        let name = self.current_display_name();
+        if !name.is_empty() {
+            let _ = conn.send_display_name(name).await;
+        }
+    }
+
+    // ── Internal: liveness + disconnect helpers ──────────────────────────
+
+    /// Check liveness; on failure, emit `PeerDisconnected` and propagate the error.
+    async fn check_alive_or_disconnect(
+        &self,
+        peer_id: &str,
+        conn: &WebRTCConnection,
+    ) -> Result<()> {
+        if let Err(e) = conn.check_peer_alive().await {
+            let _ = self.event_tx.send(AppEvent::PeerDisconnected {
+                peer_id: peer_id.to_string(),
+                explicit: false,
+            });
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    // ── Internal: key rotation (offerer side) ────────────────────────────
+
+    fn spawn_key_rotation(peer_id: String, conn: Arc<WebRTCConnection>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::core::connection::crypto::KEY_ROTATION_INTERVAL).await;
+                match conn.initiate_key_rotation().await {
+                    Ok(()) => info!(
+                        event = "key_rotation_scheduled",
+                        peer = %short_id(&peer_id),
+                        "Hourly key rotation initiated"
+                    ),
+                    Err(e) => {
+                        warn!(
+                            event = "key_rotation_failed",
+                            peer = %short_id(&peer_id),
+                            error = %e,
+                            "Key rotation failed"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // ── Connect (outbound) ───────────────────────────────────────────────
 
     pub async fn connect_to(&self, ticket_str: String) -> Result<()> {
         self.connect_to_inner(ticket_str, false).await
     }
 
-    /// Like `connect_to` but suppresses per-peer status bar notifications.
-    /// Used for auto-reconnect where a single summary message is shown instead.
     pub async fn connect_to_quiet(&self, ticket_str: String) -> Result<()> {
         self.connect_to_inner(ticket_str, true).await
     }
@@ -569,29 +543,23 @@ impl PeerNode {
         let ticket = Ticket::parse(ticket_str.clone())?;
         let peer_id = format!("{}", ticket.address.id);
 
-        // Check if already connected or already attempting to connect
-        {
-            let peers = self.peers.lock().await;
-            if peers.contains_key(&peer_id) {
-                debug!(event = "connect_skipped", peer = %short_id(&peer_id), "Already connected, skipping");
-                if !quiet {
-                    let _ = self.event_tx.send(AppEvent::Info(format!(
-                        "[{}] Already connected, skipping",
-                        short_id(&peer_id)
-                    )));
-                }
-                return Ok(());
+        // Guard: already connected?
+        if self.peers.lock().await.contains_key(&peer_id) {
+            debug!(event = "connect_skipped", peer = %short_id(&peer_id), "Already connected, skipping");
+            if !quiet {
+                let _ = self.event_tx.send(AppEvent::Info(format!(
+                    "[{}] Already connected, skipping",
+                    short_id(&peer_id)
+                )));
             }
-        }
-        {
-            let mut connecting = self.connecting.lock().await;
-            if !connecting.insert(peer_id.clone()) {
-                debug!(event = "connect_skipped", peer = %short_id(&peer_id), "Connection already in progress, skipping");
-                return Ok(());
-            }
+            return Ok(());
         }
 
-        // Ensure we remove from the connecting set when we're done (success or failure)
+        // Guard: connection in progress?
+        if !self.connecting.lock().await.insert(peer_id.clone()) {
+            debug!(event = "connect_skipped", peer = %short_id(&peer_id), "Connection already in progress, skipping");
+            return Ok(());
+        }
         let _guard = ConnectingGuard {
             connecting: self.connecting.clone(),
             peer_id: peer_id.clone(),
@@ -608,7 +576,6 @@ impl PeerNode {
             .context("Iroh connection failed")?;
 
         info!(event = "iroh_connected", peer = %short_id(&peer_id), "Iroh connection established");
-
         self.connecting_notify(&peer_id, "Opening handshake stream...");
 
         let (mut send_stream, mut recv_stream) =
@@ -619,7 +586,6 @@ impl PeerNode {
 
         self.connecting_notify(&peer_id, "Exchanging encryption key...");
 
-        // ECDH key exchange: offerer side
         let key_manager = crate::core::connection::crypto::handshake_offerer(
             &mut send_stream,
             &mut recv_stream,
@@ -630,7 +596,6 @@ impl PeerNode {
         .context("ECDH handshake failed (offerer)")?;
 
         let shared_key = key_manager.inner();
-
         self.connecting_notify(&peer_id, "ECDH handshake complete, session key derived");
 
         let awake_notify = Arc::new(tokio::sync::Notify::new());
@@ -682,18 +647,12 @@ impl PeerNode {
         webrtc_conn.set_answer(answer_msg).await?;
 
         self.connecting_notify(&peer_id, "WebRTC ICE connecting...");
-
         webrtc_conn.wait_connected().await?;
 
         self.connecting_notify(&peer_id, "WebRTC connected, waiting for data channels...");
-
         webrtc_conn.wait_data_channels_open().await?;
 
-        // Insert the peer into the map IMMEDIATELY after data channels open.
-        // The remote side can start sending control messages (e.g. resume
-        // requests) as soon as channels are open, and the resume action
-        // handlers need the peer to be in the map to send responses.
-        // Atomic check-and-insert: if another connection (inbound) won the race, drop ours
+        // Atomic check-and-insert: if an inbound connection won the race, drop ours.
         {
             let mut peers = self.peers.lock().await;
             if peers.contains_key(&peer_id) {
@@ -710,45 +669,20 @@ impl PeerNode {
         }
 
         self.connecting_notify(&peer_id, "Data channels open (control + data)");
+        self.send_display_name_if_set(&webrtc_conn).await;
+        Self::spawn_key_rotation(peer_id.clone(), webrtc_conn.clone());
 
-        {
-            let name = self.current_display_name();
-            if !name.is_empty() {
-                let _ = webrtc_conn.send_display_name(name).await;
-            }
-        }
-
-        // Spawn hourly key rotation task (offerer is the rotation initiator)
-        {
-            let wc = webrtc_conn.clone();
-            let pid = peer_id.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(crate::core::connection::crypto::KEY_ROTATION_INTERVAL)
-                        .await;
-                    match wc.initiate_key_rotation().await {
-                        Ok(()) => {
-                            info!(event = "key_rotation_scheduled", peer = %short_id(&pid), "Hourly key rotation initiated")
-                        }
-                        Err(e) => {
-                            warn!(event = "key_rotation_failed", peer = %short_id(&pid), error = %e, "Key rotation failed");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
-        // Store the ticket used for this outbound connection
         self.peer_tickets
             .lock()
             .await
             .insert(peer_id.clone(), ticket_str);
 
-        tracing::info!("Peer connected: {}", peer_id);
+        info!("Peer connected: {}", peer_id);
         self.connecting_notify(&peer_id, "Peer fully connected!");
         let remote_ip = webrtc_conn.get_remote_ip().await;
-        let _ = self.event_tx.send(AppEvent::PeerConnected { peer_id, remote_ip });
+        let _ = self
+            .event_tx
+            .send(AppEvent::PeerConnected { peer_id, remote_ip });
         Ok(())
     }
 
@@ -758,15 +692,10 @@ impl PeerNode {
         let connection = incoming_conn.accept()?.await?;
         let peer_id = format!("{}", connection.remote_id());
 
-        // If we already have an entry for this peer, evict the stale connection.
-        // This handles the case where the remote peer went offline and came back
-        // before our disconnect detection noticed.
-        // NOTE: We do NOT call close() on the evicted connection.
-        // Calling close() would trigger WebRTC state-change
-        // callbacks that could cascade into spurious PeerDisconnected events.
+        // Evict any stale entry without calling close() to avoid spurious events.
         {
             let mut peers = self.peers.lock().await;
-            if let Some(_old) = peers.remove(&peer_id) {
+            if peers.remove(&peer_id).is_some() {
                 info!(event = "stale_evict", peer = %short_id(&peer_id), "Evicting stale connection for incoming reconnect (no close)");
             }
         }
@@ -779,7 +708,6 @@ impl PeerNode {
                 .context("Accepting handshake stream timed out")?
                 .context("Failed to accept handshake stream")?;
 
-        // ECDH key exchange: answerer side
         let key_manager = crate::core::connection::crypto::handshake_answerer(
             &mut send_stream,
             &mut recv_stream,
@@ -790,7 +718,6 @@ impl PeerNode {
         .context("ECDH handshake failed (answerer)")?;
 
         let shared_key = key_manager.inner();
-
         self.send_info(&peer_id, "ECDH handshake complete, session key derived");
 
         let offer_data = tokio::time::timeout(
@@ -838,16 +765,11 @@ impl PeerNode {
         send_stream.finish()?;
 
         webrtc_conn.wait_connected().await?;
-
         webrtc_conn.wait_data_channels_open().await?;
 
-        // Insert the peer into the map IMMEDIATELY after data channels open.
-        // The remote side can start sending control messages (e.g. resume
-        // requests) as soon as channels are open, and the resume action
-        // handlers need the peer to be in the map to send responses.
         {
             let mut peers = self.peers.lock().await;
-            if let Some(_old) = peers.remove(&peer_id) {
+            if peers.remove(&peer_id).is_some() {
                 debug!(event = "stale_evict_late", peer = %short_id(&peer_id), direction = "inbound", "Evicting stale entry during insert (no close)");
             }
             peers.insert(
@@ -859,14 +781,8 @@ impl PeerNode {
             );
         }
 
-        {
-            let name = self.current_display_name();
-            if !name.is_empty() {
-                let _ = webrtc_conn.send_display_name(name).await;
-            }
-        }
+        self.send_display_name_if_set(&webrtc_conn).await;
 
-        // Generate a minimal ticket from the inbound peer's NodeId for future reconnection
         if let Some(ticket) =
             crate::core::peer_registry::PeerRegistry::ticket_from_node_id(&peer_id)
         {
@@ -876,10 +792,12 @@ impl PeerNode {
                 .insert(peer_id.clone(), ticket);
         }
 
-        tracing::info!(event = "peer_connected", peer = %short_id(&peer_id), direction = "inbound", "Peer connected (inbound)");
+        info!(event = "peer_connected", peer = %short_id(&peer_id), direction = "inbound", "Peer connected (inbound)");
         self.send_info(&peer_id, "✓ Peer fully connected!");
         let remote_ip = webrtc_conn.get_remote_ip().await;
-        let _ = self.event_tx.send(AppEvent::PeerConnected { peer_id, remote_ip });
+        let _ = self
+            .event_tx
+            .send(AppEvent::PeerConnected { peer_id, remote_ip });
         Ok(())
     }
 
@@ -917,7 +835,6 @@ impl PeerNode {
 
     // ── Chat ─────────────────────────────────────────────────────────────
 
-    /// Queue a message for an offline peer.
     pub fn queue_message_for_peer(
         &self,
         peer_id: &str,
@@ -938,58 +855,42 @@ impl PeerNode {
         persistence.queue_message(queued_msg)
     }
 
-    /// Send a direct (1-to-1) message using the DM protocol.
-    /// If the peer is offline, queues the message for later delivery.
     pub async fn send_dm(&self, peer_id: &str, message: &str) -> Result<()> {
-        // Check if peer is connected
-        let conn_opt = {
-            let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|e| e.connection.clone())
-        };
-
-        match conn_opt {
+        match self.try_get_connection(peer_id).await {
             Some(conn) => {
-                // Peer is connected - verify alive and send
                 conn.check_peer_alive().await?;
-                tracing::debug!("Sending DM (direct) to {}: {}", peer_id, message);
+                debug!("Sending DM (direct) to {}: {}", peer_id, message);
                 conn.send_dm(message.as_bytes().to_vec()).await
             }
             None => {
-                // Peer is offline - queue the message
-                tracing::info!(event = "dm_queued", peer_id = %peer_id, "Peer offline, queuing DM");
+                info!(event = "dm_queued", peer_id = %peer_id, "Peer offline, queuing DM");
                 self.queue_message_for_peer(
                     peer_id,
                     crate::core::persistence::QueuedMessageType::Dm {
                         message: message.to_string(),
                     },
-                )?;
-                Ok(())
+                )
             }
         }
     }
 
-    /// Send a typing indicator to a specific peer.
     pub async fn send_typing(&self, peer_id: &str) -> Result<()> {
-        let peers = self.peers.lock().await;
-        if let Some(entry) = peers.get(peer_id) {
-            entry.connection.send_typing().await
+        if let Some(conn) = self.try_get_connection(peer_id).await {
+            conn.send_typing().await
         } else {
             Ok(())
         }
     }
 
-    /// Broadcast a typing indicator to all connected peers.
     pub async fn broadcast_typing(&self) -> Result<()> {
         let peers = self.peers.lock().await;
-        for (_, entry) in peers.iter() {
+        for entry in peers.values() {
             let _ = entry.connection.send_typing().await;
         }
         Ok(())
     }
 
-    /// Broadcast a chat message to ALL connected peers.
     pub async fn broadcast_chat(&self, message: &str) -> Result<Vec<String>> {
-        // Collect connections first, then release the lock for awake checks
         let peer_conns: Vec<(String, Arc<WebRTCConnection>)> = {
             let peers = self.peers.lock().await;
             peers
@@ -997,20 +898,21 @@ impl PeerNode {
                 .map(|(id, e)| (id.clone(), e.connection.clone()))
                 .collect()
         };
+
         let mut sent_to = Vec::new();
         for (peer_id, conn) in &peer_conns {
-            // Verify each peer is alive before sending
             if let Err(e) = conn.check_peer_alive().await {
                 warn!(event = "chat_peer_not_awake", peer = %short_id(peer_id), error = %e, "Peer not awake, skipping chat message");
                 continue;
             }
-            if let Err(e) = conn.send_message(message.as_bytes().to_vec()).await {
-                warn!(event = "chat_send_failure", peer = %short_id(peer_id), error = %e, "Failed to send chat message");
-            } else {
-                sent_to.push(peer_id.clone());
+            match conn.send_message(message.as_bytes().to_vec()).await {
+                Ok(()) => sent_to.push(peer_id.clone()),
+                Err(e) => {
+                    warn!(event = "chat_send_failure", peer = %short_id(peer_id), error = %e, "Failed to send chat message")
+                }
             }
         }
-        tracing::debug!(
+        debug!(
             "Broadcasting chat to {} peers: {}",
             peer_conns.len(),
             message
@@ -1018,9 +920,7 @@ impl PeerNode {
         Ok(sent_to)
     }
 
-    /// Broadcast display name to all connected peers.
     pub async fn broadcast_display_name(&self, name: String) {
-        // Update the shared state so new connections get the latest name
         let _ = self.display_name_tx.send(name.clone());
         let peers = self.peers.lock().await;
         for (peer_id, entry) in peers.iter() {
@@ -1030,22 +930,16 @@ impl PeerNode {
         }
     }
 
-    /// Update the current display name (called from Settings panel).
-    /// Does NOT broadcast — call `broadcast_display_name` separately if needed.
     pub fn set_display_name(&self, name: String) {
         let _ = self.display_name_tx.send(name);
     }
 
-    /// Get the current display name.
     pub fn current_display_name(&self) -> String {
         self.display_name_rx.borrow().clone()
     }
 
-    // ── Direct file send (Transaction protocol) ─────────────────────────
+    // ── File transfer ────────────────────────────────────────────────────
 
-    /// Send a single file directly using a Transaction file_id.
-    /// No offer/response negotiation — the receiver has already accepted
-    /// via TransactionResponse and registered a destination via PrepareReceive.
     pub async fn send_file_data(
         &self,
         peer_id: &str,
@@ -1053,33 +947,13 @@ impl PeerNode {
         file_path: &str,
         filename: &str,
     ) -> Result<()> {
-        let metadata = tokio::fs::metadata(file_path).await?;
-        let filesize = metadata.len();
+        let filesize = tokio::fs::metadata(file_path).await?.len();
+        let conn = self.get_connection(peer_id).await?;
+        self.check_alive_or_disconnect(peer_id, &conn).await?;
 
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        // Verify peer is alive before starting file transfer
-        if let Err(e) = conn.check_peer_alive().await {
-            let _ = self.event_tx.send(AppEvent::PeerDisconnected {
-                peer_id: peer_id.to_string(),
-                explicit: false,
-            });
-            return Err(e);
-        }
-
-        tracing::info!(
+        info!(
             "Sending file '{}' ({} bytes) to {} [txn file_id={}]",
-            filename,
-            filesize,
-            peer_id,
-            file_id
+            filename, filesize, peer_id, file_id
         );
         conn.send_file(
             file_id,
@@ -1090,8 +964,6 @@ impl PeerNode {
         .await
     }
 
-    /// Send a file using a chunk bitmap to skip already-received chunks.
-    /// This is the preferred method for resume as it handles non-contiguous gaps.
     pub async fn send_file_data_resuming(
         &self,
         peer_id: &str,
@@ -1100,34 +972,14 @@ impl PeerNode {
         filename: &str,
         bitmap: crate::core::pipeline::chunk::ChunkBitmap,
     ) -> Result<()> {
-        let metadata = tokio::fs::metadata(file_path).await?;
-        let filesize = metadata.len();
-
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        if let Err(e) = conn.check_peer_alive().await {
-            let _ = self.event_tx.send(AppEvent::PeerDisconnected {
-                peer_id: peer_id.to_string(),
-                explicit: false,
-            });
-            return Err(e);
-        }
+        let filesize = tokio::fs::metadata(file_path).await?.len();
+        let conn = self.get_connection(peer_id).await?;
+        self.check_alive_or_disconnect(peer_id, &conn).await?;
 
         let missing_count = bitmap.missing_count();
-        tracing::info!(
+        info!(
             "Resuming file '{}' ({} bytes) to {} with bitmap ({} missing chunks) [txn file_id={}]",
-            filename,
-            filesize,
-            peer_id,
-            missing_count,
-            file_id
+            filename, filesize, peer_id, missing_count, file_id
         );
         conn.send_file_with_bitmap(
             file_id,
@@ -1139,42 +991,23 @@ impl PeerNode {
         .await
     }
 
-    /// Send multiple files for a folder transfer using Transaction file_ids.
-    /// Each file is streamed from disk — never loaded fully into memory.
-    /// Files are sent sequentially with semaphore-gated concurrency:
-    /// - At most `MAX_PENDING_FILE_ACKS` files can be in-flight (sent but not ACKed)
-    /// - While waiting for a permit, periodically probe peer liveness with AreYouAwake
-    /// - If peer goes offline, mark disconnected and return error
     pub async fn send_folder_data(
         &self,
         peer_id: &str,
         folder_path: &str,
-        file_entries: Vec<(Uuid, String)>, // (file_id, relative_path)
+        file_entries: Vec<(Uuid, String)>,
     ) -> Result<()> {
         use crate::core::config::FILE_ACK_POLL_INTERVAL;
 
-        let root = std::path::Path::new(folder_path);
-        let root_parent = root.parent().unwrap_or(root);
-
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
+        let root_parent = {
+            let root = std::path::Path::new(folder_path);
+            root.parent().unwrap_or(root).to_path_buf()
         };
 
-        // Verify peer is alive before starting folder transfer
-        if let Err(e) = conn.check_peer_alive().await {
-            let _ = self.event_tx.send(AppEvent::PeerDisconnected {
-                peer_id: peer_id.to_string(),
-                explicit: false,
-            });
-            return Err(e);
-        }
+        let conn = self.get_connection(peer_id).await?;
+        self.check_alive_or_disconnect(peer_id, &conn).await?;
 
-        tracing::info!(
+        info!(
             "Sending folder '{}' ({} files) to {} via Transaction protocol (async streaming)",
             folder_path,
             file_entries.len(),
@@ -1186,21 +1019,15 @@ impl PeerNode {
         let semaphore = &conn.file_ack_semaphore;
 
         for (idx, (file_id, relative_path)) in file_entries.into_iter().enumerate() {
-            // Acquire a semaphore permit before sending each file.
-            // This ensures at most MAX_PENDING_FILE_ACKS files are in-flight.
-            // While waiting, periodically probe peer liveness.
+            // Acquire semaphore, probing liveness on each timeout.
             loop {
                 match tokio::time::timeout(FILE_ACK_POLL_INTERVAL, semaphore.acquire()).await {
                     Ok(Ok(permit)) => {
-                        // Got a permit — consume it (FileReceived handler adds permits back)
                         permit.forget();
                         break;
                     }
-                    Ok(Err(_)) => {
-                        return Err(anyhow::anyhow!("File ACK semaphore closed"));
-                    }
+                    Ok(Err(_)) => return Err(anyhow::anyhow!("File ACK semaphore closed")),
                     Err(_timeout) => {
-                        // Timed out waiting for permit — probe peer liveness
                         if let Err(e) = conn.check_peer_alive().await {
                             warn!(
                                 event = "folder_send_peer_offline",
@@ -1210,7 +1037,7 @@ impl PeerNode {
                                 "Peer not responding while waiting for file ACKs"
                             );
                             let _ = self.event_tx.send(AppEvent::PeerDisconnected {
-                                peer_id: peer_id.to_string(),
+                                peer_id: peer_id_owned.clone(),
                                 explicit: false,
                             });
                             return Err(anyhow::anyhow!(
@@ -1218,7 +1045,7 @@ impl PeerNode {
                                 idx
                             ));
                         }
-                        tracing::debug!(
+                        debug!(
                             "Peer {} still alive, waiting for file ACK permits ({}/{})",
                             short_id(peer_id),
                             idx,
@@ -1233,7 +1060,7 @@ impl PeerNode {
             let filesize = match tokio::fs::metadata(&full_path).await {
                 Ok(m) => m.len(),
                 Err(e) => {
-                    tracing::error!(
+                    error!(
                         "Failed to stat file for folder transfer: {} — {}",
                         full_path.display(),
                         e
@@ -1243,42 +1070,34 @@ impl PeerNode {
                         file_id,
                         success: false,
                     });
-                    // Return the permit since we won't actually send this file
                     semaphore.add_permits(1);
                     continue;
                 }
             };
 
-            tracing::debug!(
+            debug!(
                 "Sending file '{}' ({} bytes) [file_id={}]",
-                relative_path,
-                filesize,
-                file_id
+                relative_path, filesize, file_id
             );
 
             if let Err(e) = conn
-                .send_file(file_id, full_path.clone(), filesize, relative_path.as_str())
+                .send_file(file_id, full_path, filesize, &relative_path)
                 .await
             {
                 let err_str = e.to_string();
-                tracing::error!(
+                error!(
                     "Failed to send file '{}' [file_id={}]: {}",
-                    relative_path,
-                    file_id,
-                    err_str
+                    relative_path, file_id, err_str
                 );
                 let _ = self.event_tx.send(AppEvent::SendComplete {
                     _peer_id: peer_id_owned.clone(),
                     file_id,
                     success: false,
                 });
-                // Return the permit since we failed to send
                 semaphore.add_permits(1);
-                // If the data channel is permanently dead, stop trying
-                // remaining files — every subsequent send would also fail.
                 if err_str.contains("permanently closed") || err_str.contains("not available") {
                     let remaining = total_files.saturating_sub(idx + 1);
-                    tracing::error!(
+                    error!(
                         "Connection to peer lost — aborting remaining {} file(s) in folder transfer",
                         remaining
                     );
@@ -1290,9 +1109,8 @@ impl PeerNode {
         Ok(())
     }
 
-    // ── Transaction-level API ────────────────────────────────────────────
+    // ── Transaction API ──────────────────────────────────────────────────
 
-    /// Deliver all pending messages for a peer after connection.
     pub async fn deliver_pending_messages(&self, peer_id: &str) -> Result<()> {
         use crate::core::persistence::{Persistence, QueuedMessageType};
 
@@ -1315,16 +1133,7 @@ impl PeerNode {
             "Delivering pending messages to reconnected peer"
         );
 
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-
-        // Wait for data channels to be ready
+        let conn = self.get_connection(peer_id).await?;
         conn.wait_data_channels_open()
             .await
             .context("Data channels not ready for pending messages")?;
@@ -1390,7 +1199,6 @@ impl PeerNode {
                         error = %e,
                         "Failed to deliver pending message, will retry later"
                     );
-                    // Don't remove the message - keep it for retry
                 }
             }
         }
@@ -1398,7 +1206,6 @@ impl PeerNode {
         Ok(())
     }
 
-    /// Send a transaction request to a peer (new protocol).
     pub async fn send_transaction_request(
         &self,
         peer_id: &str,
@@ -1407,27 +1214,12 @@ impl PeerNode {
         manifest: TransactionManifest,
         total_size: u64,
     ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-        // Verify peer is alive before sending transaction request
-        if let Err(e) = conn.check_peer_alive().await {
-            let _ = self.event_tx.send(AppEvent::PeerDisconnected {
-                peer_id: peer_id.to_string(),
-                explicit: false,
-            });
-            return Err(e);
-        }
+        let conn = self.get_connection(peer_id).await?;
+        self.check_alive_or_disconnect(peer_id, &conn).await?;
         conn.send_transaction_request(transaction_id, display_name, manifest, total_size)
             .await
     }
 
-    /// Respond to a transaction request (accept/reject).
     pub async fn respond_to_transaction(
         &self,
         peer_id: &str,
@@ -1436,15 +1228,7 @@ impl PeerNode {
         dest_path: Option<String>,
         reject_reason: Option<String>,
     ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-        // Verify connection is ready before sending
+        let conn = self.get_connection(peer_id).await?;
         conn.wait_data_channels_open()
             .await
             .context("Data channels not ready for transaction response")?;
@@ -1452,21 +1236,12 @@ impl PeerNode {
             .await
     }
 
-    /// Accept a resume request for a transaction.
     pub async fn accept_transaction_resume(
         &self,
         peer_id: &str,
         transaction_id: Uuid,
     ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-        // Verify connection is ready before sending
+        let conn = self.get_connection(peer_id).await?;
         conn.wait_data_channels_open()
             .await
             .context("Data channels not ready for resume acceptance")?;
@@ -1474,20 +1249,12 @@ impl PeerNode {
             .await
     }
 
-    /// Reject a resume request for a transaction.
     pub async fn reject_transaction_resume(
         &self,
         peer_id: &str,
         transaction_id: Uuid,
     ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
+        let conn = self.get_connection(peer_id).await?;
         conn.wait_data_channels_open()
             .await
             .context("Data channels not ready for resume rejection")?;
@@ -1495,96 +1262,58 @@ impl PeerNode {
             .await
     }
 
-    /// Send a resume request to the peer (receiver side, requesting retransmission).
     pub async fn send_resume_request(
         &self,
         peer_id: &str,
         _transaction_id: Uuid,
         resume_info: ResumeInfo,
     ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            let entry = peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?;
-            entry.connection.clone()
-        };
-
-        // Verify connection is fully ready before sending
+        let conn = self.get_connection(peer_id).await?;
         conn.wait_data_channels_open()
             .await
             .context("Data channels not ready for resume request")?;
-
-        conn.send_control(
-            &crate::core::connection::webrtc::ControlMessage::TransactionResumeRequest {
-                resume_info,
-            },
-        )
-        .await
+        conn.send_control(&ControlMessage::TransactionResumeRequest { resume_info })
+            .await
     }
 
-    /// Notify the peer that a transaction has completed successfully.
     pub async fn send_transaction_complete(
         &self,
         peer_id: &str,
         transaction_id: Uuid,
     ) -> Result<()> {
-        let conn = {
-            let peers = self.peers.lock().await;
-            peers
-                .get(peer_id)
-                .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?
-                .connection
-                .clone()
-        };
-        // Verify connection is ready before sending
+        let conn = self.get_connection(peer_id).await?;
         conn.wait_data_channels_open()
             .await
             .context("Data channels not ready for transaction complete")?;
-        conn.send_control(
-            &crate::core::connection::webrtc::ControlMessage::TransactionComplete {
-                transaction_id,
-            },
-        )
-        .await
+        conn.send_control(&ControlMessage::TransactionComplete { transaction_id })
+            .await
     }
 
-    /// Send a TransactionCancel to the peer.
-    /// If the peer is offline, queues the message for later delivery.
     pub async fn send_transaction_cancel(&self, peer_id: &str, transaction_id: Uuid) -> Result<()> {
-        let conn_opt = {
-            let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|e| e.connection.clone())
-        };
-
-        match conn_opt {
-            Some(conn) => {
-                // Peer is connected - verify connection is ready before sending
-                match conn.wait_data_channels_open().await {
-                    Ok(()) => {
-                        conn.send_transaction_cancel(transaction_id, Some("User cancelled".to_string()))
-                            .await
-                    }
-                    Err(e) => {
-                        // Connection not ready - queue the cancel for later
-                        tracing::warn!(
-                            event = "cancel_queued_connection_not_ready",
-                            transaction_id = %transaction_id,
-                            peer_id = %peer_id,
-                            error = %e,
-                            "Peer connection not ready, queuing cancel message"
-                        );
-                        self.queue_message_for_peer(
-                            peer_id,
-                            crate::core::persistence::QueuedMessageType::TransactionCancel { transaction_id },
-                        )?;
-                        Ok(())
-                    }
+        match self.try_get_connection(peer_id).await {
+            Some(conn) => match conn.wait_data_channels_open().await {
+                Ok(()) => {
+                    conn.send_transaction_cancel(transaction_id, Some("User cancelled".to_string()))
+                        .await
                 }
-            }
+                Err(e) => {
+                    warn!(
+                        event = "cancel_queued_connection_not_ready",
+                        transaction_id = %transaction_id,
+                        peer_id = %peer_id,
+                        error = %e,
+                        "Peer connection not ready, queuing cancel message"
+                    );
+                    self.queue_message_for_peer(
+                        peer_id,
+                        crate::core::persistence::QueuedMessageType::TransactionCancel {
+                            transaction_id,
+                        },
+                    )
+                }
+            },
             None => {
-                // Peer is offline - queue the cancel for later delivery
-                tracing::info!(
+                info!(
                     event = "cancel_queued_peer_offline",
                     transaction_id = %transaction_id,
                     peer_id = %peer_id,
@@ -1592,10 +1321,65 @@ impl PeerNode {
                 );
                 self.queue_message_for_peer(
                     peer_id,
-                    crate::core::persistence::QueuedMessageType::TransactionCancel { transaction_id },
-                )?;
-                Ok(())
+                    crate::core::persistence::QueuedMessageType::TransactionCancel {
+                        transaction_id,
+                    },
+                )
             }
+        }
+    }
+
+    pub async fn send_transaction_complete_ack(
+        &self,
+        peer_id: &str,
+        transaction_id: Uuid,
+    ) -> Result<()> {
+        let conn = self.get_connection(peer_id).await?;
+        conn.send_control(&ControlMessage::TransactionCompleteAck { transaction_id })
+            .await
+    }
+
+    /// Retransmit specific chunks (or the whole file if `chunk_indices` is empty).
+    pub async fn retransmit_chunks(
+        &self,
+        engine: &mut crate::core::engine::TransferEngine,
+        peer_id: &str,
+        file_id: Uuid,
+        chunk_indices: &[u32],
+    ) -> Result<()> {
+        let conn = self.get_connection(peer_id).await?;
+
+        let (txn_id, filesize, relative_path) =
+            if let Some(txn) = engine.find_transaction_by_file_mut(&file_id) {
+                let tf = txn
+                    .files
+                    .get(&file_id)
+                    .ok_or_else(|| anyhow::anyhow!("File not found in transaction: {}", file_id))?;
+                (txn.id, tf.filesize, tf.relative_path.clone())
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Transaction not found for file: {}",
+                    file_id
+                ));
+            };
+
+        let file_path = engine
+            .get_source_path(&txn_id)
+            .ok_or_else(|| anyhow::anyhow!("Source path not found for transaction: {}", txn_id))?;
+        let path = std::path::PathBuf::from(file_path);
+
+        if chunk_indices.is_empty() {
+            conn.send_file(file_id, path, filesize, &relative_path)
+                .await
+        } else {
+            conn.send_file_chunks(
+                file_id,
+                path,
+                filesize,
+                &relative_path,
+                chunk_indices.to_vec(),
+            )
+            .await
         }
     }
 
@@ -1606,10 +1390,8 @@ impl PeerNode {
     }
 
     pub async fn list_remote_directory(&self, peer_id: &str, path: String) -> Result<()> {
-        let peers = self.peers.lock().await;
-        if let Some(peer) = peers.get(peer_id) {
-            peer.connection
-                .send_control(&crate::core::connection::webrtc::ControlMessage::LsRequest { path })
+        if let Some(conn) = self.try_get_connection(peer_id).await {
+            conn.send_control(&ControlMessage::LsRequest { path })
                 .await?;
         }
         Ok(())
@@ -1621,23 +1403,13 @@ impl PeerNode {
         path: String,
         is_folder: bool,
     ) -> Result<()> {
-        let peers = self.peers.lock().await;
-        if let Some(peer) = peers.get(peer_id) {
-            peer.connection
-                .send_control(
-                    &crate::core::connection::webrtc::ControlMessage::FetchRequest {
-                        path,
-                        is_folder,
-                    },
-                )
+        if let Some(conn) = self.try_get_connection(peer_id).await {
+            conn.send_control(&ControlMessage::FetchRequest { path, is_folder })
                 .await?;
         }
         Ok(())
     }
 
-    /// Like `fetch_remote_path` but also stores a destination path in the app
-    /// event channel so the UI can auto-accept the incoming file to the right
-    /// location.  The dest_path is carried as a special Info event.
     pub async fn fetch_remote_path_with_dest(
         &self,
         peer_id: &str,
@@ -1645,7 +1417,6 @@ impl PeerNode {
         is_folder: bool,
         dest_path: String,
     ) -> Result<()> {
-        // Notify the UI to store the save path for auto-accept
         let _ = self.event_tx.send(AppEvent::Info(format!(
             "REMOTE_SAVE_PATH:{}:{}",
             peer_id, dest_path
@@ -1655,31 +1426,18 @@ impl PeerNode {
 
     pub async fn get_peer_key(&self, peer_id: &str) -> Option<[u8; 32]> {
         let peers = self.peers.lock().await;
-        if let Some(entry) = peers.get(peer_id) {
-            Some(entry.key_manager.current_key().await)
-        } else {
-            None
-        }
+        let entry = peers.get(peer_id)?;
+        Some(entry.key_manager.current_key().await)
     }
 
-    /// Get the ticket string stored for a peer (used for persistence).
     pub async fn get_peer_ticket(&self, peer_id: &str) -> Option<String> {
         self.peer_tickets.lock().await.get(peer_id).cloned()
     }
 
-    /// Check if a peer currently has an active connection in the peers map.
-    /// Used to detect stale disconnect events from evicted connections.
     pub async fn is_peer_connected(&self, peer_id: &str) -> bool {
         self.peers.lock().await.contains_key(peer_id)
     }
 
-    /// Wait for a peer to appear in the connection map.
-    ///
-    /// Returns `true` if the peer became available within the timeout.
-    /// This is used by resume action handlers to tolerate the race where
-    /// a control-channel message (e.g. `TransactionResumeRequested`) is
-    /// forwarded to the event loop before the connection setup has finished
-    /// inserting the peer into the map.
     pub async fn wait_for_peer(&self, peer_id: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let poll_interval = Duration::from_millis(50);
@@ -1694,73 +1452,48 @@ impl PeerNode {
         }
     }
 
-    /// Pre-register file destinations so that incoming Metadata frames can
-    /// look up the correct save path. Called by the TransferEngine when
-    /// accepting an incoming Transaction.
     pub async fn prepare_file_reception(
         &self,
         peer_id: &str,
         files: Vec<(Uuid, std::path::PathBuf)>,
     ) -> Result<()> {
-        let peers = self.peers.lock().await;
-        let entry = peers
-            .get(peer_id)
-            .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?;
+        let conn = self.get_connection(peer_id).await?;
         for (file_id, dest_path) in files {
-            entry
-                .connection
-                .register_file_destination(file_id, dest_path)
-                .await;
+            conn.register_file_destination(file_id, dest_path).await;
         }
         Ok(())
     }
 
-    /// Pre-register chunk bitmaps for resumed files so that the Metadata
-    /// handler can open the existing temp file without truncating.
     pub async fn prepare_resume_bitmaps(
         &self,
         peer_id: &str,
         bitmaps: Vec<(Uuid, crate::core::pipeline::chunk::ChunkBitmap)>,
     ) -> Result<()> {
-        let peers = self.peers.lock().await;
-        let entry = peers
-            .get(peer_id)
-            .ok_or_else(|| anyhow::anyhow!("Peer not found: {}", peer_id))?;
+        let conn = self.get_connection(peer_id).await?;
         for (file_id, bitmap) in bitmaps {
-            entry
-                .connection
-                .register_resume_bitmap(file_id, bitmap)
-                .await;
+            conn.register_resume_bitmap(file_id, bitmap).await;
         }
         Ok(())
     }
 
     pub async fn remove_peer(&self, peer_id: &str) {
-        let mut peers = self.peers.lock().await;
-        if let Some(entry) = peers.remove(peer_id) {
+        if let Some(entry) = self.peers.lock().await.remove(peer_id) {
             let _ = entry.connection.close().await;
         }
         info!(event = "peer_disconnected", peer = %short_id(peer_id), explicit = true, "Peer explicitly disconnected");
         let _ = self.event_tx.send(AppEvent::PeerDisconnected {
             peer_id: peer_id.to_string(),
-            explicit: true, // User-initiated disconnect
+            explicit: true,
         });
     }
 
-    /// Remove a stale peer entry from the internal map without firing events.
-    /// Called when a connection-lost event is detected so the peer slot is freed
-    /// and the remote side can reconnect inbound.
-    ///
-    /// NOTE: We intentionally do NOT call `close()` on the connection here.
-    /// The `WebRTCConnection` will be cleaned up when its last `Arc` ref drops.
     pub async fn cleanup_peer(&self, peer_id: &str) {
-        let mut peers = self.peers.lock().await;
-        if peers.remove(peer_id).is_some() {
+        if self.peers.lock().await.remove(peer_id).is_some() {
             debug!(event = "peer_cleanup", peer = %short_id(peer_id), "Stale peer entry removed (no close)");
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────
+    // ── Logging helpers ──────────────────────────────────────────────────
 
     fn connecting_notify(&self, peer_id: &str, status: &str) {
         let _ = self.event_tx.send(AppEvent::Connecting {

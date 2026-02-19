@@ -12,7 +12,7 @@ use tracing::error;
 /// A connection ticket containing an endpoint address.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Ticket {
-    pub(crate) address: EndpointAddr,
+    pub address: EndpointAddr,
 }
 
 impl Ticket {

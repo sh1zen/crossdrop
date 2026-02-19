@@ -32,7 +32,7 @@ use webrtc::data_channel::RTCDataChannel;
 ///
 /// All fields are cheaply cloneable (`Arc`s or `Option<Sender<…>>`).
 /// The struct is `Clone` so it can be captured by the `on_message` closure.
-pub(crate) struct HandlerContext {
+pub struct HandlerContext {
     pub recv_state: Arc<RwLock<HashMap<Uuid, ReceiveFileState>>>,
     pub pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>, u64)>>>>,
     pub accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
@@ -113,7 +113,7 @@ fn decrypt_frame(
 // ── Handler attachment ────────────────────────────────────────────────────────
 
 /// Attach `on_open`, `on_close`, `on_error`, and `on_message` callbacks to `dc`.
-pub(crate) async fn attach_dc_handlers(dc: &Arc<RTCDataChannel>, ctx: HandlerContext) {
+pub async fn attach_dc_handlers(dc: &Arc<RTCDataChannel>, ctx: HandlerContext) {
     let label = dc.label().to_string();
     dc.on_close(Box::new(move || {
         let label = label.clone();

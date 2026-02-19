@@ -72,7 +72,7 @@ impl WebRTCConnection {
     ///
     /// Finalization runs from a `tokio::spawn` call so it must not return
     /// before all side effects complete; errors are logged locally.
-    pub(crate) async fn finalize_file_receive(
+    pub async fn finalize_file_receive(
         dc: &Arc<RTCDataChannel>,
         file_id: Uuid,
         state: ReceiveFileState,

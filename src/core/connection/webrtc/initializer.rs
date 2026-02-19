@@ -128,7 +128,7 @@ impl ConnectionState {
 ///
 /// Grouping these reduces per-function parameter count and makes the call
 /// sites easier to read without changing any logic.
-pub(crate) struct ConnectionArgs {
+pub struct ConnectionArgs {
     pub app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
     pub shared_key: Arc<RwLock<[u8; 32]>>,
     pub key_manager: Option<SessionKeyManager>,
@@ -193,7 +193,7 @@ impl WebRTCConnection {
 // ── ICE Gathering ─────────────────────────────────────────────────────────────
 
 impl WebRTCConnection {
-    pub(crate) async fn gather_local_description(pc: &Arc<RTCPeerConnection>) -> Result<String> {
+    pub async fn gather_local_description(pc: &Arc<RTCPeerConnection>) -> Result<String> {
         // Fast path: already complete.
         if pc.ice_gathering_state() == RTCIceGatheringState::Complete {
             return Self::get_serialized_local_description(pc).await;

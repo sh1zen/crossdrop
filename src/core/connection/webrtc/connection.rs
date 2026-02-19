@@ -31,38 +31,38 @@ use webrtc::peer_connection::RTCPeerConnection;
 /// The struct is `Send + Sync`.
 pub struct WebRTCConnection {
     // ── WebRTC core ───────────────────────────────────────────────────────────
-    pub(crate) peer_connection: Arc<RTCPeerConnection>,
+    pub peer_connection: Arc<RTCPeerConnection>,
     /// JSON control messages (chat, metadata, acknowledgements).
-    pub(crate) control_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
+    pub control_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
     /// Binary file chunks.
-    pub(crate) data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
+    pub data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
 
     // ── Application interface ─────────────────────────────────────────────────
-    pub(crate) app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
+    pub app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
     /// Notified when the peer replies to an `AreYouAwake` probe.
-    pub(crate) awake_notify: Arc<tokio::sync::Notify>,
+    pub awake_notify: Arc<tokio::sync::Notify>,
 
     // ── File transfer state ───────────────────────────────────────────────────
     /// Accepted save directories keyed by `file_id`.
-    pub(crate) accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
+    pub accepted_destinations: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
     /// Per-file chunk bitmaps for resume support.
-    pub(crate) resume_bitmaps:
+    pub resume_bitmaps:
         Arc<RwLock<HashMap<Uuid, crate::core::pipeline::chunk::ChunkBitmap>>>,
     /// Limits the number of concurrently in-flight (sent but unacknowledged) files.
-    pub(crate) file_ack_semaphore: Arc<Semaphore>,
+    pub file_ack_semaphore: Arc<Semaphore>,
 
     // ── Cryptography ──────────────────────────────────────────────────────────
-    pub(crate) shared_key: Arc<RwLock<[u8; 32]>>,
-    pub(crate) key_manager: Option<SessionKeyManager>,
+    pub shared_key: Arc<RwLock<[u8; 32]>>,
+    pub key_manager: Option<SessionKeyManager>,
     /// Ephemeral keypair held during an in-progress key rotation.
-    pub(crate) pending_rotation:
+    pub pending_rotation:
         Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
 
     // ── Counters ──────────────────────────────────────────────────────────────
     /// Monotonic outgoing chat counter (replay protection).
-    pub(crate) chat_send_counter: Arc<RwLock<u64>>,
+    pub chat_send_counter: Arc<RwLock<u64>>,
     /// Cumulative wire-level TX bytes.
-    pub(crate) wire_tx: Arc<std::sync::atomic::AtomicU64>,
+    pub wire_tx: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // ── Inherent impl ─────────────────────────────────────────────────────────────
