@@ -28,7 +28,32 @@ const BLOCK_SIZE: usize = 136;
 /// # Returns
 /// A 32-byte HMAC tag.
 pub fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let actual_key = if key.len() > BLOCK_SIZE {
+    let actual_key = prepare_key(key);
+
+    let (ipad, opad) = compute_pads(&actual_key);
+
+    // Inner hash: H(ipad || data)
+    let inner_hash = {
+        let mut inner = Sha3_256::new();
+        inner.update(&ipad);
+        inner.update(data);
+        inner.finalize()
+    };
+
+    // Outer hash: H(opad || inner_hash)
+    let mut outer = Sha3_256::new();
+    outer.update(&opad);
+    outer.update(&inner_hash);
+    let result = outer.finalize();
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Prepare the key for HMAC: hash if too long, pad if too short.
+fn prepare_key(key: &[u8]) -> [u8; BLOCK_SIZE] {
+    if key.len() > BLOCK_SIZE {
         let mut h = Sha3_256::new();
         h.update(key);
         let digest = h.finalize();
@@ -39,28 +64,20 @@ pub fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
         let mut k = [0u8; BLOCK_SIZE];
         k[..key.len()].copy_from_slice(key);
         k
-    };
+    }
+}
 
+/// Compute the inner and outer pads for HMAC.
+fn compute_pads(key: &[u8; BLOCK_SIZE]) -> ([u8; BLOCK_SIZE], [u8; BLOCK_SIZE]) {
     let mut ipad = [0x36u8; BLOCK_SIZE];
     let mut opad = [0x5cu8; BLOCK_SIZE];
+
     for i in 0..BLOCK_SIZE {
-        ipad[i] ^= actual_key[i];
-        opad[i] ^= actual_key[i];
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
     }
 
-    let mut inner = Sha3_256::new();
-    inner.update(&ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha3_256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    let result = outer.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+    (ipad, opad)
 }
 
 /// Constant-time comparison of two 32-byte values.

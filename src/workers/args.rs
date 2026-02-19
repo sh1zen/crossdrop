@@ -1,3 +1,10 @@
+//! Command-line argument parsing and configuration.
+//!
+//! Supports:
+//! - CLI arguments via clap
+//! - TOML configuration file
+//! - Merging CLI with file config (CLI takes precedence)
+
 use clap::Parser;
 use iroh::{RelayMode, RelayUrl};
 use serde::{Deserialize, Serialize};
@@ -7,8 +14,9 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// Crossdrop - P2P file sharing and chat.
 #[derive(Parser, Deserialize, Clone, Debug)]
-#[command(author, version, about = "Crossdrop - P2P file sharing and chat")]
+#[command(author, version, about)]
 #[command(propagate_version = true)]
 pub struct Args {
     /// The IPv4 address that socket will listen on.
@@ -23,6 +31,7 @@ pub struct Args {
     #[clap(short, long, default_value_t = 0)]
     pub port: u16,
 
+    /// Verbosity level (-v, -vv, -vvv).
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -30,10 +39,11 @@ pub struct Args {
     #[clap(long, default_value_t = RelayModeOption::Default)]
     pub relay: RelayModeOption,
 
+    /// Show the secret key on startup.
     #[clap(long)]
     pub show_secret: bool,
 
-    /// Remote access allowed
+    /// Enable remote access.
     #[clap(long)]
     pub remote_access: bool,
 
@@ -57,9 +67,8 @@ impl Args {
         cli_args.conf = cli_args.conf.map(Self::resolve_path);
 
         let default_path = PathBuf::from("config.toml");
-        if let Some(mut file_args) = Self::from_file(&default_path) {
-            file_args = Self::merge(file_args, cli_args);
-            return file_args;
+        if let Some(file_args) = Self::from_file(&default_path) {
+            return Self::merge(file_args, cli_args);
         }
 
         cli_args
@@ -74,6 +83,7 @@ impl Args {
         }
     }
 
+    /// Load args from a TOML file.
     fn from_file(path: &Path) -> Option<Self> {
         if !path.exists() {
             return None;
@@ -82,6 +92,7 @@ impl Args {
         toml::from_str::<Args>(&content).ok()
     }
 
+    /// Merge file args with CLI args (CLI takes precedence).
     fn merge(mut file: Args, cli: Args) -> Args {
         if cli.ipv4_addr.is_some() {
             file.ipv4_addr = cli.ipv4_addr;
@@ -111,6 +122,8 @@ impl Args {
         file
     }
 }
+
+// ── Relay Mode Option ──────────────────────────────────────────────────────────
 
 /// Available command line options for configuring relays.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,5 +162,11 @@ impl From<RelayModeOption> for RelayMode {
             RelayModeOption::Default => RelayMode::Default,
             RelayModeOption::Custom(url) => RelayMode::Custom(url.into()),
         }
+    }
+}
+
+impl Default for RelayModeOption {
+    fn default() -> Self {
+        Self::Default
     }
 }

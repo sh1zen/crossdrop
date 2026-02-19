@@ -36,7 +36,7 @@ impl MessageAuthenticator {
         data.extend_from_slice(transaction_id.as_bytes());
         data.extend_from_slice(&counter.to_be_bytes());
         data.extend_from_slice(payload);
-        hmac_sha3_256(session_key, &data)
+        crate::utils::crypto::hmac_sha3_256(session_key, &data)
     }
 
     /// Create an authenticated message.
@@ -59,18 +59,8 @@ impl MessageAuthenticator {
     pub fn verify(session_key: &[u8; 32], msg: &AuthenticatedMessage) -> bool {
         let expected =
             Self::compute_hmac(session_key, &msg.transaction_id, msg.counter, &msg.payload);
-        constant_time_eq(&expected, &msg.hmac)
+        crate::utils::crypto::constant_time_eq(&expected, &msg.hmac)
     }
-}
-
-/// HMAC-SHA3-256 — delegates to the centralized implementation in `utils::crypto`.
-fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    crate::utils::crypto::hmac_sha3_256(key, data)
-}
-
-/// Constant-time comparison — delegates to the centralized implementation in `utils::crypto`.
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    crate::utils::crypto::constant_time_eq(a, b)
 }
 
 #[cfg(test)]

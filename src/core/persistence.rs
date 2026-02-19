@@ -1,3 +1,11 @@
+//! Persistent state management for the application.
+//!
+//! Provides:
+//! - Transfer history tracking
+//! - Chat message persistence
+//! - Pending message queue for offline peers
+//! - User preferences (display name, theme)
+
 use crate::core::transaction::{TransactionDirection, TransactionSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -178,28 +186,44 @@ pub struct Persistence {
 }
 
 impl Persistence {
+    /// Load persistence state from disk, or return default if not found.
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
             return Ok(Self::default());
         }
+
         let content = std::fs::read_to_string(&path).map_err(|e| {
-            warn!(event = "persistence_read_failure", path = %path.display(), error = %e, "Failed to read persistence file");
+            warn!(
+                event = "persistence_read_failure",
+                path = %path.display(),
+                error = %e,
+                "Failed to read persistence file"
+            );
             e
         })?;
+
         let p: Persistence = serde_json::from_str(&content).map_err(|e| {
-            error!(event = "persistence_parse_failure", path = %path.display(), error = %e, "Failed to parse persistence state");
+            error!(
+                event = "persistence_parse_failure",
+                path = %path.display(),
+                error = %e,
+                "Failed to parse persistence state"
+            );
             e
         })?;
+
         debug!(
             event = "persistence_loaded",
             transactions = p.transactions.len(),
             history = p.transfer_history.len(),
             "Persistence state loaded"
         );
+
         Ok(p)
     }
 
+    /// Persist current state to disk atomically.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         let content = serde_json::to_string_pretty(self)?;
@@ -248,11 +272,7 @@ impl Persistence {
 
     /// Clear chat history for a specific target and persist.
     pub fn clear_chat_target(&mut self, target: &ChatTargetSnapshot) -> Result<()> {
-        self.chat_history.retain(|m| match (&m.target, target) {
-            (ChatTargetSnapshot::Room, ChatTargetSnapshot::Room) => false,
-            (ChatTargetSnapshot::Peer(a), ChatTargetSnapshot::Peer(b)) if a == b => false,
-            _ => true,
-        });
+        self.chat_history.retain(|m| !matches_target(&m.target, target));
         self.save()
     }
 
@@ -282,6 +302,7 @@ impl Persistence {
     pub fn remove_pending_message(&mut self, id: &Uuid) -> Result<()> {
         let initial_len = self.pending_messages.len();
         self.pending_messages.retain(|m| m.id != *id);
+
         if self.pending_messages.len() < initial_len {
             info!(
                 event = "pending_message_removed",
@@ -290,11 +311,21 @@ impl Persistence {
             );
             self.save()?;
         }
+
         Ok(())
     }
 
     fn path() -> Result<PathBuf> {
         let dir = crate::utils::data_dir::get();
         Ok(dir.join("transfers.json"))
+    }
+}
+
+/// Check if a chat target matches another (for filtering).
+fn matches_target(a: &ChatTargetSnapshot, b: &ChatTargetSnapshot) -> bool {
+    match (a, b) {
+        (ChatTargetSnapshot::Room, ChatTargetSnapshot::Room) => true,
+        (ChatTargetSnapshot::Peer(id_a), ChatTargetSnapshot::Peer(id_b)) => id_a == id_b,
+        _ => false,
     }
 }

@@ -1,3 +1,9 @@
+//! Log buffering and file logging for the application.
+//!
+//! Provides:
+//! - In-memory ring buffer for UI log display
+//! - File logging layer for persistent log storage
+
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -11,6 +17,9 @@ use tracing_subscriber::Layer;
 
 use crate::core::config::MAX_LOG_ENTRIES as MAX_ENTRIES;
 
+// ── Log Entry ──────────────────────────────────────────────────────────────────
+
+/// A single log entry with timestamp, level, and message.
 #[derive(Clone)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -18,6 +27,9 @@ pub struct LogEntry {
     pub message: String,
 }
 
+// ── Log Buffer ─────────────────────────────────────────────────────────────────
+
+/// Thread-safe ring buffer for log entries.
 #[derive(Clone)]
 pub struct LogBuffer {
     entries: Arc<Mutex<VecDeque<LogEntry>>>,
@@ -30,6 +42,7 @@ impl LogBuffer {
         }
     }
 
+    /// Push a new entry, evicting the oldest if at capacity.
     pub fn push(&self, entry: LogEntry) {
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= MAX_ENTRIES {
@@ -38,11 +51,60 @@ impl LogBuffer {
         entries.push_back(entry);
     }
 
+    /// Get a snapshot of all current entries.
     pub fn entries(&self) -> Vec<LogEntry> {
         self.entries.lock().unwrap().iter().cloned().collect()
     }
 }
 
+impl Default for LogBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Message Visitor ────────────────────────────────────────────────────────────
+
+/// Visitor for extracting and formatting log message fields.
+struct MessageVisitor {
+    message: String,
+}
+
+impl MessageVisitor {
+    fn new() -> Self {
+        Self {
+            message: String::new(),
+        }
+    }
+
+    fn format_field(&mut self, name: &str, value: String) {
+        if name == "message" {
+            if self.message.is_empty() {
+                self.message = value;
+            } else {
+                self.message = format!("{}, {}", self.message, value);
+            }
+        } else if self.message.is_empty() {
+            self.message = format!("{name} = {value}");
+        } else {
+            self.message.push_str(&format!(", {name} = {value}"));
+        }
+    }
+}
+
+impl Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.format_field(field.name(), format!("{:?}", value));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.format_field(field.name(), value.to_string());
+    }
+}
+
+// ── Buffer Layer ───────────────────────────────────────────────────────────────
+
+/// Tracing layer that writes events to an in-memory buffer.
 pub struct BufferLayer {
     buffer: LogBuffer,
 }
@@ -53,71 +115,15 @@ impl BufferLayer {
     }
 }
 
-struct MessageVisitor {
-    message: String,
-}
-
-impl Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{:?}", value);
-        } else if self.message.is_empty() {
-            self.message = format!("{} = {:?}", field.name(), value);
-        } else {
-            self.message
-                .push_str(&format!(", {} = {:?}", field.name(), value));
-        }
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else if self.message.is_empty() {
-            self.message = format!("{} = {}", field.name(), value);
-        } else {
-            self.message
-                .push_str(&format!(", {} = {}", field.name(), value));
-        }
-    }
-}
-
 impl<S: Subscriber> Layer<S> for BufferLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        let level = *meta.level();
-
-        let mut visitor = MessageVisitor {
-            message: String::new(),
-        };
-        event.record(&mut visitor);
-
-        let target = meta.target();
-        let message = if visitor.message.is_empty() {
-            target.to_string()
-        } else {
-            format!("{}: {}", target, visitor.message)
-        };
-
-        let now = {
-            let dur = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            let total_secs = dur.as_secs();
-            let h = (total_secs / 3600) % 24;
-            let m = (total_secs / 60) % 60;
-            let s = total_secs % 60;
-            format!("{:02}:{:02}:{:02}", h, m, s)
-        };
-
-        self.buffer.push(LogEntry {
-            timestamp: now,
-            level,
-            message,
-        });
+        let entry = create_log_entry(event, meta, format_timestamp_time_only);
+        self.buffer.push(entry);
     }
 }
 
-// ── File Logging Layer ──────────────────────────────────────────────────────
+// ── File Log Layer ─────────────────────────────────────────────────────────────
 
 /// A tracing layer that writes log events to a file.
 /// Writes full ISO 8601 timestamps for complete log history.
@@ -145,36 +151,66 @@ impl FileLogLayer {
 impl<S: Subscriber> Layer<S> for FileLogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        let level = *meta.level();
+        let entry = create_log_entry(event, meta, format_timestamp_iso8601);
 
-        let mut visitor = MessageVisitor {
-            message: String::new(),
-        };
-        event.record(&mut visitor);
-
-        let target = meta.target();
-        let message = if visitor.message.is_empty() {
-            target.to_string()
-        } else {
-            format!("{}: {}", target, visitor.message)
-        };
-
-        // Full ISO 8601 timestamp with date for file logs
-        let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
-
-        let level_str = match level {
-            Level::ERROR => "ERROR",
-            Level::WARN => "WARN",
-            Level::INFO => "INFO",
-            Level::DEBUG => "DEBUG",
-            Level::TRACE => "TRACE",
-        };
-
-        let log_line = format!("[{}] {} {}\n", timestamp, level_str, message);
+        let level_str = level_to_str(entry.level);
+        let log_line = format!("[{}] {} {}\n", entry.timestamp, level_str, entry.message);
 
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.write_all(log_line.as_bytes());
             let _ = writer.flush();
         }
+    }
+}
+
+// ── Helper Functions ───────────────────────────────────────────────────────────
+
+/// Create a log entry from a tracing event.
+fn create_log_entry<F>(event: &Event<'_>, meta: &tracing::Metadata<'_>, format_timestamp: F) -> LogEntry
+where
+    F: FnOnce() -> String,
+{
+    let mut visitor = MessageVisitor::new();
+    event.record(&mut visitor);
+
+    let target = meta.target();
+    let message = if visitor.message.is_empty() {
+        target.to_string()
+    } else {
+        format!("{}: {}", target, visitor.message)
+    };
+
+    LogEntry {
+        timestamp: format_timestamp(),
+        level: *meta.level(),
+        message,
+    }
+}
+
+/// Format timestamp as HH:MM:SS (time only, for UI display).
+fn format_timestamp_time_only() -> String {
+    let dur = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs();
+    let h = (total_secs / 3600) % 24;
+    let m = (total_secs / 60) % 60;
+    let s = total_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// Format timestamp as ISO 8601 with timezone (for file logging).
+fn format_timestamp_iso8601() -> String {
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
+}
+
+/// Convert log level to string representation.
+fn level_to_str(level: Level) -> &'static str {
+    match level {
+        Level::ERROR => "ERROR",
+        Level::WARN => "WARN",
+        Level::INFO => "INFO",
+        Level::DEBUG => "DEBUG",
+        Level::TRACE => "TRACE",
     }
 }

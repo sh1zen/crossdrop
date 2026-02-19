@@ -69,30 +69,32 @@ pub fn derive_session_key(
     info: &[u8],
     previous_key: Option<&[u8; 32]>,
 ) -> [u8; 32] {
+    // Sort public keys for deterministic salt
     let mut pks = [*local_pk.as_bytes(), *remote_pk.as_bytes()];
     pks.sort();
 
+    // Build salt: sorted PKs + optional previous key
     let mut salt_data = Vec::with_capacity(64 + 32);
     salt_data.extend_from_slice(&pks[0]);
     salt_data.extend_from_slice(&pks[1]);
     if let Some(prev) = previous_key {
         salt_data.extend_from_slice(prev);
     }
-    let prk = hmac_sha3_256(&salt_data, shared_secret);
 
+    // HKDF-Extract
+    let prk = crate::utils::crypto::hmac_sha3_256(&salt_data, shared_secret);
+
+    // HKDF-Expand
     let mut expand_msg = Vec::with_capacity(info.len() + 1);
     expand_msg.extend_from_slice(info);
     expand_msg.push(0x01);
-    hmac_sha3_256(&prk, &expand_msg)
-}
 
-/// HMAC-SHA3-256 — delegates to the centralized implementation in `utils::crypto`.
-fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    crate::utils::crypto::hmac_sha3_256(key, data)
+    crate::utils::crypto::hmac_sha3_256(&prk, &expand_msg)
 }
 
 // ── SessionKeyManager ────────────────────────────────────────────────────────
 
+/// Thread-safe session key manager with support for key rotation.
 #[derive(Clone)]
 pub struct SessionKeyManager {
     key: Arc<RwLock<[u8; 32]>>,
@@ -101,6 +103,7 @@ pub struct SessionKeyManager {
 }
 
 impl SessionKeyManager {
+    /// Create a new session key manager.
     pub fn new(
         initial_key: [u8; 32],
         local_pk: iroh::PublicKey,
@@ -113,10 +116,12 @@ impl SessionKeyManager {
         }
     }
 
+    /// Get the current session key.
     pub async fn current_key(&self) -> [u8; 32] {
         *self.key.read().await
     }
 
+    /// Rotate the session key using a new ECDH shared secret.
     pub async fn rotate(&self, new_shared_secret: &[u8; 32]) -> [u8; 32] {
         let mut guard = self.key.write().await;
         let new_key = derive_session_key(
@@ -130,6 +135,7 @@ impl SessionKeyManager {
         new_key
     }
 
+    /// Get a clone of the inner Arc for external access.
     pub fn inner(&self) -> Arc<RwLock<[u8; 32]>> {
         self.key.clone()
     }
@@ -137,6 +143,7 @@ impl SessionKeyManager {
 
 // ── Handshake helpers ────────────────────────────────────────────────────────
 
+/// Perform the offerer side of the ECDH handshake.
 pub async fn handshake_offerer(
     send_stream: &mut iroh::endpoint::SendStream,
     recv_stream: &mut iroh::endpoint::RecvStream,
@@ -145,46 +152,39 @@ pub async fn handshake_offerer(
 ) -> anyhow::Result<SessionKeyManager> {
     let eph = EphemeralKeypair::generate();
 
+    // Send our ephemeral public key
     send_stream.write_all(&eph.public).await?;
 
+    // Receive peer's ephemeral public key
     let mut peer_eph_pk = [0u8; 32];
     recv_stream.read_exact(&mut peer_eph_pk).await?;
 
+    // Compute shared secret and derive session key
     let shared_secret = eph.diffie_hellman(&peer_eph_pk);
-
-    let session_key = derive_session_key(
-        &shared_secret,
-        local_pk,
-        remote_pk,
-        b"crossdrop-session-v1",
-        None,
-    );
+    let session_key = derive_session_key(&shared_secret, local_pk, remote_pk, b"crossdrop-session-v1", None);
 
     Ok(SessionKeyManager::new(session_key, *local_pk, *remote_pk))
 }
 
+/// Perform the answerer side of the ECDH handshake.
 pub async fn handshake_answerer(
     send_stream: &mut iroh::endpoint::SendStream,
     recv_stream: &mut iroh::endpoint::RecvStream,
     local_pk: &iroh::PublicKey,
     remote_pk: &iroh::PublicKey,
 ) -> anyhow::Result<SessionKeyManager> {
+    // Receive peer's ephemeral public key first
     let mut peer_eph_pk = [0u8; 32];
     recv_stream.read_exact(&mut peer_eph_pk).await?;
 
     let eph = EphemeralKeypair::generate();
 
+    // Send our ephemeral public key
     send_stream.write_all(&eph.public).await?;
 
+    // Compute shared secret and derive session key
     let shared_secret = eph.diffie_hellman(&peer_eph_pk);
-
-    let session_key = derive_session_key(
-        &shared_secret,
-        local_pk,
-        remote_pk,
-        b"crossdrop-session-v1",
-        None,
-    );
+    let session_key = derive_session_key(&shared_secret, local_pk, remote_pk, b"crossdrop-session-v1", None);
 
     Ok(SessionKeyManager::new(session_key, *local_pk, *remote_pk))
 }
@@ -193,10 +193,12 @@ pub async fn handshake_answerer(
 
 pub use crate::core::config::KEY_ROTATION_INTERVAL;
 
+/// Prepare a new ephemeral key pair for key rotation.
 pub fn prepare_rotation() -> EphemeralKeypair {
     EphemeralKeypair::generate()
 }
 
+/// Complete key rotation using the peer's ephemeral public key.
 pub async fn complete_rotation(
     manager: &SessionKeyManager,
     local_eph: &EphemeralKeypair,
@@ -265,13 +267,5 @@ mod tests {
         let secret_a = alice.diffie_hellman(&bob.public);
         let secret_b = bob.diffie_hellman(&alice.public);
         assert_eq!(secret_a, secret_b, "ECDH must be commutative");
-    }
-
-    #[test]
-    fn test_hmac_sha3_256_basic() {
-        let r1 = hmac_sha3_256(b"key", b"data");
-        let r2 = hmac_sha3_256(b"key", b"data");
-        assert_eq!(r1, r2);
-        assert_ne!(r1, [0u8; 32]);
     }
 }

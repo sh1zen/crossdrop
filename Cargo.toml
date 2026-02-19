@@ -13,8 +13,8 @@ categories = ["command-line-utilities", "filesystem", "development-tools"]
 
 [dependencies]
 # Networking & P2P
-iroh = { version = "0.96.1", features = ["default"] }          # discovery, key exchange, relay
-webrtc = "0.17.1"        # data channels peer-to-peer
+iroh = { version = "0.96.1", features = ["default"] }
+webrtc = "0.17.1"
 tokio = { version = "1.49.0" }
 bytes = "1.11.1"
 # Cryptography & Security
@@ -29,7 +29,7 @@ hex = "0.4.3"
 # Serialization & Data formats
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-toml = "1.0.2"
+toml = "1.0.3"
 # TUI / Terminal
 ratatui = { version = "0.30.0", features = ["crossterm"] }
 crossterm = "0.29.0"

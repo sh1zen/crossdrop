@@ -48,26 +48,46 @@ impl PeerRegistry {
             Ok(p) => p,
             Err(_) => return Self::default(),
         };
+
         if !path.exists() {
             return Self::default();
         }
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<PeerRegistry>(&content) {
-                Ok(reg) => {
-                    debug!(
-                        event = "peer_registry_loaded",
-                        peers = reg.peers.len(),
-                        "Peer registry loaded"
-                    );
-                    reg
-                }
-                Err(e) => {
-                    error!(event = "peer_registry_parse_failure", error = %e, "Failed to parse peer registry, starting fresh");
-                    Self::default()
-                }
-            },
+
+        Self::read_from_file(&path)
+    }
+
+    /// Read registry from file with error handling.
+    fn read_from_file(path: &PathBuf) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(content) => Self::parse_content(&content),
             Err(e) => {
-                warn!(event = "peer_registry_read_failure", error = %e, "Failed to read peer registry");
+                warn!(
+                    event = "peer_registry_read_failure",
+                    error = %e,
+                    "Failed to read peer registry"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Parse registry content with error handling.
+    fn parse_content(content: &str) -> Self {
+        match serde_json::from_str::<PeerRegistry>(content) {
+            Ok(reg) => {
+                debug!(
+                    event = "peer_registry_loaded",
+                    peers = reg.peers.len(),
+                    "Peer registry loaded"
+                );
+                reg
+            }
+            Err(e) => {
+                error!(
+                    event = "peer_registry_parse_failure",
+                    error = %e,
+                    "Failed to parse peer registry, starting fresh"
+                );
                 Self::default()
             }
         }
@@ -81,21 +101,19 @@ impl PeerRegistry {
     }
 
     /// Record that a peer has connected.
-    ///
-    /// `ticket` is the ticket string used for this connection.
     pub fn peer_connected(&mut self, peer_id: &str, ticket: String) {
         let now = now_unix();
-        let entry = self
-            .peers
-            .entry(peer_id.to_string())
-            .or_insert_with(|| PeerRecord {
+        let entry = self.peers.entry(peer_id.to_string()).or_insert_with(|| {
+            PeerRecord {
                 peer_id: peer_id.to_string(),
                 ticket: ticket.clone(),
                 display_name: None,
                 last_connected: now,
                 last_disconnected: None,
                 removed: false,
-            });
+            }
+        });
+
         entry.ticket = ticket;
         entry.last_connected = now;
         entry.removed = false;
@@ -119,7 +137,6 @@ impl PeerRegistry {
     }
 
     /// Mark a peer as explicitly removed (user clicked disconnect).
-    /// Keeps the record but sets `removed = true` so we don't auto-reconnect.
     pub fn peer_removed(&mut self, peer_id: &str) {
         if let Some(entry) = self.peers.get_mut(peer_id) {
             entry.removed = true;
@@ -128,8 +145,7 @@ impl PeerRegistry {
         }
     }
 
-    /// Returns peers eligible for auto-reconnection: not removed, and that have
-    /// connected at least once.
+    /// Returns peers eligible for auto-reconnection.
     pub fn reconnectable_peers(&self) -> Vec<&PeerRecord> {
         self.peers
             .values()
@@ -154,8 +170,7 @@ impl PeerRegistry {
         let _ = self.save();
     }
 
-    /// Build a ticket string from a peer's NodeId (for inbound connections
-    /// where we don't have the original ticket).
+    /// Build a ticket string from a peer's NodeId (for inbound connections).
     pub fn ticket_from_node_id(peer_id: &str) -> Option<String> {
         use crate::core::connection::Ticket;
         let pk: iroh::PublicKey = peer_id.parse().ok()?;
@@ -170,6 +185,7 @@ impl PeerRegistry {
     }
 }
 
+/// Get current Unix timestamp in seconds.
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

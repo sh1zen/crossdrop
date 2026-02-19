@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::path::PathBuf;
 
+/// Domain separation prefix for identity key derivation.
+const IDENTITY_DOMAIN: &[u8] = b"crossdrop-identity-v1";
+
 /// Ed25519 key pair (64-byte secret contains both halves).
 /// We store the raw bytes to avoid dragging in ed25519-dalek as a heavyweight dep;
 /// instead we implement the bare minimum sign/verify using iroh's built-in Ed25519
@@ -48,29 +51,42 @@ impl PeerIdentity {
     /// Load or create an identity from a file path.
     pub fn load_or_create(path: &std::path::Path) -> Result<Self> {
         if path.exists() {
-            let data = std::fs::read(path)?;
-            if data.len() != 32 {
-                return Err(anyhow!("Invalid identity file: expected 32 bytes"));
-            }
-            let mut secret = [0u8; 32];
-            secret.copy_from_slice(&data);
-            let public_key = Self::derive_public(&secret);
-            Ok(Self { secret, public_key })
+            Self::load_from_file(path)
         } else {
-            let identity = Self::generate();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, &identity.secret)?;
-            // Restrict file permissions on Unix: owner read/write only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                std::fs::set_permissions(path, perms)?;
-            }
-            Ok(identity)
+            Self::create_and_save(path)
         }
+    }
+
+    /// Load identity from an existing file.
+    fn load_from_file(path: &std::path::Path) -> Result<Self> {
+        let data = std::fs::read(path)?;
+        if data.len() != 32 {
+            return Err(anyhow!("Invalid identity file: expected 32 bytes"));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&data);
+        let public_key = Self::derive_public(&secret);
+        Ok(Self { secret, public_key })
+    }
+
+    /// Generate a new identity and save it to file.
+    fn create_and_save(path: &std::path::Path) -> Result<Self> {
+        let identity = Self::generate();
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, &identity.secret)?;
+
+        // Restrict file permissions on Unix: owner read/write only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+
+        Ok(identity)
     }
 
     /// Default identity file path.
@@ -79,11 +95,13 @@ impl PeerIdentity {
         Ok(dir.join("identity.key"))
     }
 
+    /// Derive public key from secret using SHA3-256 with domain separation.
     fn derive_public(secret: &[u8; 32]) -> [u8; 32] {
-        let mut h = Sha3_256::new();
-        h.update(b"crossdrop-identity-v1");
-        h.update(secret);
-        let result = h.finalize();
+        let mut hasher = Sha3_256::new();
+        hasher.update(IDENTITY_DOMAIN);
+        hasher.update(secret);
+        let result = hasher.finalize();
+
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&result);
         pk
@@ -91,7 +109,7 @@ impl PeerIdentity {
 
     /// Sign a payload using HMAC(secret, data).
     pub fn sign(&self, data: &[u8]) -> [u8; 32] {
-        hmac_sign(&self.secret, data)
+        crate::utils::crypto::hmac_sha3_256(&self.secret, data)
     }
 
     /// Verify a signed payload against a known public key.
@@ -110,11 +128,6 @@ impl PeerIdentity {
     pub fn verify_signed(payload: &SignedPayload, expected_signer: &[u8; 32]) -> bool {
         crate::utils::crypto::constant_time_eq(&payload.signer, expected_signer)
     }
-}
-
-/// HMAC-SHA3-256 for signing — delegates to the centralized implementation.
-fn hmac_sign(key: &[u8], data: &[u8]) -> [u8; 32] {
-    crate::utils::crypto::hmac_sha3_256(key, data)
 }
 
 #[cfg(test)]
