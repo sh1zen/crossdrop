@@ -1,31 +1,77 @@
 //! Receiver: RX operations — file finalization, hash verification, commit.
-
+use super::{ConnectionMessage, ControlMessage, ReceiveFileState, WebRTCConnection};
+use anyhow::Result;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-
-use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
 
-use super::{ConnectionMessage, ControlMessage, ReceiveFileState, WebRTCConnection};
+// ── Verification result ───────────────────────────────────────────────────────
+
+/// Outcome of all integrity checks run after a file is fully received.
+struct FileVerificationResult {
+    sha3_ok: bool,
+    merkle_ok: bool,
+    /// Chunks whose per-chunk hash did not match during streaming verification.
+    failed_chunks: Vec<u32>,
+}
+
+impl FileVerificationResult {
+    fn new(
+        computed_sha3: &[u8],
+        expected_sha3: &[u8],
+        sender_merkle_root: Option<[u8; 32]>,
+        computed_merkle_root: &[u8; 32],
+        failed_chunks: &[u32],
+    ) -> Self {
+        let sha3_ok = computed_sha3 == expected_sha3;
+        let merkle_ok = match sender_merkle_root {
+            Some(sender_root) => {
+                let ok = computed_merkle_root == &sender_root;
+                if ok {
+                    tracing::debug!(event = "merkle_root_verified", "Merkle root matches sender");
+                } else {
+                    warn!(
+                        event = "merkle_root_mismatch",
+                        "Sender/receiver Merkle root mismatch"
+                    );
+                }
+                ok
+            }
+            // No sender root to compare against — treat as passing.
+            None => true,
+        };
+        Self {
+            sha3_ok,
+            merkle_ok,
+            failed_chunks: failed_chunks.to_vec(),
+        }
+    }
+
+    #[inline]
+    fn is_valid(&self) -> bool {
+        self.sha3_ok && self.merkle_ok
+    }
+
+    #[inline]
+    fn has_failed_chunks(&self) -> bool {
+        !self.failed_chunks.is_empty()
+    }
+}
+
+// ── Finalization ──────────────────────────────────────────────────────────────
 
 impl WebRTCConnection {
-    /// Finalize a fully-received file: flush, verify hash + Merkle root,
-    /// send HashResult to the sender, and commit or abort.
+    /// Finalize a fully-received file:
+    ///   1. Flush the writer.
+    ///   2. Verify SHA-3 + Merkle root.
+    ///   3. Send `HashResult` to the sender.
+    ///   4. Commit (or abort and request retransmission) accordingly.
     ///
-    /// # Incremental Verification
-    ///
-    /// If a verifier was set on the writer, chunks were verified as they arrived.
-    /// The `failed_chunks` list contains chunks that failed verification.
-    /// These chunks are requested for retransmission instead of the entire file.
-    ///
-    /// # Async Confirmation
-    ///
-    /// After successfully committing the file, sends a `FileReceived` confirmation
-    /// to the sender, allowing the sender to continue with the next file without
-    /// waiting for the full processing to complete.
+    /// Finalization runs from a `tokio::spawn` call so it must not return
+    /// before all side effects complete; errors are logged locally.
     pub(crate) async fn finalize_file_receive(
         dc: &Arc<RTCDataChannel>,
         file_id: Uuid,
@@ -36,66 +82,52 @@ impl WebRTCConnection {
         app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>,
         wire_tx: &Arc<AtomicU64>,
     ) -> Result<()> {
-        match state.writer.finalize().await {
-            Ok(finalized) => {
-                let result = FileVerificationResult::new(
-                    &finalized.sha3_256,
-                    &sha3_256,
-                    sender_merkle_root,
-                    &finalized.merkle_root,
-                    &finalized.failed_chunks,
-                );
-
-                // Send hash result (don't let failure prevent commit)
-                if let Err(e) = Self::send_control_on(
-                    dc,
-                    key,
-                    &ControlMessage::HashResult {
-                        file_id,
-                        ok: result.is_valid(),
-                    },
-                    wire_tx,
-                )
-                .await
-                {
-                    warn!(
-                        event = "hash_result_send_failed",
-                        file_id = %file_id,
-                        error = %e,
-                        "Failed to send HashResult to sender (file will still be committed)"
-                    );
-                }
-
-                if result.is_valid() {
-                    Self::handle_successful_receive(
-                        dc, file_id, finalized, key, app_tx, wire_tx,
-                    ).await;
-                } else {
-                    Self::handle_failed_receive(
-                        dc, file_id, finalized, result, key, app_tx, wire_tx,
-                    ).await;
-                }
-            }
+        let finalized = match state.writer.finalize().await {
+            Ok(f) => f,
             Err(e) => {
-                error!(
-                    event = "file_finalize_failed",
-                    file_id = %file_id,
-                    error = %e,
-                    "Failed to finalize received file"
-                );
-                if let Some(tx) = app_tx {
-                    let _ = tx.send(ConnectionMessage::Error(format!(
-                        "Failed to finalize file: {}",
-                        e
-                    )));
-                }
+                error!(event = "file_finalize_failed", %file_id, %e, "Failed to finalize received file");
+                notify_app_err(app_tx, format!("Failed to finalize file: {e}"));
+                return Ok(());
             }
+        };
+
+        let result = FileVerificationResult::new(
+            &finalized.sha3_256,
+            &sha3_256,
+            sender_merkle_root,
+            &finalized.merkle_root,
+            &finalized.failed_chunks,
+        );
+
+        // Best-effort: send HashResult; a send failure should not prevent commit.
+        if let Err(e) = WebRTCConnection::send_control_on(
+            dc,
+            key,
+            &ControlMessage::HashResult {
+                file_id,
+                ok: result.is_valid(),
+            },
+            wire_tx,
+        )
+        .await
+        {
+            warn!(event = "hash_result_send_failed", %file_id, %e,
+                "Failed to send HashResult (file will still be committed if valid)");
         }
+
+        if result.is_valid() {
+            Self::commit_received_file(dc, file_id, finalized, key, app_tx, wire_tx).await;
+        } else {
+            Self::reject_received_file(dc, file_id, finalized, result, key, app_tx, wire_tx).await;
+        }
+
         Ok(())
     }
 
-    /// Handle a successfully verified file receive.
-    async fn handle_successful_receive(
+    // ── Post-verification paths ───────────────────────────────────────────
+
+    /// Happy path: confirm receipt to sender, then commit file to disk in the background.
+    async fn commit_received_file(
         dc: &Arc<RTCDataChannel>,
         file_id: Uuid,
         finalized: crate::core::pipeline::receiver::FinalizedFile,
@@ -105,14 +137,12 @@ impl WebRTCConnection {
     ) {
         info!(
             event = "file_recv_verified",
-            file_id = %file_id,
-            filename = %finalized.filename,
-            bytes = finalized.filesize,
+            %file_id, filename = %finalized.filename, bytes = finalized.filesize,
             "File received and hash verified"
         );
 
-        // Send FileReceived confirmation BEFORE commit (unblocks sender)
-        if let Err(e) = Self::send_control_on(
+        // Unblock the sender before the (potentially slow) disk commit.
+        if let Err(e) = WebRTCConnection::send_control_on(
             dc,
             key,
             &ControlMessage::FileReceived { file_id },
@@ -120,52 +150,39 @@ impl WebRTCConnection {
         )
         .await
         {
-            warn!(
-                event = "file_received_confirm_failed",
-                file_id = %file_id,
-                error = %e,
-                "Failed to send FileReceived confirmation"
-            );
+            warn!(event = "file_received_confirm_failed", %file_id, %e,
+                "Failed to send FileReceived confirmation");
         }
 
         let filename = finalized.filename.clone();
         let filesize = finalized.filesize;
         let merkle_root = finalized.merkle_root;
-        let app_tx_clone = app_tx.clone();
+        let app_tx = app_tx.clone();
 
-        // Commit in background (don't block control channel)
         tokio::spawn(async move {
             match finalized.commit().await {
                 Ok(save_path) => {
-                    tracing::info!(
-                        "File receive complete: {} ({} bytes)",
-                        filename,
-                        filesize
-                    );
-                    if let Some(tx) = &app_tx_clone {
-                        let _ = tx.send(ConnectionMessage::FileSaved {
+                    info!("File receive complete: {} ({} bytes)", filename, filesize);
+                    notify_app(
+                        &app_tx,
+                        ConnectionMessage::FileSaved {
                             file_id,
-                            filename: filename.clone(),
-                            path: save_path.to_string_lossy().to_string(),
+                            filename,
+                            path: save_path.to_string_lossy().into_owned(),
                             merkle_root,
-                        });
-                    }
+                        },
+                    );
                 }
                 Err(e) => {
                     error!("Failed to commit file {}: {}", filename, e);
-                    if let Some(tx) = &app_tx_clone {
-                        let _ = tx.send(ConnectionMessage::Error(format!(
-                            "Failed to save {}: {}",
-                            filename, e
-                        )));
-                    }
+                    notify_app_err(&app_tx, format!("Failed to save {filename}: {e}"));
                 }
             }
         });
     }
 
-    /// Handle a failed file receive (hash mismatch).
-    async fn handle_failed_receive(
+    /// Error path: abort the temp file, log the failure, request chunk retransmission.
+    async fn reject_received_file(
         dc: &Arc<RTCDataChannel>,
         file_id: Uuid,
         finalized: crate::core::pipeline::receiver::FinalizedFile,
@@ -174,34 +191,31 @@ impl WebRTCConnection {
         app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>,
         wire_tx: &Arc<AtomicU64>,
     ) {
-        let failed_name = finalized.filename.clone();
         error!(
             event = "file_integrity_failure",
-            file_id = %file_id,
-            filename = %failed_name,
-            sha3_ok = result.sha3_ok,
-            merkle_ok = result.merkle_ok,
+            %file_id, filename = %finalized.filename,
+            sha3_ok = result.sha3_ok, merkle_ok = result.merkle_ok,
             failed_chunks = ?result.failed_chunks,
             "File integrity check failed"
         );
+
+        let failed_name = finalized.filename.clone();
         finalized.abort().await;
 
-        // Request retransmission of specific chunks if available
-        let chunk_indices = if result.has_failed_chunks() {
-            result.failed_chunks.clone()
+        // An empty list signals the sender to retransmit everything.
+        let chunk_indices: Vec<u32> = if result.has_failed_chunks() {
+            result.failed_chunks
         } else {
-            Vec::new() // Empty means retransmit all
+            Vec::new()
         };
 
         info!(
             event = "requesting_chunk_retransmission",
-            file_id = %file_id,
-            chunk_count = chunk_indices.len(),
-            chunks = ?chunk_indices,
+            %file_id, count = chunk_indices.len(), chunks = ?chunk_indices,
             "Requesting retransmission of failed chunks"
         );
 
-        if let Err(e) = Self::send_control_on(
+        if let Err(e) = WebRTCConnection::send_control_on(
             dc,
             key,
             &ControlMessage::ChunkRetransmitRequest {
@@ -212,77 +226,22 @@ impl WebRTCConnection {
         )
         .await
         {
-            warn!(
-                event = "chunk_retransmit_request_failed",
-                file_id = %file_id,
-                error = %e,
-                "Failed to send ChunkRetransmitRequest"
-            );
+            warn!(event = "chunk_retransmit_request_failed", %file_id, %e,
+                "Failed to send ChunkRetransmitRequest");
         }
 
-        if let Some(tx) = app_tx {
-            let _ = tx.send(ConnectionMessage::Error(format!(
-                "Hash mismatch for {}",
-                failed_name
-            )));
-        }
+        notify_app_err(app_tx, format!("Hash mismatch for {failed_name}"));
     }
 }
 
-// ── Verification Result ────────────────────────────────────────────────────────
+// ── Notification helpers ──────────────────────────────────────────────────────
 
-/// Result of file verification after receive.
-struct FileVerificationResult {
-    sha3_ok: bool,
-    merkle_ok: bool,
-    failed_chunks: Vec<u32>,
+fn notify_app(app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>, msg: ConnectionMessage) {
+    if let Some(tx) = app_tx {
+        let _ = tx.send(msg);
+    }
 }
 
-impl FileVerificationResult {
-    /// Create a verification result from the finalized file data.
-    fn new(
-        computed_sha3: &[u8],
-        expected_sha3: &[u8],
-        sender_merkle_root: Option<[u8; 32]>,
-        computed_merkle_root: &[u8; 32],
-        failed_chunks: &[u32],
-    ) -> Self {
-        let sha3_ok = computed_sha3 == expected_sha3;
-
-        let merkle_ok = sender_merkle_root
-            .map(|sender_root| {
-                if computed_merkle_root == &sender_root {
-                    tracing::debug!(
-                        event = "merkle_root_verified",
-                        "Merkle root matches sender"
-                    );
-                    true
-                } else {
-                    warn!(
-                        event = "merkle_root_mismatch",
-                        "Sender/receiver Merkle root mismatch"
-                    );
-                    false
-                }
-            })
-            .unwrap_or(true); // No Merkle root to verify against
-
-        Self {
-            sha3_ok,
-            merkle_ok,
-            failed_chunks: failed_chunks.to_vec(),
-        }
-    }
-
-    /// Check if the file passed all verification checks.
-    #[inline]
-    fn is_valid(&self) -> bool {
-        self.sha3_ok && self.merkle_ok
-    }
-
-    /// Check if we have specific failed chunks to request retransmission for.
-    #[inline]
-    fn has_failed_chunks(&self) -> bool {
-        !self.failed_chunks.is_empty()
-    }
+fn notify_app_err(app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>, err: String) {
+    notify_app(app_tx, ConnectionMessage::Error(err));
 }
