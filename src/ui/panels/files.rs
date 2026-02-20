@@ -301,6 +301,9 @@ impl Component for FilesPanel {
             let is_selected = i == history_selected && !app.files_focus_active;
             let marker = if is_selected { "▶ " } else { "  " };
 
+            // Show delete indicator (×) when selected
+            let delete_marker = if is_selected { " x" } else { "" };
+
             // Status mark with color
             let (status_label, status_color) = match &rec.status {
                 TransferStatus::Ok => ("✓", Color::Green),
@@ -337,6 +340,14 @@ impl Component for FilesPanel {
                 Span::styled(
                     format!("  {}", rec.timestamp),
                     Style::default().fg(Color::Indexed(240)),
+                ),
+                Span::styled(
+                    delete_marker,
+                    Style::default().fg(if is_selected {
+                        Color::Red
+                    } else {
+                        Color::DarkGray
+                    }).add_modifier(Modifier::BOLD),
                 ),
             ])));
         }
@@ -638,6 +649,22 @@ impl Handler for FilesPanel {
                         }
                         if !outcome.actions.is_empty() {
                             return Some(Action::EngineActions(outcome.actions));
+                        }
+                    }
+                } else if !app.files_focus_active {
+                    // Delete the selected history entry
+                    let history_len = app.engine.transfer_history().len();
+                    if history_len > 0 {
+                        let idx = app.history_selected_idx.min(history_len - 1);
+                        // History is displayed in reverse, so calculate actual index
+                        let actual_idx = history_len - 1 - idx;
+                        if app.engine.delete_history_entry(actual_idx) {
+                            // Adjust selection if needed
+                            let new_len = history_len - 1;
+                            if app.history_selected_idx >= new_len && new_len > 0 {
+                                app.history_selected_idx = new_len - 1;
+                            }
+                            return Some(Action::SetStatus("History entry deleted".to_string()));
                         }
                     }
                 }

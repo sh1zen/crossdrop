@@ -1214,14 +1214,13 @@ impl UIExecuter {
 
             EngineAction::SendFolderData {
                 peer_id,
-                folder_path,
                 file_entries,
             } => {
                 let node = node.clone();
                 let event_tx = node.event_tx().clone();
                 tokio::spawn(async move {
                     if let Err(e) = node
-                        .send_folder_data(&peer_id, &folder_path, file_entries)
+                        .send_folder_data(&peer_id, file_entries)
                         .await
                     {
                         tracing::error!("Folder send error: {}", e);
@@ -1614,7 +1613,7 @@ fn help_line_for_mode(mode: Mode) -> &'static str {
         Mode::Connect => "Enter: connect | Esc: back",
         Mode::Peers => "Up/Down: navigate | d: disconnect | e/Enter: explore | Esc: back",
         Mode::Files => {
-            "Left/Right: select active | x: cancel transfer | Up/Down: scroll history | Esc: back"
+            "Tab: switch panel | x: cancel/delete | Up/Down: navigate | Enter: details | Esc: back"
         }
         Mode::Logs => "Up/Down: scroll | d: clear | Esc: back",
         Mode::Id => "c: copy to clipboard | Esc: back",

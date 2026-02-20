@@ -53,7 +53,7 @@ impl TransferStatus {
 /// Persistable transfer history record.
 /// One entry per completed/cancelled/rejected transaction.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct TransferRecordSnapshot {
+pub struct TransferRecord {
     pub direction: TransactionDirection,
     pub peer_id: String,
     pub display_name: String,
@@ -166,7 +166,7 @@ pub struct Persistence {
 
     /// Completed transfer history with absolute timestamps.
     #[serde(default)]
-    pub transfer_history: Vec<TransferRecordSnapshot>,
+    pub transfer_history: Vec<TransferRecord>,
 
     /// Cumulative transfer statistics (files/folders sent/received).
     #[serde(default)]
@@ -247,9 +247,19 @@ impl Persistence {
     }
 
     /// Append a transfer record to history and persist.
-    pub fn push_transfer_record(&mut self, record: TransferRecordSnapshot) -> Result<()> {
+    pub fn push_transfer_record(&mut self, record: TransferRecord) -> Result<()> {
         self.transfer_history.push(record);
         self.save()
+    }
+
+    /// Remove a transfer record from history by index and persist.
+    pub fn remove_transfer_record(&mut self, index: usize) -> Result<()> {
+        if index < self.transfer_history.len() {
+            self.transfer_history.remove(index);
+            self.save()
+        } else {
+            Ok(())
+        }
     }
 
     /// Update transfer statistics and persist.

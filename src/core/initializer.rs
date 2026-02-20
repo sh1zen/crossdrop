@@ -994,19 +994,15 @@ impl PeerNode {
     pub async fn send_folder_data(
         &self,
         peer_id: &str,
-        folder_path: &str,
-        file_entries: Vec<(Uuid, String)>,
+        file_entries: Vec<(Uuid, String, String)>, // (file_id, full_path, relative_path)
     ) -> Result<()> {
         use crate::core::config::FILE_ACK_POLL_INTERVAL;
-
-        let folder_root = std::path::Path::new(folder_path);
 
         let conn = self.get_connection(peer_id).await?;
         self.check_alive_or_disconnect(peer_id, &conn).await?;
 
         info!(
-            "Sending folder '{}' ({} files) to {} via Transaction protocol (async streaming)",
-            folder_path,
+            "Sending folder ({} files) to {} via Transaction protocol (async streaming)",
             file_entries.len(),
             peer_id
         );
@@ -1015,7 +1011,7 @@ impl PeerNode {
         let total_files = file_entries.len();
         let semaphore = &conn.file_ack_semaphore;
 
-        for (idx, (file_id, relative_path)) in file_entries.into_iter().enumerate() {
+        for (idx, (file_id, full_path, relative_path)) in file_entries.into_iter().enumerate() {
             // Acquire semaphore, probing liveness on each timeout.
             loop {
                 match tokio::time::timeout(FILE_ACK_POLL_INTERVAL, semaphore.acquire()).await {
@@ -1052,7 +1048,7 @@ impl PeerNode {
                 }
             }
 
-            let full_path = folder_root.join(&relative_path);
+            let full_path = std::path::PathBuf::from(&full_path);
 
             let filesize = match tokio::fs::metadata(&full_path).await {
                 Ok(m) => m.len(),

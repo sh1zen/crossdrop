@@ -246,9 +246,8 @@ impl Handler for SendPanel {
                                             if let Ok(meta) = std::fs::metadata(&p) {
                                                 let size = meta.len();
                                                 *total += size;
-                                                let root_parent = root.parent().unwrap_or(root);
                                                 let relative = p
-                                                    .strip_prefix(root_parent)
+                                                    .strip_prefix(root)
                                                     .unwrap_or(&p)
                                                     .to_string_lossy()
                                                     .replace('\\', "/");

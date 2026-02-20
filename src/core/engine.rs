@@ -12,7 +12,7 @@ use crate::core::config::{
     TRANSACTION_TIMEOUT,
 };
 use crate::core::initializer::AppEvent;
-use crate::core::persistence::{Persistence, TransferRecordSnapshot, TransferStatus};
+use crate::core::persistence::{Persistence, TransferRecord, TransferStatus};
 use crate::core::security::identity::PeerIdentity;
 use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
@@ -60,8 +60,7 @@ pub enum EngineAction {
     },
     SendFolderData {
         peer_id: String,
-        folder_path: String,
-        file_entries: Vec<(Uuid, String)>,
+        file_entries: Vec<(Uuid, String, String)>, // (file_id, full_path, relative_path)
     },
     SendTransactionComplete {
         peer_id: String,
@@ -174,20 +173,6 @@ pub struct DataStats {
     pub remote_exploration_bytes: u64,
 }
 
-// ── Transfer History Record ──────────────────────────────────────────────────
-
-/// One entry per Transaction — never per individual file.
-#[derive(Clone, Debug)]
-pub struct TransferRecord {
-    pub direction: TransactionDirection,
-    pub peer_id: String,
-    pub display_name: String,
-    pub total_size: u64,
-    pub file_count: u32,
-    pub timestamp: String,
-    pub status: TransferStatus,
-}
-
 // ── TransferEngine ───────────────────────────────────────────────────────────
 
 pub struct TransferEngine {
@@ -243,11 +228,7 @@ impl TransferEngine {
             }
         };
 
-        let mut history: Vec<TransferRecord> = p
-            .transfer_history
-            .iter()
-            .map(TransferRecord::from_snapshot)
-            .collect();
+        let mut history: Vec<TransferRecord> = p.transfer_history.clone();
 
         let mut manager = TransactionManager::new();
         let mut source_paths = HashMap::new();
@@ -299,10 +280,7 @@ impl TransferEngine {
             for id in &expired_ids {
                 p.transactions.remove(id);
             }
-            p.transfer_history = history
-                .iter()
-                .map(TransferRecordSnapshot::from_record)
-                .collect();
+            p.transfer_history = history.clone();
             let _ = p.save();
         }
 
@@ -348,6 +326,21 @@ impl TransferEngine {
     pub fn transfer_history(&self) -> &[TransferRecord] {
         &self.transfer_history
     }
+
+    /// Delete a transfer history entry by index.
+    pub fn delete_history_entry(&mut self, index: usize) -> bool {
+        if index < self.transfer_history.len() {
+            self.transfer_history.remove(index);
+            // Persist the change
+            if let Ok(mut p) = Persistence::load() {
+                let _ = p.remove_transfer_record(index);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn can_start_transfer(&self) -> bool {
         self.transactions.active_count() < MAX_CONCURRENT_TRANSACTIONS
     }
@@ -1158,14 +1151,26 @@ impl TransferEngine {
 
         let txn = self.transactions.get_active_mut(transaction_id).unwrap();
         let actions = if is_folder {
-            let file_entries: Vec<(Uuid, String)> = txn
+            // Use full_path from each file if available (already computed during initiate_folder_send)
+            // Fall back to joining source_path with relative_path if full_path is not set
+            let file_entries: Vec<(Uuid, String, String)> = txn
                 .file_order
                 .iter()
-                .filter_map(|fid| txn.files.get(fid).map(|f| (*fid, f.relative_path.clone())))
+                .filter_map(|fid| {
+                    txn.files.get(fid).map(|f| {
+                        let full_path = f.full_path.clone().unwrap_or_else(|| {
+                            // Fallback: join source_path with relative_path
+                            std::path::Path::new(&source_path)
+                                .join(&f.relative_path)
+                                .to_string_lossy()
+                                .to_string()
+                        });
+                        (*fid, full_path, f.relative_path.clone())
+                    })
+                })
                 .collect();
             vec![EngineAction::SendFolderData {
                 peer_id,
-                folder_path: source_path,
                 file_entries,
             }]
         } else {
@@ -1590,7 +1595,7 @@ impl TransferEngine {
                 timestamp: crate::ui::helpers::format_absolute_timestamp_now(),
                 status: status.clone(),
             };
-            let snapshot = TransferRecordSnapshot::from_record(&record);
+            let snapshot = record.clone();
             self.transfer_history.push(record);
 
             if let Ok(mut p) = Persistence::load() {
@@ -1611,35 +1616,5 @@ impl TransferEngine {
 impl Default for TransferEngine {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ── Helper conversions ────────────────────────────────────────────────────────
-
-impl TransferRecord {
-    fn from_snapshot(snap: &TransferRecordSnapshot) -> Self {
-        Self {
-            direction: snap.direction,
-            peer_id: snap.peer_id.clone(),
-            display_name: snap.display_name.clone(),
-            total_size: snap.total_size,
-            file_count: snap.file_count,
-            timestamp: snap.timestamp.clone(),
-            status: snap.status.clone(),
-        }
-    }
-}
-
-impl TransferRecordSnapshot {
-    fn from_record(rec: &TransferRecord) -> Self {
-        Self {
-            direction: rec.direction,
-            peer_id: rec.peer_id.clone(),
-            display_name: rec.display_name.clone(),
-            total_size: rec.total_size,
-            file_count: rec.file_count,
-            timestamp: rec.timestamp.clone(),
-            status: rec.status.clone(),
-        }
     }
 }
