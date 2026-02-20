@@ -12,9 +12,10 @@ use ratatui::{
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FocusElement {
-    DisplayNameInput,   // Index 0
-    RemoteAccessToggle, // Index 1
-    ThemeToggle,        // Index 2
+    DisplayNameInput,        // Index 0
+    RemoteAccessToggle,      // Index 1
+    RemoteKeyListenerToggle, // Index 2
+    ThemeToggle,             // Index 3
 }
 
 impl FocusElement {
@@ -22,7 +23,8 @@ impl FocusElement {
         match index {
             0 => FocusElement::DisplayNameInput,
             1 => FocusElement::RemoteAccessToggle,
-            2 => FocusElement::ThemeToggle,
+            2 => FocusElement::RemoteKeyListenerToggle,
+            3 => FocusElement::ThemeToggle,
             _ => FocusElement::DisplayNameInput,
         }
     }
@@ -31,7 +33,8 @@ impl FocusElement {
         match self {
             FocusElement::DisplayNameInput => 0,
             FocusElement::RemoteAccessToggle => 1,
-            FocusElement::ThemeToggle => 2,
+            FocusElement::RemoteKeyListenerToggle => 2,
+            FocusElement::ThemeToggle => 3,
         }
     }
 }
@@ -62,6 +65,7 @@ impl Component for SettingsPanel {
             .constraints([
                 Constraint::Length(3), // Display name input
                 Constraint::Length(3), // Remote access toggle
+                Constraint::Length(3), // Remote key listener toggle
                 Constraint::Length(3), // Theme toggle
                 Constraint::Min(0),    // Spacer
             ])
@@ -123,6 +127,43 @@ impl Component for SettingsPanel {
         let toggle_widget = Paragraph::new(toggle_line).block(toggle_block);
         f.render_widget(toggle_widget, chunks[1]);
 
+        // Remote key listener toggle
+        let rkl_focused = self.focused_element == FocusElement::RemoteKeyListenerToggle;
+        let rkl_border_color = if rkl_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+
+        let rkl_status = if app.remote_key_listener {
+            Span::styled(" ENABLED ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(" DISABLED ", Style::default().fg(Color::Red))
+        };
+
+        let rkl_help = if rkl_focused {
+            Span::styled(" (Press 'k' to toggle) ", Style::default().fg(Color::Gray))
+        } else {
+            Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
+        };
+
+        let rkl_line = Line::from(vec![
+            Span::raw("Share Keystrokes: "),
+            rkl_status,
+            rkl_help,
+        ]);
+
+        let rkl_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(rkl_border_color))
+            .title(Span::styled(
+                " Remote Key Sharing ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let rkl_widget = Paragraph::new(rkl_line).block(rkl_block);
+        f.render_widget(rkl_widget, chunks[2]);
+
         // Theme toggle
         let theme_focused = self.focused_element == FocusElement::ThemeToggle;
         let theme_border_color = if theme_focused {
@@ -157,7 +198,7 @@ impl Component for SettingsPanel {
             ));
 
         let theme_widget = Paragraph::new(theme_line).block(theme_block);
-        f.render_widget(theme_widget, chunks[2]);
+        f.render_widget(theme_widget, chunks[3]);
     }
 
     fn on_focus(&mut self, app: &mut App) {
@@ -225,10 +266,33 @@ impl Handler for SettingsPanel {
                             tokio::spawn(async move {
                                 node.update_remote_access(enabled);
                             });
+                            // Persist to disk
+                            if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                                let _ = p.save_remote_access(enabled);
+                            }
                             app.set_status(format!(
                                 "Remote access {}",
                                 if enabled { "enabled" } else { "disabled" }
                             ));
+                        }
+                    }
+                    FocusElement::RemoteKeyListenerToggle => {
+                        if c == 'k' || c == 'K' {
+                            app.remote_key_listener = !app.remote_key_listener;
+                            let enabled = app.remote_key_listener;
+                            let node = node.clone();
+                            tokio::spawn(async move {
+                                node.update_remote_key_listener(enabled);
+                            });
+                            // Persist to disk
+                            if let Ok(mut p) = crate::core::persistence::Persistence::load() {
+                                let _ = p.save_remote_key_listener(enabled);
+                            }
+                            app.set_status(format!(
+                                "Remote key listener {}",
+                                if enabled { "enabled" } else { "disabled" }
+                            ));
+                            return Some(Action::UpdateGlobalKeyboardListener);
                         }
                     }
                     FocusElement::ThemeToggle => {
@@ -257,7 +321,12 @@ impl Handler for SettingsPanel {
 
 impl Focusable for SettingsPanel {
     fn focusable_elements(&self) -> Vec<FocusableElement> {
-        vec![FocusableElement::TextInput, FocusableElement::Toggle, FocusableElement::Toggle]
+        vec![
+            FocusableElement::TextInput,
+            FocusableElement::Toggle,
+            FocusableElement::Toggle,
+            FocusableElement::Toggle,
+        ]
     }
 
     fn focused_index(&self) -> usize {

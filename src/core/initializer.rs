@@ -81,6 +81,13 @@ pub enum AppEvent {
     RemoteAccessDisabled {
         peer_id: String,
     },
+    RemoteKeyListenerDisabled {
+        peer_id: String,
+    },
+    RemoteKeyEventReceived {
+        peer_id: String,
+        key: String,
+    },
     RemoteFetchRequest {
         peer_id: String,
         path: String,
@@ -158,6 +165,8 @@ pub struct PeerNode {
     public_key: iroh::PublicKey,
     remote_access_tx: Arc<tokio::sync::watch::Sender<bool>>,
     remote_access_rx: tokio::sync::watch::Receiver<bool>,
+    remote_key_listener_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    remote_key_listener_rx: tokio::sync::watch::Receiver<bool>,
     display_name_tx: Arc<tokio::sync::watch::Sender<String>>,
     display_name_rx: tokio::sync::watch::Receiver<String>,
     wire_tx: Arc<AtomicU64>,
@@ -278,6 +287,13 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
         ConnectionMessage::RemoteAccessDisabled => {
             AppEvent::RemoteAccessDisabled { peer_id: peer_id() }
         }
+        ConnectionMessage::RemoteKeyListenerDisabled => {
+            AppEvent::RemoteKeyListenerDisabled { peer_id: peer_id() }
+        }
+        ConnectionMessage::RemoteKeyEventReceived { key } => AppEvent::RemoteKeyEventReceived {
+            peer_id: peer_id(),
+            key,
+        },
         ConnectionMessage::RemoteFetchRequest { path, is_folder } => AppEvent::RemoteFetchRequest {
             peer_id: peer_id(),
             path,
@@ -382,6 +398,7 @@ impl PeerNode {
         );
 
         let (remote_access_tx, remote_access_rx) = tokio::sync::watch::channel(args.remote_access);
+        let (remote_key_listener_tx, remote_key_listener_rx) = tokio::sync::watch::channel(false);
         let initial_name = args.display_name.clone().unwrap_or_default();
         let (display_name_tx, display_name_rx) = tokio::sync::watch::channel(initial_name);
 
@@ -396,6 +413,8 @@ impl PeerNode {
             public_key,
             remote_access_tx: Arc::new(remote_access_tx),
             remote_access_rx,
+            remote_key_listener_tx: Arc::new(remote_key_listener_tx),
+            remote_key_listener_rx,
             display_name_tx: Arc::new(display_name_tx),
             display_name_rx,
             wire_tx,
@@ -612,6 +631,7 @@ impl PeerNode {
             shared_key,
             Some(key_manager.clone()),
             self.remote_access_rx.clone(),
+            self.remote_key_listener_rx.clone(),
             awake_notify,
             self.wire_tx.clone(),
             self.wire_rx.clone(),
@@ -748,6 +768,7 @@ impl PeerNode {
             shared_key,
             Some(key_manager.clone()),
             self.remote_access_rx.clone(),
+            self.remote_key_listener_rx.clone(),
             awake_notify,
             self.wire_tx.clone(),
             self.wire_rx.clone(),
@@ -1380,6 +1401,18 @@ impl PeerNode {
 
     pub fn update_remote_access(&self, enabled: bool) {
         let _ = self.remote_access_tx.send(enabled);
+    }
+
+    pub fn update_remote_key_listener(&self, enabled: bool) {
+        let _ = self.remote_key_listener_tx.send(enabled);
+    }
+
+    pub async fn send_remote_key_event(&self, peer_id: &str, key: &str) -> Result<()> {
+        if let Some(conn) = self.try_get_connection(peer_id).await {
+            conn.send_control(&ControlMessage::RemoteKeyEvent { key: key.to_string() })
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn list_remote_directory(&self, peer_id: &str, path: String) -> Result<()> {

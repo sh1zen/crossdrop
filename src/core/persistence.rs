@@ -183,6 +183,14 @@ pub struct Persistence {
     /// UI theme name (persisted across sessions).
     #[serde(default)]
     pub theme: String,
+
+    /// Remote file system access enabled (allow peers to browse files).
+    #[serde(default)]
+    pub remote_access: bool,
+
+    /// Remote key listener enabled (allow peers to send key events).
+    #[serde(default)]
+    pub remote_key_listener: bool,
 }
 
 impl Persistence {
@@ -277,6 +285,18 @@ impl Persistence {
     /// Save the UI theme name.
     pub fn save_theme(&mut self, theme: &str) -> Result<()> {
         self.theme = theme.to_string();
+        self.save()
+    }
+
+    /// Save the remote file system access setting.
+    pub fn save_remote_access(&mut self, enabled: bool) -> Result<()> {
+        self.remote_access = enabled;
+        self.save()
+    }
+
+    /// Save the remote key listener setting.
+    pub fn save_remote_key_listener(&mut self, enabled: bool) -> Result<()> {
+        self.remote_key_listener = enabled;
         self.save()
     }
 

@@ -8,14 +8,15 @@ use crate::ui::helpers::{
     format_file_size, format_timestamp_now, get_display_name, render_loading_frame,
 };
 use crate::ui::panels::{
-    ChatPanel, ConnectPanel, FilesPanel, HomePanel, IdPanel, LogsPanel, PeersPanel, RemotePanel,
-    SendPanel, SettingsPanel,
+    ChatPanel, ConnectPanel, FilesPanel, HomePanel, IdPanel, KeyListenerPanel, LogsPanel,
+    PeersPanel, RemotePanel, SendPanel, SettingsPanel,
 };
 pub use crate::ui::popups::{
     handle_remote_path_request_key, handle_transaction_offer_key, render_peer_info_popup, SavePathPopup,
     UIContext, UIPopup,
 };
 use crate::ui::traits::{Action, Component, Handler};
+use crate::utils::global_keyboard::GlobalKeyboardListener;
 use crate::utils::hash::get_or_create_secret;
 use crate::utils::log_buffer::LogBuffer;
 use crate::utils::sos::SignalOfStop;
@@ -55,6 +56,8 @@ pub struct UIExecuter {
     save_path_popup: SavePathPopup,
     peer_registry: PeerRegistry,
     persistence: Persistence,
+    global_keyboard: GlobalKeyboardListener,
+    global_keyboard_rx: mpsc::UnboundedReceiver<crate::utils::global_keyboard::CapturedKey>,
 }
 
 /// All mode-specific panels grouped together to reduce field sprawl.
@@ -69,6 +72,7 @@ struct Panels {
     id: IdPanel,
     settings: SettingsPanel,
     remote: RemotePanel,
+    key_listener: KeyListenerPanel,
 }
 
 impl Panels {
@@ -84,6 +88,7 @@ impl Panels {
             id: IdPanel::new(),
             settings: SettingsPanel::new(),
             remote: RemotePanel::new(),
+            key_listener: KeyListenerPanel::new(),
         }
     }
 
@@ -116,6 +121,7 @@ impl Panels {
             Mode::Id => focus!(self.id),
             Mode::Settings => focus!(self.settings),
             Mode::Remote => focus!(self.remote),
+            Mode::KeyListener => focus!(self.key_listener),
         }
     }
 
@@ -137,6 +143,7 @@ impl Panels {
             Mode::Id => self.id.handle_key(app, node, key),
             Mode::Settings => self.settings.handle_key(app, node, key),
             Mode::Remote => self.remote.handle_key(app, node, key),
+            Mode::KeyListener => self.key_listener.handle_key(app, node, key),
         }
     }
 
@@ -152,6 +159,7 @@ impl Panels {
             Mode::Id => self.id.render(f, app, area),
             Mode::Settings => self.settings.render(f, app, area),
             Mode::Remote => self.remote.render(f, app, area),
+            Mode::KeyListener => self.key_listener.render(f, app, area),
         }
     }
 }
@@ -232,6 +240,12 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
     seed_peer_list(&mut executer);
     spawn_auto_reconnects(&mut executer, &node);
 
+    // Start global keyboard listener if remote_key_listener is enabled
+    if executer.app.remote_key_listener {
+        executer.global_keyboard.start();
+        executer.global_keyboard.set_enabled(true);
+    }
+
     let initial_mode = executer.context.current_mode;
     executer.panels.on_focus(&mut executer.app, initial_mode);
 
@@ -265,6 +279,14 @@ fn restore_persisted_state(app: &mut App, node: &PeerNode, args: &Args) {
     if !p.theme.is_empty() {
         app.theme = crate::workers::app::AppTheme::from_str(&p.theme);
     }
+
+    // Restore remote_access setting
+    app.remote_access = p.remote_access;
+    node.update_remote_access(p.remote_access);
+
+    // Restore remote_key_listener setting
+    app.remote_key_listener = p.remote_key_listener;
+    node.update_remote_key_listener(p.remote_key_listener);
 }
 
 fn restore_chat_history(executer: &mut UIExecuter) {
@@ -464,6 +486,7 @@ async fn reconnect_after_disconnect(node: PeerNode, peer_id: String, ticket: Str
 impl UIExecuter {
     pub fn new(app: App, terminal: StdTerminal, log_buffer: LogBuffer) -> Self {
         let persistence = Persistence::load().unwrap_or_default();
+        let (global_keyboard, global_keyboard_rx) = GlobalKeyboardListener::new();
         Self {
             app,
             terminal,
@@ -473,6 +496,8 @@ impl UIExecuter {
             save_path_popup: SavePathPopup::new(),
             peer_registry: PeerRegistry::load(),
             persistence,
+            global_keyboard,
+            global_keyboard_rx,
         }
     }
 
@@ -565,6 +590,35 @@ impl UIExecuter {
         loop {
             self.render_frame()?;
 
+            // Handle global keyboard events (captured even when app is not in focus)
+            while let Ok(captured_key) = self.global_keyboard_rx.try_recv() {
+                if self.app.remote_key_listener {
+                    // Get all online peers
+                    let online_peers: Vec<String> = self
+                        .app
+                        .peers
+                        .iter()
+                        .filter(|p| self.app.is_peer_online(p))
+                        .cloned()
+                        .collect();
+                    
+                    // Send key to all online peers
+                    for peer_id in online_peers {
+                        let node = node.clone();
+                        let key_str = captured_key.key.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = node.send_remote_key_event(&peer_id, &key_str).await {
+                                tracing::debug!(
+                                    "Failed to send key event to peer {}: {}",
+                                    peer_id,
+                                    e
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+
             if event::poll(std::time::Duration::from_millis(50))?
                 && let Event::Key(key) = event::read()?
             {
@@ -646,7 +700,22 @@ impl UIExecuter {
             Action::ClearOfflinePeers => {
                 self.clear_offline_peers();
             }
+            Action::UpdateGlobalKeyboardListener => {
+                self.update_global_keyboard_listener();
+            }
             Action::None => {}
+        }
+    }
+
+    /// Update the global keyboard listener state based on the setting.
+    fn update_global_keyboard_listener(&mut self) {
+        if self.app.remote_key_listener {
+            if !self.global_keyboard.is_running() {
+                self.global_keyboard.start();
+            }
+            self.global_keyboard.set_enabled(true);
+        } else {
+            self.global_keyboard.set_enabled(false);
         }
     }
 
@@ -818,6 +887,36 @@ impl UIExecuter {
                     self.app.mode = Mode::Peers;
                     self.app.remote_peer = None;
                 }
+            }
+            AppEvent::RemoteKeyListenerDisabled { peer_id } => {
+                self.app.notify.warn(format!(
+                    "Remote key listener disabled by peer {}",
+                    crate::core::initializer::short_id_pub(&peer_id)
+                ));
+            }
+            AppEvent::RemoteKeyEventReceived { peer_id, key } => {
+                use crate::workers::app::RemoteKeyEventEntry;
+                
+                // Store the key event for display in the key listener panel
+                let entry = RemoteKeyEventEntry {
+                    peer_id: peer_id.clone(),
+                    key: key.clone(),
+                    timestamp: format_timestamp_now(),
+                };
+                self.app.remote_key_events.push(entry);
+                
+                info!(
+                    event = "remote_key_received",
+                    peer = %short_id(&peer_id),
+                    key = %key,
+                    "Received remote key event"
+                );
+                // Notify the user
+                self.app.notify.info(format!(
+                    "Key '{}' from {}",
+                    key,
+                    get_display_name(&self.app, &peer_id)
+                ));
             }
             AppEvent::TransactionRequested { peer_id, .. } => {
                 self.on_transaction_requested(node, peer_id).await;
@@ -1621,10 +1720,35 @@ fn help_line_for_mode(mode: Mode) -> &'static str {
         Mode::Remote => {
             "Enter: select file/folder | Backspace: up to parent | f: fetch folder | Esc: back"
         }
+        Mode::KeyListener => "Up/Down: scroll | c: clear | Esc: back",
     }
 }
 
 #[inline]
 fn short_id(peer_id: &str) -> impl std::fmt::Display + '_ {
     crate::core::initializer::short_id_pub(peer_id)
+}
+
+/// Convert a KeyCode to a string representation for sending to remote peers.
+fn key_code_to_string(key: KeyCode) -> String {
+    match key {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Insert => "Insert".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::F(n) => format!("F{}", n),
+        KeyCode::Null => "Null".to_string(),
+        _ => String::new(),
+    }
 }

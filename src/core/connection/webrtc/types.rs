@@ -143,6 +143,12 @@ pub enum ControlMessage {
     /// Remote access is disabled on the peer.
     RemoteAccessDisabled,
 
+    // ── Remote key listener ──────────────────────────────────────────────────
+    /// Remote key event from a peer (key code as string).
+    RemoteKeyEvent { key: String },
+    /// Remote key listener is disabled on the peer.
+    RemoteKeyListenerDisabled,
+
     // ── Key rotation ──────────────────────────────────────────────────────────
     /// Send a fresh ephemeral X25519 public key to trigger key rotation.
     KeyRotation { ephemeral_pub: Vec<u8> },
@@ -231,6 +237,12 @@ pub enum ConnectionMessage {
         path: String,
         is_folder: bool,
     },
+
+    // ── Remote key listener ──────────────────────────────────────────────────
+    /// Remote key event received from peer.
+    RemoteKeyEventReceived { key: String },
+    /// Remote key listener is disabled on the peer.
+    RemoteKeyListenerDisabled,
 
     // ── Transactions ──────────────────────────────────────────────────────────
     TransactionRequested {

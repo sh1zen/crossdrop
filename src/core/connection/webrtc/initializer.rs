@@ -73,6 +73,7 @@ impl ConnectionState {
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
         shared_key: Arc<RwLock<[u8; 32]>>,
         remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
+        remote_key_listener: Arc<tokio::sync::watch::Receiver<bool>>,
         key_manager: Option<SessionKeyManager>,
         wire_tx: Arc<AtomicU64>,
         wire_rx: Arc<AtomicU64>,
@@ -85,6 +86,7 @@ impl ConnectionState {
             app_tx,
             shared_key,
             remote_access,
+            remote_key_listener,
             key_manager,
             pending_rotation: Arc::clone(&self.pending_rotation),
             chat_recv_counter: Arc::clone(&self.chat_recv_counter),
@@ -302,6 +304,7 @@ impl WebRTCConnection {
         shared_key: Arc<RwLock<[u8; 32]>>,
         key_manager: Option<SessionKeyManager>,
         remote_access: tokio::sync::watch::Receiver<bool>,
+        remote_key_listener: tokio::sync::watch::Receiver<bool>,
         awake_notify: Arc<tokio::sync::Notify>,
         wire_tx: Arc<AtomicU64>,
         wire_rx: Arc<AtomicU64>,
@@ -313,10 +316,12 @@ impl WebRTCConnection {
 
         let state = ConnectionState::new();
         let ra = Arc::new(remote_access);
+        let rkl = Arc::new(remote_key_listener);
         let ctx = state.build_context(
             app_tx.clone(),
             Arc::clone(&shared_key),
             Arc::clone(&ra),
+            Arc::clone(&rkl),
             key_manager.clone(),
             Arc::clone(&wire_tx),
             Arc::clone(&wire_rx),
@@ -348,6 +353,7 @@ impl WebRTCConnection {
         shared_key: Arc<RwLock<[u8; 32]>>,
         key_manager: Option<SessionKeyManager>,
         remote_access: tokio::sync::watch::Receiver<bool>,
+        remote_key_listener: tokio::sync::watch::Receiver<bool>,
         awake_notify: Arc<tokio::sync::Notify>,
         wire_tx: Arc<AtomicU64>,
         wire_rx: Arc<AtomicU64>,
@@ -359,10 +365,12 @@ impl WebRTCConnection {
 
         let state = ConnectionState::new();
         let ra = Arc::new(remote_access);
+        let rkl = Arc::new(remote_key_listener);
         let ctx = state.build_context(
             app_tx.clone(),
             Arc::clone(&shared_key),
             Arc::clone(&ra),
+            Arc::clone(&rkl),
             key_manager.clone(),
             Arc::clone(&wire_tx),
             Arc::clone(&wire_rx),

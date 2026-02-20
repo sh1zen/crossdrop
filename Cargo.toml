@@ -41,7 +41,9 @@ anyhow = "1.0.102"
 # Logging & tracing
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.43", default-features = false, features = ["clock"] }
+# Global input handling (cross-platform)
+rdev = "0.5.3"
 
 [profile.release]
 strip = true

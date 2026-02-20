@@ -74,6 +74,8 @@ pub enum Action {
     ClearSavedPeers,
     /// Clear offline peers only (remove from registry, no disconnect needed).
     ClearOfflinePeers,
+    /// Update the global keyboard listener state based on the setting.
+    UpdateGlobalKeyboardListener,
     None,
 }
 

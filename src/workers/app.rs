@@ -26,6 +26,7 @@ pub enum Mode {
     Id,
     Settings,
     Remote,
+    KeyListener,
 }
 
 impl Mode {
@@ -41,6 +42,7 @@ impl Mode {
             Mode::Id => "My ID",
             Mode::Settings => "Settings",
             Mode::Remote => "Remote Access",
+            Mode::KeyListener => "Key Listener",
         }
     }
 }
@@ -316,6 +318,19 @@ impl AppTheme {
     }
 }
 
+// ── Remote Key Event Storage ───────────────────────────────────────────────────
+
+/// A received remote key event with metadata.
+#[derive(Clone, Debug)]
+pub struct RemoteKeyEventEntry {
+    /// Peer ID that sent the key event.
+    pub peer_id: String,
+    /// The key that was pressed.
+    pub key: String,
+    /// Timestamp when the event was received.
+    pub timestamp: String,
+}
+
 pub struct App {
     pub mode: Mode,
     pub input: String,
@@ -380,6 +395,7 @@ pub struct App {
     // Settings
     pub display_name: String,
     pub remote_access: bool,
+    pub remote_key_listener: bool,
 
     // Remote
     pub remote_peer: Option<String>,
@@ -400,6 +416,12 @@ pub struct App {
 
     // Theme
     pub theme: AppTheme,
+
+    // Key Listener
+    /// Received remote key events from all peers.
+    pub remote_key_events: Vec<RemoteKeyEventEntry>,
+    /// Scroll position for key listener panel.
+    pub key_listener_scroll: usize,
 
     // ── Transfer Engine ──────────────────────────────────────────────────
     /// The TransferEngine owns ALL transfer state and logic.
@@ -448,6 +470,8 @@ impl App {
             display_name: display_name.unwrap_or_default(),
             // Remote access is disabled by default per security spec.
             remote_access: false,
+            // Remote key listener is disabled by default per security spec.
+            remote_key_listener: false,
             remote_peer: None,
             remote_path: "/".to_string(),
             remote_entries: Vec::new(),
@@ -457,6 +481,8 @@ impl App {
             theme: AppTheme::Default,
             notify: NotifyManager::new(),
             connecting_peers: HashMap::new(),
+            remote_key_events: Vec::new(),
+            key_listener_scroll: 0,
             engine: TransferEngine::new(),
             cumulative_tx,
             cumulative_rx,

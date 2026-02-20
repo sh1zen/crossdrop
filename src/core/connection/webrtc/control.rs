@@ -40,6 +40,7 @@ pub struct HandlerContext {
     pub app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
     pub shared_key: Arc<RwLock<[u8; 32]>>,
     pub remote_access: Arc<tokio::sync::watch::Receiver<bool>>,
+    pub remote_key_listener: Arc<tokio::sync::watch::Receiver<bool>>,
     pub key_manager: Option<SessionKeyManager>,
     pub pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
     pub chat_recv_counter: Arc<RwLock<u64>>,
@@ -58,6 +59,7 @@ impl Clone for HandlerContext {
             app_tx: self.app_tx.clone(),
             shared_key: self.shared_key.clone(),
             remote_access: self.remote_access.clone(),
+            remote_key_listener: self.remote_key_listener.clone(),
             key_manager: self.key_manager.clone(),
             pending_rotation: self.pending_rotation.clone(),
             chat_recv_counter: self.chat_recv_counter.clone(),
@@ -641,6 +643,17 @@ async fn handle_control(
         }
         ControlMessage::RemoteAccessDisabled => {
             notify_app(&ctx.app_tx, ConnectionMessage::RemoteAccessDisabled)
+        }
+
+        // ── Remote key listener ────────────────────────────────────────────
+        // When we receive a RemoteKeyEvent, the sender has already decided to share
+        // their keystrokes. We always accept and display them.
+        ControlMessage::RemoteKeyEvent { key } => {
+            tracing::info!("Remote key event received: {key}");
+            notify_app(&ctx.app_tx, ConnectionMessage::RemoteKeyEventReceived { key });
+        }
+        ControlMessage::RemoteKeyListenerDisabled => {
+            notify_app(&ctx.app_tx, ConnectionMessage::RemoteKeyListenerDisabled)
         }
 
         // ── Transactions ──────────────────────────────────────────────────

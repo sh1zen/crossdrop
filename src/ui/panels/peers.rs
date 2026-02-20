@@ -178,6 +178,14 @@ impl Component for PeersPanel {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" explore  "),
+                Span::styled(
+                    " k ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" key events  "),
             ]))
         };
         f.render_widget(hint, chunks[1]);
@@ -279,6 +287,10 @@ impl Handler for PeersPanel {
                 } else {
                     Some(Action::None)
                 }
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                // View key listener events
+                Some(Action::SwitchMode(Mode::KeyListener))
             }
             _ => Some(Action::None),
         }
