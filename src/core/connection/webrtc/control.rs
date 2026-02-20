@@ -299,7 +299,6 @@ fn spawn_finalization(
             &dc,
             file_id,
             state,
-            pending.sha3_256,
             pending.merkle_root,
             &key,
             &app_tx,
@@ -555,7 +554,6 @@ async fn handle_control(
 
         ControlMessage::Hash {
             file_id,
-            sha3_256,
             merkle_root: sender_merkle_root,
         } => {
             let mut map = ctx.recv_state.write().await;
@@ -572,7 +570,6 @@ async fn handle_control(
                             &dc,
                             file_id,
                             state,
-                            sha3_256,
                             sender_merkle_root,
                             &key,
                             &app_tx,
@@ -596,7 +593,6 @@ async fn handle_control(
                         "Hash arrived before all chunks — buffering"
                     );
                     state.pending_hash = Some(PendingHash {
-                        sha3_256,
                         merkle_root: sender_merkle_root,
                     });
                 }

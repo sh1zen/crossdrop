@@ -37,11 +37,6 @@ pub const SENDER_READ_AHEAD_CHUNKS: usize = 64;
 /// overhead and improves throughput on rotational media.
 pub const RECEIVER_WRITE_BUFFER_CHUNKS: usize = 64;
 
-/// Read-back buffer size used when computing the whole-file SHA3-256 hash
-/// during finalization (slow path only — when chunks arrived out of order).
-/// 8 MB keeps memory bounded while providing good sequential-read throughput.
-pub const HASH_READ_BUFFER: usize = 8 * 1024 * 1024;
-
 /// Maximum files in-flight (sent but not yet acknowledged via FileReceived).
 /// Sender pauses if this many files are pending ACK.
 /// Higher values improve throughput by overlapping the next file's transfer

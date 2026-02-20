@@ -24,7 +24,6 @@
 use crate::core::config::SENDER_READ_AHEAD_CHUNKS;
 use crate::core::pipeline::merkle::{hash_chunk, IncrementalMerkleBuilder};
 use anyhow::Result;
-use sha3::{Digest, Sha3_256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc;
 
@@ -41,10 +40,7 @@ pub struct ReadChunk {
 }
 
 /// Aggregated output from the disk reader task.
-pub struct ReaderResult {
-    /// SHA3-256 hash of the complete file.
-    pub whole_file_hash: Vec<u8>,
-}
+pub struct ReaderResult;
 
 // ── Reader ─────────────────────────────────────────────────────────────────────
 
@@ -74,7 +70,6 @@ pub fn spawn_reader(
 
     let handle = tokio::spawn(async move {
         let mut file = tokio::fs::File::open(&file_path).await?;
-        let mut whole_hasher = Sha3_256::new();
         let mut merkle_builder = IncrementalMerkleBuilder::with_capacity(total_chunks as usize);
 
         for seq in 0..total_chunks {
@@ -85,7 +80,6 @@ pub fn spawn_reader(
             let mut buf = vec![0u8; len];
             file.read_exact(&mut buf).await?;
 
-            whole_hasher.update(&buf);
             let hash = hash_chunk(&buf);
             merkle_builder.add_leaf(hash);
 
@@ -105,9 +99,7 @@ pub fn spawn_reader(
             }
         }
 
-        Ok(ReaderResult {
-            whole_file_hash: whole_hasher.finalize().to_vec(),
-        })
+        Ok(ReaderResult)
     });
 
     (rx, handle)

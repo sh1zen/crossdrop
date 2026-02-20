@@ -12,7 +12,6 @@ use webrtc::data_channel::RTCDataChannel;
 
 /// Outcome of all integrity checks run after a file is fully received.
 struct FileVerificationResult {
-    sha3_ok: bool,
     merkle_ok: bool,
     /// Chunks whose per-chunk hash did not match during streaming verification.
     failed_chunks: Vec<u32>,
@@ -20,31 +19,20 @@ struct FileVerificationResult {
 
 impl FileVerificationResult {
     fn new(
-        computed_sha3: &[u8],
-        expected_sha3: &[u8],
-        sender_merkle_root: Option<[u8; 32]>,
+        sender_merkle_root: [u8; 32],
         computed_merkle_root: &[u8; 32],
         failed_chunks: &[u32],
     ) -> Self {
-        let sha3_ok = computed_sha3 == expected_sha3;
-        let merkle_ok = match sender_merkle_root {
-            Some(sender_root) => {
-                let ok = computed_merkle_root == &sender_root;
-                if ok {
-                    tracing::debug!(event = "merkle_root_verified", "Merkle root matches sender");
-                } else {
-                    warn!(
-                        event = "merkle_root_mismatch",
-                        "Sender/receiver Merkle root mismatch"
-                    );
-                }
-                ok
-            }
-            // No sender root to compare against — treat as passing.
-            None => true,
-        };
+        let merkle_ok = computed_merkle_root == &sender_merkle_root;
+        if merkle_ok {
+            tracing::debug!(event = "merkle_root_verified", "Merkle root matches sender");
+        } else {
+            warn!(
+                event = "merkle_root_mismatch",
+                "Sender/receiver Merkle root mismatch"
+            );
+        }
         Self {
-            sha3_ok,
             merkle_ok,
             failed_chunks: failed_chunks.to_vec(),
         }
@@ -52,7 +40,7 @@ impl FileVerificationResult {
 
     #[inline]
     fn is_valid(&self) -> bool {
-        self.sha3_ok && self.merkle_ok
+        self.merkle_ok
     }
 
     #[inline]
@@ -66,7 +54,7 @@ impl FileVerificationResult {
 impl WebRTCConnection {
     /// Finalize a fully-received file:
     ///   1. Flush the writer.
-    ///   2. Verify SHA-3 + Merkle root.
+    ///   2. Verify Merkle root.
     ///   3. Send `HashResult` to the sender.
     ///   4. Commit (or abort and request retransmission) accordingly.
     ///
@@ -76,8 +64,7 @@ impl WebRTCConnection {
         dc: &Arc<RTCDataChannel>,
         file_id: Uuid,
         state: ReceiveFileState,
-        sha3_256: Vec<u8>,
-        sender_merkle_root: Option<[u8; 32]>,
+        sender_merkle_root: [u8; 32],
         key: &[u8; 32],
         app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>,
         wire_tx: &Arc<AtomicU64>,
@@ -92,8 +79,6 @@ impl WebRTCConnection {
         };
 
         let result = FileVerificationResult::new(
-            &finalized.sha3_256,
-            &sha3_256,
             sender_merkle_root,
             &finalized.merkle_root,
             &finalized.failed_chunks,
@@ -138,7 +123,7 @@ impl WebRTCConnection {
         info!(
             event = "file_recv_verified",
             %file_id, filename = %finalized.filename, bytes = finalized.filesize,
-            "File received and hash verified"
+            "File received and Merkle root verified"
         );
 
         // Unblock the sender before the (potentially slow) disk commit.
@@ -194,7 +179,7 @@ impl WebRTCConnection {
         error!(
             event = "file_integrity_failure",
             %file_id, filename = %finalized.filename,
-            sha3_ok = result.sha3_ok, merkle_ok = result.merkle_ok,
+            merkle_ok = result.merkle_ok,
             failed_chunks = ?result.failed_chunks,
             "File integrity check failed"
         );
@@ -230,7 +215,7 @@ impl WebRTCConnection {
                 "Failed to send ChunkRetransmitRequest");
         }
 
-        notify_app_err(app_tx, format!("Hash mismatch for {failed_name}"));
+        notify_app_err(app_tx, format!("Merkle root mismatch for {failed_name}"));
     }
 }
 

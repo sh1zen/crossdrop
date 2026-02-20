@@ -20,15 +20,14 @@
 //! Each [`StreamingFileWriter`] is independent — multiple instances run in
 //! parallel for different file IDs without shared-state contention.
 
-use crate::core::config::{CHUNK_SIZE, HASH_READ_BUFFER, RECEIVER_WRITE_BUFFER_CHUNKS};
+use crate::core::config::{CHUNK_SIZE, RECEIVER_WRITE_BUFFER_CHUNKS};
 use crate::core::pipeline::chunk::ChunkBitmap;
 use crate::core::pipeline::merkle::{ChunkHashVerifier, ChunkVerificationError, MerkleTree};
 use anyhow::{anyhow, Result};
-use sha3::{Digest, Sha3_256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tracing::warn;
 
 // ── Public result types ────────────────────────────────────────────────────────
@@ -73,10 +72,6 @@ pub struct StreamingFileWriter {
     next_flush_seq: u32,
     verifier: Option<ChunkHashVerifier>,
     failed_chunks: Vec<u32>,
-    /// Incremental whole-file hasher — updated for sequentially flushed chunks.
-    whole_file_hasher: Sha3_256,
-    /// How far the incremental hasher has reached (in chunk units).
-    hash_frontier: u32,
     /// Last milestone at which a high-watermark warning was emitted.
     last_buffer_warn_milestone: usize,
 }
@@ -195,8 +190,6 @@ impl StreamingFileWriter {
             next_flush_seq: frontier,
             verifier: None,
             failed_chunks: Vec::new(),
-            whole_file_hasher: Sha3_256::new(),
-            hash_frontier: 0,
             last_buffer_warn_milestone: 0,
         }
     }
@@ -209,7 +202,20 @@ impl StreamingFileWriter {
     }
 
     /// Feed incremental chunk hashes into the verifier, creating one if needed.
+    ///
+    /// Also stores hashes in `chunk_hashes` for Merkle root computation at finalization.
+    /// This is critical for resumed transfers where some chunks are already on disk:
+    /// the sender sends all chunk hashes, and we must retain them even for chunks
+    /// we won't receive again.
     pub fn add_chunk_hashes(&mut self, start_index: u32, hashes: Vec<[u8; 32]>) {
+        // Store in chunk_hashes for Merkle root computation at finalization.
+        for (i, hash) in hashes.iter().enumerate() {
+            let seq = start_index as usize + i;
+            if seq < self.chunk_hashes.len() {
+                self.chunk_hashes[seq] = Some(*hash);
+            }
+        }
+        // Also feed to verifier for incremental verification.
         let verifier = self
             .verifier
             .get_or_insert_with(|| ChunkHashVerifier::with_capacity(self.total_chunks as usize));
@@ -306,11 +312,6 @@ impl StreamingFileWriter {
             self.file.seek(SeekFrom::Start(offset)).await?;
             self.file.write_all(&data).await?;
 
-            if self.next_flush_seq == self.hash_frontier {
-                self.whole_file_hasher.update(&data);
-                self.hash_frontier += 1;
-            }
-
             self.next_flush_seq += 1;
         }
 
@@ -349,8 +350,8 @@ impl StreamingFileWriter {
 
     // ── Finalization ───────────────────────────────────────────────────────────
 
-    /// Flush remaining buffered chunks, compute the whole-file SHA3-256 hash
-    /// and the Merkle root, then return a [`FinalizedFile`] for commit/abort.
+    /// Flush remaining buffered chunks, compute the Merkle root,
+    /// then return a [`FinalizedFile`] for commit/abort.
     pub async fn finalize(mut self) -> Result<FinalizedFile> {
         // Drain the write buffer in order.
         let remaining: Vec<(u32, Vec<u8>)> =
@@ -360,21 +361,14 @@ impl StreamingFileWriter {
                 .seek(SeekFrom::Start(*seq as u64 * CHUNK_SIZE as u64))
                 .await?;
             self.file.write_all(data).await?;
-
-            if *seq == self.hash_frontier {
-                self.whole_file_hasher.update(data);
-                self.hash_frontier += 1;
-            }
         }
 
         self.file.flush().await?;
         self.file.sync_all().await?;
 
-        let sha3_hash = self.compute_whole_file_hash().await?;
         let merkle_root = self.compute_merkle_root();
 
         Ok(FinalizedFile {
-            sha3_256: sha3_hash,
             merkle_root,
             filename: self.filename,
             filesize: self.filesize,
@@ -382,41 +376,6 @@ impl StreamingFileWriter {
             final_path: self.final_path,
             failed_chunks: self.failed_chunks,
         })
-    }
-
-    /// Finish the whole-file hash, using disk readback only for the out-of-order tail.
-    async fn compute_whole_file_hash(&mut self) -> Result<Vec<u8>> {
-        if self.hash_frontier >= self.total_chunks {
-            tracing::debug!(
-                event = "incremental_hash_complete",
-                total_chunks = self.total_chunks,
-                "Whole-file SHA3-256 computed incrementally — no file readback"
-            );
-        } else {
-            tracing::debug!(
-                event = "partial_readback",
-                hash_frontier = self.hash_frontier,
-                total_chunks = self.total_chunks,
-                "Reading back file from chunk {} to compute hash",
-                self.hash_frontier
-            );
-            let start = self.hash_frontier as u64 * CHUNK_SIZE as u64;
-            self.file.seek(SeekFrom::Start(start)).await?;
-            let mut buf = vec![0u8; HASH_READ_BUFFER];
-            loop {
-                let n = self.file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                self.whole_file_hasher.update(&buf[..n]);
-            }
-        }
-
-        Ok(
-            std::mem::replace(&mut self.whole_file_hasher, Sha3_256::new())
-                .finalize()
-                .to_vec(),
-        )
     }
 
     /// Build the Merkle root from per-chunk hashes collected during reception.
@@ -438,7 +397,6 @@ impl StreamingFileWriter {
 /// Call [`commit`](FinalizedFile::commit) to rename the temp file into place,
 /// or [`abort`](FinalizedFile::abort) to delete it.
 pub struct FinalizedFile {
-    pub sha3_256: Vec<u8>,
     pub merkle_root: [u8; 32],
     pub filename: String,
     pub filesize: u64,
@@ -524,15 +482,8 @@ mod tests {
 
         let finalized = writer.finalize().await.unwrap();
 
-        let expected_hash = {
-            let mut h = Sha3_256::new();
-            h.update(&chunk0);
-            h.update(&chunk1);
-            h.update(&chunk2);
-            h.finalize().to_vec()
-        };
-
-        assert_eq!(finalized.sha3_256, expected_hash);
+        // Verify Merkle root is computed (non-zero)
+        assert_ne!(finalized.merkle_root, [0u8; 32]);
         assert_eq!(finalized.filename, "test_file.bin");
         assert_eq!(finalized.filesize, filesize);
 

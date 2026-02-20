@@ -16,8 +16,8 @@ use crate::core::persistence::{Persistence, TransferRecordSnapshot, TransferStat
 use crate::core::security::identity::PeerIdentity;
 use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
-    ResumeInfo, ResumeRejectReason, Transaction, TransactionDirection, TransactionManager,
-    TransactionManifest, TransactionState,
+    ResumeInfo, Transaction, TransactionDirection, TransactionManager, TransactionManifest,
+    TransactionState,
 };
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -447,12 +447,18 @@ impl TransferEngine {
     ) -> Result<EngineOutcome> {
         self.check_transfer_capacity("File send")?;
 
-        let txn = Transaction::new_outbound(
+        let mut txn = Transaction::new_outbound(
             peer_id.to_owned(),
             filename.to_owned(),
             None,
             vec![(filename.to_owned(), filesize)],
         );
+        // Set full_path on the single file for crash-resilient resume
+        if let Some(file_id) = txn.file_order.first() {
+            if let Some(tf) = txn.files.get_mut(file_id) {
+                tf.full_path = Some(file_path.to_owned());
+            }
+        }
         let txn_id = txn.id;
         let total_size = txn.total_size;
         let mut manifest = txn.build_manifest();
@@ -488,12 +494,34 @@ impl TransferEngine {
             return Err(anyhow!("Folder is empty"));
         }
 
-        let txn = Transaction::new_outbound(
+        // Build a map of relative_path -> full_path for setting full_path on each file
+        let full_paths: HashMap<String, String> = files
+            .iter()
+            .map(|(rel_path, _)| {
+                let full = std::path::Path::new(folder_path)
+                    .join(rel_path)
+                    .to_string_lossy()
+                    .to_string();
+                (rel_path.clone(), full)
+            })
+            .collect();
+
+        let mut txn = Transaction::new_outbound(
             peer_id.to_owned(),
             dirname.to_owned(),
             Some(dirname.to_owned()),
             files,
         );
+
+        // Set full_path on each file for crash-resilient resume
+        for file_id in &txn.file_order {
+            if let Some(tf) = txn.files.get_mut(file_id) {
+                if let Some(full) = full_paths.get(&tf.relative_path) {
+                    tf.full_path = Some(full.clone());
+                }
+            }
+        }
+
         let txn_id = txn.id;
         let total_size = txn.total_size;
         let files_len = txn.file_order.len();

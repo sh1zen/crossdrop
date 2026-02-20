@@ -7,7 +7,7 @@ use super::{
 use crate::core::config::{
     CHUNK_SIZE, DC_BUFFERED_AMOUNT_HIGH, DC_REOPEN_TIMEOUT, DC_SEND_MAX_RETRIES, PIPELINE_SIZE,
 };
-use crate::core::connection::webrtc::data::{encode_chunk_frame_into, encode_control_frame};
+use crate::core::connection::webrtc::data::{encode_chunk_frame_into, encode_control_frame, CHUNK_FRAME_MIN_SIZE};
 use crate::core::pipeline::chunk::ChunkBitmap;
 use crate::core::pipeline::merkle::IncrementalMerkleBuilder;
 use crate::core::security::message_auth::MessageAuthenticator;
@@ -15,7 +15,6 @@ use crate::core::transaction::TransactionManifest;
 use aes_gcm::{aead::KeyInit, Aes256Gcm};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use sha3::Digest;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -461,7 +460,7 @@ impl WebRTCConnection {
         }
 
         // Await reader completion.
-        let reader_result = reader_handle
+        let _reader_result = reader_handle
             .await
             .map_err(|e| anyhow!("Reader task panicked: {}", e))?
             .map_err(|e| anyhow!("Reader error: {}", e))?;
@@ -492,8 +491,7 @@ impl WebRTCConnection {
         tail_wire += self
             .send_control_counted(&ControlMessage::Hash {
                 file_id,
-                sha3_256: reader_result.whole_file_hash,
-                merkle_root: Some(merkle_root),
+                merkle_root,
             })
             .await?;
 
@@ -593,6 +591,7 @@ impl WebRTCConnection {
         let total_chunks = total_chunks(filesize);
         let missing: Vec<u32> = bitmap.missing_chunks().collect();
         let missing_count = missing.len() as u32;
+        let already_received = total_chunks - missing_count;
 
         if missing_count == 0 {
             info!(event = "file_send_complete_all_chunks", %file_id, %filename, "All chunks already received, nothing to send");
@@ -656,11 +655,12 @@ impl WebRTCConnection {
                 batch_wire += wb as u64;
 
                 if sent_chunks % 20 == 0 {
+                    // Report progress relative to total_chunks for consistent UI on both peers.
                     self.report_progress(
                         file_id,
                         &filename,
-                        sent_chunks,
-                        missing_count,
+                        already_received + sent_chunks,
+                        total_chunks,
                         batch_wire,
                     );
                     batch_wire = 0;
@@ -675,18 +675,17 @@ impl WebRTCConnection {
                 .await?;
         }
 
-        // Compute whole-file hash and send final Hash message.
+        // Send final Hash message with Merkle root.
         let merkle_root = *merkle.build().root();
-        let final_hash = hash_file_streaming(&mut file, filesize).await?;
 
         self.send_control(&ControlMessage::Hash {
             file_id,
-            sha3_256: final_hash,
-            merkle_root: Some(merkle_root),
+            merkle_root,
         })
         .await?;
 
-        self.report_progress(file_id, &filename, missing_count, missing_count, batch_wire);
+        // Report final progress as complete.
+        self.report_progress(file_id, &filename, total_chunks, total_chunks, batch_wire);
 
         info!(event = "file_send_resume_complete", %file_id, %filename, sent_chunks, "Completed file resume send");
         Ok(())
@@ -890,7 +889,7 @@ fn make_cipher(key: &[u8; 32]) -> Result<Aes256Gcm> {
 #[inline]
 fn chunk_frame_buf() -> Vec<u8> {
     // 1 byte type tag + 16 bytes UUID + 4 bytes seq + CHUNK_SIZE data
-    Vec::with_capacity(1 + 16 + 4 + CHUNK_SIZE)
+    Vec::with_capacity(CHUNK_FRAME_MIN_SIZE)
 }
 
 /// Read exactly the bytes belonging to chunk `seq` from `file`.
@@ -901,19 +900,4 @@ async fn read_chunk(file: &mut tokio::fs::File, filesize: u64, seq: u32) -> Resu
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf).await?;
     Ok(buf)
-}
-
-/// Hash the entire file by streaming it in CHUNK_SIZE windows.
-async fn hash_file_streaming(file: &mut tokio::fs::File, filesize: u64) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0)).await?;
-    let mut hasher = sha3::Sha3_256::default();
-    let mut remaining = filesize;
-    while remaining > 0 {
-        let to_read = (CHUNK_SIZE as u64).min(remaining) as usize;
-        let mut buf = vec![0u8; to_read];
-        file.read_exact(&mut buf).await?;
-        sha3::Digest::update(&mut hasher, &buf);
-        remaining -= to_read as u64;
-    }
-    Ok(hasher.finalize().to_vec())
 }

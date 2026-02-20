@@ -90,6 +90,10 @@ pub struct TransactionFile {
     pub file_id: Uuid,
     /// Relative path (for folders) or filename (for single file).
     pub relative_path: String,
+    /// Full absolute path to the source file (for outbound) or destination (for inbound).
+    /// Persisted for crash-resilient resume support.
+    #[serde(default)]
+    pub full_path: Option<String>,
     pub filesize: u64,
     pub total_chunks: u32,
     pub transferred_chunks: u32,
@@ -111,6 +115,7 @@ impl TransactionFile {
         Self {
             file_id,
             relative_path,
+            full_path: None,
             filesize,
             total_chunks,
             transferred_chunks: 0,
@@ -382,12 +387,6 @@ impl Transaction {
 
     // ── File-level operations ────────────────────────────────────────────
 
-    pub fn update_file_progress(&mut self, file_id: Uuid, transferred_chunks: u32) {
-        if let Some(f) = self.files.get_mut(&file_id) {
-            f.transferred_chunks = transferred_chunks;
-        }
-    }
-
     /// Update sent-chunk progress and mark chunks as sent in the bitmap.
     pub fn update_file_progress_sent(&mut self, file_id: Uuid, sent_chunks: u32) {
         if let Some(f) = self.files.get_mut(&file_id) {
@@ -616,6 +615,7 @@ impl Transaction {
             .map(|f| TransactionFileSnapshot {
                 file_id: f.file_id,
                 relative_path: f.relative_path.clone(),
+                full_path: f.full_path.clone(),
                 filesize: f.filesize,
                 total_chunks: f.total_chunks,
                 transferred_chunks: f.transferred_chunks,
@@ -675,6 +675,7 @@ impl Transaction {
             let tf = TransactionFile {
                 file_id: fs.file_id,
                 relative_path: fs.relative_path.clone(),
+                full_path: fs.full_path.clone(),
                 filesize: fs.filesize,
                 total_chunks: fs.total_chunks,
                 transferred_chunks: fs.transferred_chunks,
@@ -850,6 +851,10 @@ impl TransactionSnapshot {
 pub struct TransactionFileSnapshot {
     pub file_id: Uuid,
     pub relative_path: String,
+    /// Full absolute path to the source file (for outbound) or destination (for inbound).
+    /// Persisted for crash-resilient resume support.
+    #[serde(default)]
+    pub full_path: Option<String>,
     pub filesize: u64,
     pub total_chunks: u32,
     pub transferred_chunks: u32,

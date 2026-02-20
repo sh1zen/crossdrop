@@ -124,20 +124,6 @@ impl ConnectionState {
 
 // ── WebRTC API Configuration ─────────────────────────────────────────────────
 
-/// Arguments shared between `create_offer` and `accept_offer`.
-///
-/// Grouping these reduces per-function parameter count and makes the call
-/// sites easier to read without changing any logic.
-pub struct ConnectionArgs {
-    pub app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
-    pub shared_key: Arc<RwLock<[u8; 32]>>,
-    pub key_manager: Option<SessionKeyManager>,
-    pub remote_access: tokio::sync::watch::Receiver<bool>,
-    pub awake_notify: Arc<tokio::sync::Notify>,
-    pub wire_tx: Arc<AtomicU64>,
-    pub wire_rx: Arc<AtomicU64>,
-}
-
 impl WebRTCConnection {
     fn default_ice_servers() -> Vec<RTCIceServer> {
         vec![

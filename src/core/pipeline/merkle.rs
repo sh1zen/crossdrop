@@ -38,7 +38,6 @@ fn finalize(hasher: Sha3_256) -> [u8; 32] {
 #[derive(Debug, Clone)]
 pub struct MerkleTree {
     root: [u8; 32],
-    leaves: Vec<[u8; 32]>,
 }
 
 impl MerkleTree {
@@ -46,18 +45,12 @@ impl MerkleTree {
     pub fn build(chunk_hashes: &[[u8; 32]]) -> Self {
         Self {
             root: Self::compute_root(chunk_hashes),
-            leaves: chunk_hashes.to_vec(),
         }
     }
 
     /// Return the Merkle root.
     pub fn root(&self) -> &[u8; 32] {
         &self.root
-    }
-
-    /// Return all leaf hashes.
-    pub fn leaves(&self) -> &[[u8; 32]] {
-        &self.leaves
     }
 
     /// Compute the Merkle root from a slice of leaf hashes.
@@ -94,10 +87,6 @@ pub struct IncrementalMerkleBuilder {
 }
 
 impl IncrementalMerkleBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             leaves: Vec::with_capacity(capacity),
@@ -150,11 +139,6 @@ impl ChunkHashVerifier {
                 *slot = Some(hash);
             }
         }
-    }
-
-    /// Return the expected hash for `seq`, if present.
-    pub fn get_chunk_hash(&self, seq: u32) -> Option<&[u8; 32]> {
-        self.chunk_hashes.get(seq as usize)?.as_ref()
     }
 
     /// Total number of chunk slots.
@@ -255,12 +239,6 @@ mod tests {
             builder.build().root(),
             MerkleTree::build(&[h1, h2, h3]).root()
         );
-    }
-
-    #[test]
-    fn test_merkle_tree_leaves() {
-        let (h1, h2) = ([1u8; 32], [2u8; 32]);
-        assert_eq!(MerkleTree::build(&[h1, h2]).leaves(), &[h1, h2]);
     }
 
     #[test]

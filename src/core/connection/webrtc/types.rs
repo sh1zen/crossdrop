@@ -78,13 +78,11 @@ pub enum ControlMessage {
         /// SHA3-256 hashes for chunks `start_index .. start_index + len`.
         chunk_hashes: Vec<[u8; 32]>,
     },
-    /// Whole-file hash + optional Merkle root sent after all chunks.
+    /// Merkle root sent after all chunks (incremental Merkle approach).
     Hash {
         file_id: Uuid,
-        sha3_256: Vec<u8>,
         /// Merkle root computed incrementally from per-chunk SHA3-256 hashes.
-        #[serde(default)]
-        merkle_root: Option<[u8; 32]>,
+        merkle_root: [u8; 32],
     },
     /// Hash verification result (receiver → sender).
     HashResult { file_id: Uuid, ok: bool },
@@ -287,20 +285,8 @@ pub enum ConnectionMessage {
 ///
 /// Consumed by the chunk handler once `received_chunks == total_chunks`.
 pub struct PendingHash {
-    /// Expected SHA3-256 hash of the complete file.
-    pub sha3_256: Vec<u8>,
-    /// Expected Merkle root, if the sender provided one.
-    pub merkle_root: Option<[u8; 32]>,
-}
-
-impl PendingHash {
-    #[inline]
-    pub fn new(sha3_256: Vec<u8>, merkle_root: Option<[u8; 32]>) -> Self {
-        Self {
-            sha3_256,
-            merkle_root,
-        }
-    }
+    /// Expected Merkle root from sender.
+    pub merkle_root: [u8; 32],
 }
 
 /// Live state for one in-progress file receive.
@@ -309,14 +295,4 @@ pub struct ReceiveFileState {
     pub writer: StreamingFileWriter,
     /// Buffered hash message — set when `Hash` arrives before the final chunk.
     pub pending_hash: Option<PendingHash>,
-}
-
-impl ReceiveFileState {
-    #[inline]
-    pub fn new(writer: StreamingFileWriter) -> Self {
-        Self {
-            writer,
-            pending_hash: None,
-        }
-    }
 }

@@ -999,10 +999,7 @@ impl PeerNode {
     ) -> Result<()> {
         use crate::core::config::FILE_ACK_POLL_INTERVAL;
 
-        let root_parent = {
-            let root = std::path::Path::new(folder_path);
-            root.parent().unwrap_or(root).to_path_buf()
-        };
+        let folder_root = std::path::Path::new(folder_path);
 
         let conn = self.get_connection(peer_id).await?;
         self.check_alive_or_disconnect(peer_id, &conn).await?;
@@ -1055,7 +1052,7 @@ impl PeerNode {
                 }
             }
 
-            let full_path = root_parent.join(&relative_path);
+            let full_path = folder_root.join(&relative_path);
 
             let filesize = match tokio::fs::metadata(&full_path).await {
                 Ok(m) => m.len(),

@@ -49,7 +49,6 @@ type StdTerminal = Terminal<CrosstermBackend<std::io::Stdout>>;
 pub struct UIExecuter {
     app: App,
     terminal: StdTerminal,
-    node: PeerNode,
     log_buffer: LogBuffer,
     context: UIContext,
     panels: Panels,
@@ -227,7 +226,7 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
 
     restore_persisted_state(&mut app, &node, &args);
 
-    let mut executer = UIExecuter::new(app, terminal, node.clone(), log_buffer);
+    let mut executer = UIExecuter::new(app, terminal, log_buffer);
 
     restore_chat_history(&mut executer);
     seed_peer_list(&mut executer);
@@ -463,12 +462,11 @@ async fn reconnect_after_disconnect(node: PeerNode, peer_id: String, ticket: Str
 // ── UIExecuter impl ───────────────────────────────────────────────────────────
 
 impl UIExecuter {
-    pub fn new(app: App, terminal: StdTerminal, node: PeerNode, log_buffer: LogBuffer) -> Self {
+    pub fn new(app: App, terminal: StdTerminal, log_buffer: LogBuffer) -> Self {
         let persistence = Persistence::load().unwrap_or_default();
         Self {
             app,
             terminal,
-            node,
             log_buffer,
             context: UIContext::new(),
             panels: Panels::new(),
@@ -874,6 +872,9 @@ impl UIExecuter {
             non_terminal = active_count,
             "Checking for resumable transactions"
         );
+
+        // Wait 100ms after WebRTC connection is established before resume logic.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let resume = self.app.engine.handle_peer_reconnected(&peer_id);
         let has_resume = !resume.actions.is_empty();
@@ -1327,12 +1328,9 @@ impl UIExecuter {
     // ── ResendFiles helpers ───────────────────────────────────────────────
 
     fn collect_resend_info(&self, peer_id: &str, transaction_id: uuid::Uuid) -> Option<ResendInfo> {
-        use crate::core::pipeline::chunk::ChunkBitmap;
-
         let txn = self.app.engine.transactions().get(&transaction_id)?;
-        let source_path = self.app.engine.source_path(&transaction_id)?.to_string();
 
-        let incomplete: Vec<(uuid::Uuid, String, Option<ChunkBitmap>)> = txn
+        let incomplete: Vec<ResendFileInfo> = txn
             .file_order
             .iter()
             .filter_map(|fid| {
@@ -1340,14 +1338,45 @@ impl UIExecuter {
                 if f.completed {
                     return None;
                 }
-                Some((*fid, f.relative_path.clone(), f.chunk_bitmap.clone()))
+                // Use stored full_path if available, otherwise fall back to joining source_path with relative_path
+                let full_path = f.full_path.clone().or_else(|| {
+                    self.app
+                        .engine
+                        .source_path(&transaction_id)
+                        .filter(|s| !s.is_empty())
+                        .map(|src| {
+                            std::path::Path::new(src)
+                                .join(&f.relative_path)
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                });
+                let full_path = match full_path {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(
+                            "Resume: no valid path for file '{}' in transaction {} (full_path={:?}, source_path={:?})",
+                            f.relative_path,
+                            transaction_id,
+                            f.full_path,
+                            self.app.engine.source_path(&transaction_id)
+                        );
+                        return None;
+                    }
+                };
+                
+                Some(ResendFileInfo {
+                    file_id: *fid,
+                    relative_path: f.relative_path.clone(),
+                    full_path,
+                    bitmap: f.chunk_bitmap.clone(),
+                })
             })
             .collect();
 
         let is_folder = txn.parent_dir.is_some();
         Some(ResendInfo {
             peer_id: peer_id.to_string(),
-            source_path,
             files: incomplete,
             is_folder,
         })
@@ -1357,7 +1386,7 @@ impl UIExecuter {
 
     async fn handle_remote_fetch(
         &mut self,
-        node: &PeerNode,
+        _node: &PeerNode,
         peer_id: String,
         path: String,
         is_folder: bool,
@@ -1431,13 +1460,15 @@ impl UIExecuter {
 
 struct ResendInfo {
     peer_id: String,
-    source_path: String,
-    files: Vec<(
-        uuid::Uuid,
-        String,
-        Option<crate::core::pipeline::chunk::ChunkBitmap>,
-    )>,
+    files: Vec<ResendFileInfo>,
     is_folder: bool,
+}
+
+struct ResendFileInfo {
+    file_id: uuid::Uuid,
+    relative_path: String,
+    full_path: String,
+    bitmap: Option<crate::core::pipeline::chunk::ChunkBitmap>,
 }
 
 fn spawn_resend(node: PeerNode, info: ResendInfo) {
@@ -1451,9 +1482,9 @@ fn spawn_resend(node: PeerNode, info: ResendInfo) {
             "Resume: re-sending {} folder files (with chunk bitmaps)",
             info.files.len()
         );
-        for (fid, path, bitmap) in &info.files {
-            let missing = bitmap.as_ref().map(|b| b.missing_count()).unwrap_or(0);
-            tracing::debug!("  file {} '{}' ({} missing chunks)", fid, path, missing);
+        for f in &info.files {
+            let missing = f.bitmap.as_ref().map(|b| b.missing_count()).unwrap_or(0);
+            tracing::debug!("  file {} '{}' ({} missing chunks)", f.file_id, f.relative_path, missing);
         }
         tokio::spawn(async move {
             if !node
@@ -1467,31 +1498,29 @@ fn spawn_resend(node: PeerNode, info: ResendInfo) {
                 return;
             }
             let event_tx = node.event_tx().clone();
-            for (file_id, rel_path, bitmap) in info.files {
-                let full = std::path::Path::new(&info.source_path).join(&rel_path);
-                let full_str = full.to_string_lossy().to_string();
-                let result = if let Some(bm) = bitmap {
-                    node.send_file_data_resuming(&info.peer_id, file_id, &full_str, &rel_path, bm)
+            for f in info.files {
+                let result = if let Some(bm) = f.bitmap {
+                    node.send_file_data_resuming(&info.peer_id, f.file_id, &f.full_path, &f.relative_path, bm)
                         .await
                 } else {
-                    node.send_file_data(&info.peer_id, file_id, &full_str, &rel_path)
+                    node.send_file_data(&info.peer_id, f.file_id, &f.full_path, &f.relative_path)
                         .await
                 };
                 if let Err(e) = result {
-                    tracing::error!("Resume folder file send error for {}: {}", rel_path, e);
+                    tracing::error!("Resume folder file send error for {}: {}", f.relative_path, e);
                     let _ = event_tx.send(AppEvent::Error(format!(
                         "Resume folder file send failed ({}): {}",
-                        rel_path, e
+                        f.relative_path, e
                     )));
                     return;
                 }
             }
         });
-    } else if let Some((file_id, filename, bitmap)) = info.files.into_iter().next() {
-        let missing = bitmap.as_ref().map(|b| b.missing_count()).unwrap_or(0);
+    } else if let Some(f) = info.files.into_iter().next() {
+        let missing = f.bitmap.as_ref().map(|b| b.missing_count()).unwrap_or(0);
         tracing::info!(
             "Resume: re-sending file '{}' ({} missing chunks)",
-            filename,
+            f.relative_path,
             missing
         );
         tokio::spawn(async move {
@@ -1505,24 +1534,24 @@ fn spawn_resend(node: PeerNode, info: ResendInfo) {
                 );
                 return;
             }
-            let result = if let Some(bm) = bitmap {
+            let result = if let Some(bm) = f.bitmap {
                 node.send_file_data_resuming(
                     &info.peer_id,
-                    file_id,
-                    &info.source_path,
-                    &filename,
+                    f.file_id,
+                    &f.full_path,
+                    &f.relative_path,
                     bm,
                 )
                 .await
             } else {
-                node.send_file_data(&info.peer_id, file_id, &info.source_path, &filename)
+                node.send_file_data(&info.peer_id, f.file_id, &f.full_path, &f.relative_path)
                     .await
             };
             if let Err(e) = result {
-                tracing::error!("Resume file send error for {}: {}", filename, e);
+                tracing::error!("Resume file send error for {}: {}", f.relative_path, e);
                 let _ = node.event_tx().send(AppEvent::Error(format!(
                     "Resume file send failed ({}): {}",
-                    filename, e
+                    f.relative_path, e
                 )));
             }
         });
