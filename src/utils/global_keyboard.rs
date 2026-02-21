@@ -14,8 +14,6 @@ use tracing::{debug, error, info};
 pub struct CapturedKey {
     /// The key that was pressed or released.
     pub key: String,
-    /// Whether the key was pressed (true) or released (false).
-    pub is_press: bool,
 }
 
 /// Global keyboard listener that captures all keyboard events.
@@ -74,7 +72,7 @@ impl GlobalKeyboardListener {
 
                 // Only send key press events (not releases)
                 if is_press {
-                    if tx.send(CapturedKey { key, is_press }).is_err() {
+                    if tx.send(CapturedKey { key }).is_err() {
                         debug!("Global keyboard listener channel closed");
                     }
                 }
@@ -101,11 +99,6 @@ impl GlobalKeyboardListener {
             enabled = enabled,
             "Global keyboard listener enabled state changed"
         );
-    }
-
-    /// Check if the listener is currently enabled.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::SeqCst)
     }
 
     /// Check if the listener is running.
@@ -225,25 +218,4 @@ fn key_to_string(key: Key) -> String {
         // Unknown
         _ => "",
     }.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_listener_creation() {
-        let (listener, _rx) = GlobalKeyboardListener::new();
-        assert!(!listener.is_running());
-        assert!(!listener.is_enabled());
-    }
-
-    #[test]
-    fn test_enable_disable() {
-        let (listener, _rx) = GlobalKeyboardListener::new();
-        listener.set_enabled(true);
-        assert!(listener.is_enabled());
-        listener.set_enabled(false);
-        assert!(!listener.is_enabled());
-    }
 }

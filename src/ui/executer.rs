@@ -899,9 +899,7 @@ impl UIExecuter {
                 
                 // Store the key event for display in the key listener panel
                 let entry = RemoteKeyEventEntry {
-                    peer_id: peer_id.clone(),
                     key: key.clone(),
-                    timestamp: format_timestamp_now(),
                 };
                 self.app.remote_key_events.push(entry);
                 
@@ -1727,28 +1725,4 @@ fn help_line_for_mode(mode: Mode) -> &'static str {
 #[inline]
 fn short_id(peer_id: &str) -> impl std::fmt::Display + '_ {
     crate::core::initializer::short_id_pub(peer_id)
-}
-
-/// Convert a KeyCode to a string representation for sending to remote peers.
-fn key_code_to_string(key: KeyCode) -> String {
-    match key {
-        KeyCode::Char(c) => c.to_string(),
-        KeyCode::Enter => "Enter".to_string(),
-        KeyCode::Backspace => "Backspace".to_string(),
-        KeyCode::Tab => "Tab".to_string(),
-        KeyCode::Delete => "Delete".to_string(),
-        KeyCode::Insert => "Insert".to_string(),
-        KeyCode::Esc => "Esc".to_string(),
-        KeyCode::Home => "Home".to_string(),
-        KeyCode::End => "End".to_string(),
-        KeyCode::PageUp => "PageUp".to_string(),
-        KeyCode::PageDown => "PageDown".to_string(),
-        KeyCode::Up => "Up".to_string(),
-        KeyCode::Down => "Down".to_string(),
-        KeyCode::Left => "Left".to_string(),
-        KeyCode::Right => "Right".to_string(),
-        KeyCode::F(n) => format!("F{}", n),
-        KeyCode::Null => "Null".to_string(),
-        _ => String::new(),
-    }
 }

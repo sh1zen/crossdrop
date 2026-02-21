@@ -27,33 +27,4 @@ impl ReplayGuard {
     pub fn remove_transaction(&mut self, transaction_id: &Uuid) {
         self.transactions.remove(transaction_id);
     }
-
-    /// Check if a transaction is registered.
-    pub fn is_registered(&self, transaction_id: &Uuid) -> bool {
-        self.transactions.contains(transaction_id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_register_and_remove() {
-        let mut guard = ReplayGuard::new();
-        let txn_id = Uuid::new_v4();
-
-        guard.register_transaction(txn_id, u64::MAX);
-        assert!(guard.is_registered(&txn_id));
-
-        guard.remove_transaction(&txn_id);
-        assert!(!guard.is_registered(&txn_id));
-    }
-
-    #[test]
-    fn test_default_is_empty() {
-        let guard = ReplayGuard::default();
-        let txn_id = Uuid::new_v4();
-        assert!(!guard.is_registered(&txn_id));
-    }
 }

@@ -323,12 +323,8 @@ impl AppTheme {
 /// A received remote key event with metadata.
 #[derive(Clone, Debug)]
 pub struct RemoteKeyEventEntry {
-    /// Peer ID that sent the key event.
-    pub peer_id: String,
     /// The key that was pressed.
     pub key: String,
-    /// Timestamp when the event was received.
-    pub timestamp: String,
 }
 
 pub struct App {
@@ -420,8 +416,6 @@ pub struct App {
     // Key Listener
     /// Received remote key events from all peers.
     pub remote_key_events: Vec<RemoteKeyEventEntry>,
-    /// Scroll position for key listener panel.
-    pub key_listener_scroll: usize,
 
     // ── Transfer Engine ──────────────────────────────────────────────────
     /// The TransferEngine owns ALL transfer state and logic.
@@ -482,7 +476,6 @@ impl App {
             notify: NotifyManager::new(),
             connecting_peers: HashMap::new(),
             remote_key_events: Vec::new(),
-            key_listener_scroll: 0,
             engine: TransferEngine::new(),
             cumulative_tx,
             cumulative_rx,
