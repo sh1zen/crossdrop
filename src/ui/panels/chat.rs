@@ -42,7 +42,7 @@ impl Component for ChatPanel {
             .iter()
             .enumerate()
             .map(|(i, target)| {
-                let is_selected = i == app.chat_sidebar_idx;
+                let is_selected = i == app.chat.sidebar_idx;
                 let (icon, label, badge_count) = match target {
                     ChatTarget::Room => {
                         let count = app.unread_room_count();
@@ -101,10 +101,10 @@ impl Component for ChatPanel {
         // Right panel: messages + typing indicator + input
         // Determine if any peer is typing for the current target
         let typing_peers: Vec<String> = app
-            .typing
+            .chat.typing
             .typing_peers()
             .into_iter()
-            .filter(|pid| match &app.chat_target {
+            .filter(|pid| match &app.chat.target {
                 ChatTarget::Room => true,
                 ChatTarget::Peer(target_pid) => *pid == target_pid,
             })
@@ -126,10 +126,10 @@ impl Component for ChatPanel {
             })
             .split(chunks[1]);
 
-        let target_label = app.chat_target.label(&app.peer_names);
+        let target_label = app.chat.target.label(&app.peers.names);
 
         // Render messages from the logical message table
-        let filtered: Vec<&Message> = app.messages.messages_for(&app.chat_target);
+        let filtered: Vec<&Message> = app.chat.messages.messages_for(&app.chat.target);
         let messages: Vec<Line> = filtered
             .iter()
             .map(|m| {
@@ -156,7 +156,7 @@ impl Component for ChatPanel {
                             Style::default().fg(Color::Indexed(240)),
                         ),
                         Span::styled(
-                            format!("{} ", get_display_name(app, pid)),
+                            format!("{} ", get_display_name(app, &pid)),
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -176,12 +176,12 @@ impl Component for ChatPanel {
             0
         };
 
-        let title = match &app.chat_target {
-            ChatTarget::Room => format!(" Room Chat ({} peers) ", app.peers.len()),
+        let title = match &app.chat.target {
+            ChatTarget::Room => format!(" Room Chat ({} peers) ", app.peers.list.len()),
             ChatTarget::Peer(_) => format!(" DM with {} ", target_label),
         };
 
-        let border_color = match &app.chat_target {
+        let border_color = match &app.chat.target {
             ChatTarget::Room => Color::Yellow,
             ChatTarget::Peer(_) => Color::Cyan,
         };
@@ -216,7 +216,7 @@ impl Component for ChatPanel {
 
         let input_idx = if has_typing { 2 } else { 1 };
         let input_text = format!("{}_", app.input);
-        let input_title = match &app.chat_target {
+        let input_title = match &app.chat.target {
             ChatTarget::Room => " Message (broadcast) ",
             ChatTarget::Peer(_) => " Message (DM) ",
         };
@@ -233,9 +233,9 @@ impl Component for ChatPanel {
 
     fn on_focus(&mut self, app: &mut App) {
         // Reset unread for the currently active chat target
-        match &app.chat_target {
-            ChatTarget::Room => app.unread.reset_room(),
-            ChatTarget::Peer(pid) => app.unread.reset_peer(&pid.clone()),
+        match &app.chat.target {
+            ChatTarget::Room => app.chat.unread.reset_room(),
+            ChatTarget::Peer(pid) => app.chat.unread.reset_peer(&pid.clone()),
         }
     }
 
@@ -255,8 +255,8 @@ impl Handler for ChatPanel {
                 // Cycle through chat targets: Room -> peer1 -> peer2 -> ... -> Room
                 let targets = app.chat_targets();
                 if !targets.is_empty() {
-                    app.chat_sidebar_idx = (app.chat_sidebar_idx + 1) % targets.len();
-                    let new_target = targets[app.chat_sidebar_idx].clone();
+                    app.chat.sidebar_idx = (app.chat.sidebar_idx + 1) % targets.len();
+                    let new_target = targets[app.chat.sidebar_idx].clone();
                     app.switch_chat_target(new_target);
                 }
                 Some(Action::None)
@@ -265,12 +265,12 @@ impl Handler for ChatPanel {
                 // Shift+Tab: cycle backwards
                 let targets = app.chat_targets();
                 if !targets.is_empty() {
-                    if app.chat_sidebar_idx == 0 {
-                        app.chat_sidebar_idx = targets.len() - 1;
+                    if app.chat.sidebar_idx == 0 {
+                        app.chat.sidebar_idx = targets.len() - 1;
                     } else {
-                        app.chat_sidebar_idx -= 1;
+                        app.chat.sidebar_idx -= 1;
                     }
-                    let new_target = targets[app.chat_sidebar_idx].clone();
+                    let new_target = targets[app.chat.sidebar_idx].clone();
                     app.switch_chat_target(new_target);
                 }
                 Some(Action::None)
@@ -284,11 +284,11 @@ impl Handler for ChatPanel {
                         app.input.clear();
                         match cmd_result {
                             Ok(ChatCommand::Clear) => {
-                                let target_snap = match &app.chat_target {
+                                let target_snap = match &app.chat.target {
                                     ChatTarget::Room => ChatTargetSnapshot::Room,
                                     ChatTarget::Peer(pid) => ChatTargetSnapshot::Peer(pid.clone()),
                                 };
-                                app.messages.clear_target(&app.chat_target);
+                                app.chat.messages.clear_target(&app.chat.target);
                                 return Some(Action::PersistClearChat(target_snap));
                             }
                             Ok(ChatCommand::Help) => {
@@ -298,12 +298,12 @@ impl Handler for ChatPanel {
                                     .map(|(cmd, desc)| format!("  {} — {}", cmd, desc))
                                     .collect::<Vec<_>>()
                                     .join("\n");
-                                app.messages.insert(Message {
+                                app.chat.messages.insert(Message {
                                     id: Uuid::new_v4(),
                                     sender: MessageSender::Me,
                                     text: format!("Available commands:\n{}", help_text),
                                     timestamp: format_timestamp_now(),
-                                    target: app.chat_target.clone(),
+                                    target: app.chat.target.clone(),
                                 });
                                 return Some(Action::None);
                             }
@@ -314,27 +314,27 @@ impl Handler for ChatPanel {
                     }
 
                     // ── Regular message send ─────────────────────────────
-                    if app.peers.is_empty() {
+                    if app.peers.list.is_empty() {
                         return Some(Action::SetStatus("No peers connected".to_string()));
                     }
 
                     let msg = input;
                     let msg_len = msg.len() as u64;
-                    let target = app.chat_target.clone();
+                    let target = app.chat.target.clone();
                     let msg_id = Uuid::new_v4();
                     let timestamp = format_timestamp_now();
 
                     match &target {
                         ChatTarget::Room => {
                             // Single canonical message entry for all peers
-                            app.messages.insert(Message {
+                            app.chat.messages.insert(Message {
                                 id: msg_id,
                                 sender: MessageSender::Me,
                                 text: msg.clone(),
                                 timestamp: timestamp.clone(),
                                 target: ChatTarget::Room,
                             });
-                            let peer_count = app.peers.len() as u64;
+                            let peer_count = app.peers.list.len() as u64;
                             app.engine.record_message_sent(msg_len * peer_count);
 
                             // Network: still sent individually to each peer
@@ -357,7 +357,7 @@ impl Handler for ChatPanel {
                         }
                         ChatTarget::Peer(peer_id) => {
                             // DM: one message, one peer, only in this chat view
-                            app.messages.insert(Message {
+                            app.chat.messages.insert(Message {
                                 id: msg_id,
                                 sender: MessageSender::Me,
                                 text: msg.clone(),
@@ -368,7 +368,7 @@ impl Handler for ChatPanel {
 
                             // Update per-peer stats (messages sent)
                             let stats = app
-                                .peer_stats
+                                .peers.stats
                                 .entry(peer_id.clone())
                                 .or_insert((0, 0, 0, 0));
                             stats.0 += 1;
@@ -415,18 +415,17 @@ impl Handler for ChatPanel {
 
 /// Send a typing indicator to relevant peers, throttled to at most once per 2 s.
 fn send_typing_throttled(app: &mut App, node: &PeerNode) {
-    let should_send = match app.last_typing_sent {
+    let should_send = match app.chat.last_typing_sent {
         Some(last) => last.elapsed().as_secs() >= 2,
         None => true,
     };
     if !should_send || app.input.is_empty() {
         return;
     }
-    app.last_typing_sent = Some(Instant::now());
+    app.chat.last_typing_sent = Some(Instant::now());
 
     let node = node.clone();
-    let target = app.chat_target.clone();
-    let peers = app.peers.clone();
+    let target = app.chat.target.clone();
     tokio::spawn(async move {
         match target {
             ChatTarget::Room => {
@@ -436,7 +435,5 @@ fn send_typing_throttled(app: &mut App, node: &PeerNode) {
                 let _ = node.send_typing(&pid).await;
             }
         }
-        // If in Room, also avoid sending individual typing to all — broadcast is enough
-        drop(peers);
     });
 }

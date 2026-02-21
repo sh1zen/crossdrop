@@ -44,20 +44,20 @@ pub async fn handle_remote_path_request_key(
     match key {
         KeyCode::Tab | KeyCode::BackTab => {
             let forward = matches!(key, KeyCode::Tab);
-            if let Some(req) = &mut app.remote_path_request {
+            if let Some(req) = &mut app.remote.path_request {
                 req.button_focus = cycle_focus(req.button_focus, forward);
                 req.is_path_editing = req.button_focus == 2;
             }
         }
         KeyCode::Enter => {
-            if let Some(req) = &mut app.remote_path_request {
+            if let Some(req) = &mut app.remote.path_request {
                 if req.is_path_editing {
                     req.button_focus = 0;
                     req.is_path_editing = false;
                     return RemotePathResult::default();
                 }
             }
-            let req = app.remote_path_request.take().unwrap();
+            let req = app.remote.path_request.take().unwrap();
             let button_focus = req.button_focus;
             *active_popup = UIPopup::None;
 
@@ -99,32 +99,32 @@ pub async fn handle_remote_path_request_key(
             }
         }
         KeyCode::Backspace => {
-            if let Some(req) = &mut app.remote_path_request {
+            if let Some(req) = &mut app.remote.path_request {
                 if req.is_path_editing {
                     req.save_path_input.pop();
                 }
             }
         }
         KeyCode::Char(c) => {
-            if let Some(req) = &mut app.remote_path_request {
+            if let Some(req) = &mut app.remote.path_request {
                 if req.is_path_editing {
                     req.save_path_input.push(c);
                 } else if c == 'n' || c == 'N' || c == 'c' || c == 'C' {
-                    let req = app.remote_path_request.take().unwrap();
+                    let req = app.remote.path_request.take().unwrap();
                     *active_popup = UIPopup::None;
                     app.notify.warn(format!("Cancelled: {}", req.name));
                 }
             }
         }
         KeyCode::Esc => {
-            if let Some(req) = &mut app.remote_path_request {
+            if let Some(req) = &mut app.remote.path_request {
                 if req.is_path_editing {
                     req.button_focus = 0;
                     req.is_path_editing = false;
                     return RemotePathResult::default();
                 }
             }
-            let req = app.remote_path_request.take().unwrap();
+            let req = app.remote.path_request.take().unwrap();
             *active_popup = UIPopup::None;
             app.notify.warn(format!("Cancelled: {}", req.name));
         }

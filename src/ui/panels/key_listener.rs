@@ -61,13 +61,13 @@ impl Component for KeyListenerPanel {
             .split(area);
 
         // Header showing status
-        let status = if app.remote_key_listener {
+        let status = if app.settings.remote_key_listener {
             "● SHARING - Your keystrokes are visible to connected peers"
         } else {
             "○ NOT SHARING - Your keystrokes are private"
         };
 
-        let status_color = if app.remote_key_listener {
+        let status_color = if app.settings.remote_key_listener {
             Color::Green
         } else {
             Color::DarkGray

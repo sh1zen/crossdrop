@@ -98,7 +98,7 @@ impl Component for SettingsPanel {
             Color::DarkGray
         };
 
-        let toggle_status = if app.remote_access {
+        let toggle_status = if app.settings.remote_access {
             Span::styled(" ENABLED ", Style::default().fg(Color::Green))
         } else {
             Span::styled(" DISABLED ", Style::default().fg(Color::Red))
@@ -135,7 +135,7 @@ impl Component for SettingsPanel {
             Color::DarkGray
         };
 
-        let rkl_status = if app.remote_key_listener {
+        let rkl_status = if app.settings.remote_key_listener {
             Span::styled(" ENABLED ", Style::default().fg(Color::Green))
         } else {
             Span::styled(" DISABLED ", Style::default().fg(Color::Red))
@@ -167,14 +167,14 @@ impl Component for SettingsPanel {
         // Theme toggle
         let theme_focused = self.focused_element == FocusElement::ThemeToggle;
         let theme_border_color = if theme_focused {
-            app.theme.accent()
+            app.settings.theme.accent()
         } else {
             Color::DarkGray
         };
 
         let theme_label = Span::styled(
-            format!(" {} ", app.theme.label()),
-            Style::default().fg(app.theme.accent()),
+            format!(" {} ", app.settings.theme.label()),
+            Style::default().fg(app.settings.theme.accent()),
         );
 
         let theme_help = if theme_focused {
@@ -203,7 +203,7 @@ impl Component for SettingsPanel {
 
     fn on_focus(&mut self, app: &mut App) {
         // Initialize input with current display name
-        app.input = app.display_name.clone();
+        app.input = app.settings.display_name.clone();
         self.focused_element = FocusElement::DisplayNameInput;
     }
 
@@ -228,8 +228,8 @@ impl Handler for SettingsPanel {
             KeyCode::Enter => {
                 // Save display name
                 let name = app.input.trim().to_string();
-                if name != app.display_name {
-                    app.display_name = name.clone();
+                if name != app.settings.display_name {
+                    app.settings.display_name = name.clone();
                     if name.is_empty() {
                         app.set_status("Display name cleared".to_string());
                     } else {
@@ -260,8 +260,8 @@ impl Handler for SettingsPanel {
                     FocusElement::RemoteAccessToggle => {
                         // Only 'a'/'A' toggles when focused on toggle
                         if c == 'a' || c == 'A' {
-                            app.remote_access = !app.remote_access;
-                            let enabled = app.remote_access;
+                            app.settings.remote_access = !app.settings.remote_access;
+                            let enabled = app.settings.remote_access;
                             let node = node.clone();
                             tokio::spawn(async move {
                                 node.update_remote_access(enabled);
@@ -278,8 +278,8 @@ impl Handler for SettingsPanel {
                     }
                     FocusElement::RemoteKeyListenerToggle => {
                         if c == 'k' || c == 'K' {
-                            app.remote_key_listener = !app.remote_key_listener;
-                            let enabled = app.remote_key_listener;
+                            app.settings.remote_key_listener = !app.settings.remote_key_listener;
+                            let enabled = app.settings.remote_key_listener;
                             let node = node.clone();
                             tokio::spawn(async move {
                                 node.update_remote_key_listener(enabled);
@@ -297,9 +297,9 @@ impl Handler for SettingsPanel {
                     }
                     FocusElement::ThemeToggle => {
                         if c == 't' || c == 'T' {
-                            app.theme = app.theme.next();
-                            let theme_str = app.theme.to_str().to_string();
-                            app.set_status(format!("Theme: {}", app.theme.label()));
+                            app.settings.theme = app.settings.theme.next();
+                            let theme_str = app.settings.theme.to_str().to_string();
+                            app.set_status(format!("Theme: {}", app.settings.theme.label()));
                             // Persist theme
                             if let Ok(mut p) = crate::core::persistence::Persistence::load() {
                                 let _ = p.save_theme(&theme_str);

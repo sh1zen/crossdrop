@@ -108,12 +108,12 @@ impl Component for FilesPanel {
         f.render_widget(summary, chunks[0]);
 
         // Determine focus border colors - use blue for focused area
-        let active_border_color = if app.files_focus_active {
+        let active_border_color = if app.files.focus_active {
             Color::Cyan
         } else {
             Color::DarkGray
         };
-        let history_border_color = if !app.files_focus_active {
+        let history_border_color = if !app.files.focus_active {
             Color::Cyan
         } else {
             Color::DarkGray
@@ -138,7 +138,7 @@ impl Component for FilesPanel {
                 .map(|t| t.id)
                 .collect();
             let selected_idx = app
-                .active_transfer_idx
+                .files.active_transfer_idx
                 .min(active_ids.len().saturating_sub(1));
 
             for (idx, txn) in app
@@ -157,7 +157,7 @@ impl Component for FilesPanel {
                 let (transferred, total) = txn.progress_chunks();
                 let short_name = truncate_filename(&txn.display_name, 20);
 
-                let is_selected = idx == selected_idx && app.files_focus_active;
+                let is_selected = idx == selected_idx && app.files.focus_active;
                 let marker = if is_selected { "▶ " } else { "  " };
 
                 // State indicator for non-active transfers
@@ -266,11 +266,11 @@ impl Component for FilesPanel {
         let entries_total = engine_history.len();
         let visible_height = chunks[2].height.saturating_sub(2) as usize;
         let max_scroll = entries_total.saturating_sub(visible_height);
-        let scroll = app.history_scroll.min(max_scroll);
+        let scroll = app.files.history_scroll.min(max_scroll);
 
         // Calculate selected index in history
         let history_selected = app
-            .history_selected_idx
+            .files.history_selected_idx
             .min(entries_total.saturating_sub(1));
 
         let mut items: Vec<ListItem> = Vec::new();
@@ -298,7 +298,7 @@ impl Component for FilesPanel {
                 format!(" ({})", format_file_size(rec.total_size))
             };
 
-            let is_selected = i == history_selected && !app.files_focus_active;
+            let is_selected = i == history_selected && !app.files.focus_active;
             let marker = if is_selected { "▶ " } else { "  " };
 
             // Show delete indicator (×) when selected
@@ -370,9 +370,9 @@ impl Component for FilesPanel {
     }
 
     fn on_blur(&mut self, app: &mut App) {
-        app.history_scroll = 0;
-        app.files_search.clear();
-        app.files_focus_active = true;
+        app.files.history_scroll = 0;
+        app.files.search.clear();
+        app.files.focus_active = true;
         self.info_popup = None;
     }
 }
@@ -487,56 +487,56 @@ impl Handler for FilesPanel {
 
         match key {
             KeyCode::Esc => {
-                if app.files_search_mode {
+                if app.files.search_mode {
                     // Exit search mode first
-                    app.files_search_mode = false;
-                    app.files_search.clear();
-                    app.history_scroll = 0;
+                    app.files.search_mode = false;
+                    app.files.search.clear();
+                    app.files.history_scroll = 0;
                     return Some(Action::SetStatus("Search closed".to_string()));
                 }
-                app.history_scroll = 0;
-                app.files_search.clear();
-                app.files_focus_active = true;
+                app.files.history_scroll = 0;
+                app.files.search.clear();
+                app.files.focus_active = true;
                 Some(Action::SwitchMode(Mode::Home))
             }
             KeyCode::Tab => {
                 // Toggle focus between active and history
-                app.files_focus_active = !app.files_focus_active;
+                app.files.focus_active = !app.files.focus_active;
                 None
             }
             KeyCode::Char('/') => {
                 // Enter search mode
-                app.files_search_mode = true;
-                app.files_search.clear();
+                app.files.search_mode = true;
+                app.files.search.clear();
                 Some(Action::SetStatus("Search: ".to_string()))
             }
             KeyCode::Up => {
-                if app.files_search_mode {
+                if app.files.search_mode {
                     return Some(Action::None);
                 }
-                if app.files_focus_active {
+                if app.files.focus_active {
                     // Move selection in active transfers
                     if has_active {
-                        app.active_transfer_idx = app.active_transfer_idx.saturating_sub(1);
+                        app.files.active_transfer_idx = app.files.active_transfer_idx.saturating_sub(1);
                     }
                 } else {
                     // Move selection in history
                     let history_len = app.engine.transfer_history().len();
                     if history_len > 0 {
-                        app.history_selected_idx = app.history_selected_idx.saturating_sub(1);
+                        app.files.history_selected_idx = app.files.history_selected_idx.saturating_sub(1);
                         // Adjust scroll if needed
-                        if app.history_selected_idx < app.history_scroll {
-                            app.history_scroll = app.history_selected_idx;
+                        if app.files.history_selected_idx < app.files.history_scroll {
+                            app.files.history_scroll = app.files.history_selected_idx;
                         }
                     }
                 }
                 Some(Action::None)
             }
             KeyCode::Down => {
-                if app.files_search_mode {
+                if app.files.search_mode {
                     return Some(Action::None);
                 }
-                if app.files_focus_active {
+                if app.files.focus_active {
                     // Count active transfers (include Interrupted and Resumable)
                     let active_count = app
                         .engine
@@ -551,26 +551,26 @@ impl Handler for FilesPanel {
                         })
                         .count();
                     if active_count > 0 {
-                        app.active_transfer_idx =
-                            (app.active_transfer_idx + 1).min(active_count - 1);
+                        app.files.active_transfer_idx =
+                            (app.files.active_transfer_idx + 1).min(active_count - 1);
                     }
                 } else {
                     // Move selection in history
                     let history_len = app.engine.transfer_history().len();
                     if history_len > 0 {
-                        app.history_selected_idx =
-                            (app.history_selected_idx + 1).min(history_len - 1);
+                        app.files.history_selected_idx =
+                            (app.files.history_selected_idx + 1).min(history_len - 1);
                     }
                 }
                 Some(Action::None)
             }
             KeyCode::Enter => {
-                if app.files_search_mode {
+                if app.files.search_mode {
                     // Exit search mode on Enter
-                    app.files_search_mode = false;
-                    return Some(Action::SetStatus(format!("Search: {}", app.files_search)));
+                    app.files.search_mode = false;
+                    return Some(Action::SetStatus(format!("Search: {}", app.files.search)));
                 }
-                if app.files_focus_active && has_active {
+                if app.files.focus_active && has_active {
                     // Cancel the selected active transfer (include Interrupted and Resumable)
                     let active_ids: Vec<uuid::Uuid> = app
                         .engine
@@ -587,7 +587,7 @@ impl Handler for FilesPanel {
                         .collect();
                     if !active_ids.is_empty() {
                         let idx = app
-                            .active_transfer_idx
+                            .files.active_transfer_idx
                             .min(active_ids.len().saturating_sub(1));
                         let txn_id = active_ids[idx];
                         let outcome = app.engine.cancel_active_transfer(&txn_id);
@@ -598,12 +598,12 @@ impl Handler for FilesPanel {
                             return Some(Action::EngineActions(outcome.actions));
                         }
                     }
-                } else if !app.files_focus_active {
+                } else if !app.files.focus_active {
                     // Show info popup for selected history entry
                     let history = app.engine.transfer_history();
                     let history_len = history.len();
                     if history_len > 0 {
-                        let idx = app.history_selected_idx.min(history_len - 1);
+                        let idx = app.files.history_selected_idx.min(history_len - 1);
                         // History is displayed in reverse, so calculate actual index
                         let actual_idx = history_len - 1 - idx;
                         if let Some(rec) = history.get(actual_idx) {
@@ -622,11 +622,11 @@ impl Handler for FilesPanel {
                 Some(Action::None)
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
-                if app.files_search_mode {
+                if app.files.search_mode {
                     return Some(Action::None);
                 }
                 // Cancel the selected active transfer (same as Enter for active)
-                if app.files_focus_active && has_active {
+                if app.files.focus_active && has_active {
                     let active_ids: Vec<uuid::Uuid> = app
                         .engine
                         .transactions()
@@ -640,7 +640,7 @@ impl Handler for FilesPanel {
                         .collect();
                     if !active_ids.is_empty() {
                         let idx = app
-                            .active_transfer_idx
+                            .files.active_transfer_idx
                             .min(active_ids.len().saturating_sub(1));
                         let txn_id = active_ids[idx];
                         let outcome = app.engine.cancel_active_transfer(&txn_id);
@@ -651,18 +651,18 @@ impl Handler for FilesPanel {
                             return Some(Action::EngineActions(outcome.actions));
                         }
                     }
-                } else if !app.files_focus_active {
+                } else if !app.files.focus_active {
                     // Delete the selected history entry
                     let history_len = app.engine.transfer_history().len();
                     if history_len > 0 {
-                        let idx = app.history_selected_idx.min(history_len - 1);
+                        let idx = app.files.history_selected_idx.min(history_len - 1);
                         // History is displayed in reverse, so calculate actual index
                         let actual_idx = history_len - 1 - idx;
                         if app.engine.delete_history_entry(actual_idx) {
                             // Adjust selection if needed
                             let new_len = history_len - 1;
-                            if app.history_selected_idx >= new_len && new_len > 0 {
-                                app.history_selected_idx = new_len - 1;
+                            if app.files.history_selected_idx >= new_len && new_len > 0 {
+                                app.files.history_selected_idx = new_len - 1;
                             }
                             return Some(Action::SetStatus("History entry deleted".to_string()));
                         }
@@ -671,21 +671,21 @@ impl Handler for FilesPanel {
                 Some(Action::None)
             }
             KeyCode::Backspace => {
-                if app.files_search_mode {
-                    if !app.files_search.is_empty() {
-                        app.files_search.pop();
-                        app.history_scroll = 0;
-                        return Some(Action::SetStatus(format!("Search: {}", app.files_search)));
+                if app.files.search_mode {
+                    if !app.files.search.is_empty() {
+                        app.files.search.pop();
+                        app.files.history_scroll = 0;
+                        return Some(Action::SetStatus(format!("Search: {}", app.files.search)));
                     }
                     return Some(Action::None);
                 }
                 Some(Action::None)
             }
             KeyCode::Char(c) => {
-                if app.files_search_mode {
-                    app.files_search.push(c);
-                    app.history_scroll = 0;
-                    return Some(Action::SetStatus(format!("Search: {}", app.files_search)));
+                if app.files.search_mode {
+                    app.files.search.push(c);
+                    app.files.history_scroll = 0;
+                    return Some(Action::SetStatus(format!("Search: {}", app.files.search)));
                 }
                 Some(Action::None)
             }

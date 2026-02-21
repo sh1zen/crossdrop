@@ -34,11 +34,11 @@ impl PeersPanel {
 impl Component for PeersPanel {
     fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
         let items: Vec<ListItem> = app
-            .peers
+            .peers.list
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let is_selected = i == app.selected_peer_idx;
+                let is_selected = i == app.peers.selected_idx;
                 let is_online = app.is_peer_online(p);
                 let display = get_display_name(app, p);
                 let short = short_peer_id(p);
@@ -71,7 +71,7 @@ impl Component for PeersPanel {
                 ];
 
                 // Show peer ID if display name is different
-                if app.peer_names.contains_key(p) {
+                if app.peers.names.contains_key(p) {
                     spans.push(Span::styled(
                         format!(" ({})", short),
                         Style::default().fg(Color::DarkGray),
@@ -79,7 +79,7 @@ impl Component for PeersPanel {
                 }
 
                 // Show cipher key if available
-                if let Some(key) = app.peer_keys.get(p) {
+                if let Some(key) = app.peers.keys.get(p) {
                     spans.push(Span::styled(
                         format!(" [key: {}]", format_cipher_key(key)),
                         Style::default().fg(if is_online {
@@ -102,8 +102,8 @@ impl Component for PeersPanel {
             })
             .collect();
 
-        let online_count = app.peers.iter().filter(|p| app.is_peer_online(p)).count();
-        let total_count = app.peers.len();
+        let online_count = app.peers.list.iter().filter(|p| app.is_peer_online(p)).count();
+        let total_count = app.peers.list.len();
         let peer_list = List::new(items).block(
             Block::default()
                 .title(format!(" Peers ({}/{} online) ", online_count, total_count))
@@ -111,8 +111,8 @@ impl Component for PeersPanel {
                 .border_style(Style::default().fg(Color::Cyan)),
         );
 
-        if !app.peers.is_empty() {
-            self.list_state.select(Some(app.selected_peer_idx));
+        if !app.peers.list.is_empty() {
+            self.list_state.select(Some(app.peers.selected_idx));
         } else {
             self.list_state.select(None);
         }
@@ -125,7 +125,7 @@ impl Component for PeersPanel {
         f.render_stateful_widget(peer_list, chunks[0], &mut self.list_state);
 
         // Hint bar at the bottom
-        let hint = if app.peers.is_empty() {
+        let hint = if app.peers.list.is_empty() {
             Paragraph::new("  No peers saved").style(Style::default().fg(Color::DarkGray))
         } else {
             Paragraph::new(Line::from(vec![
@@ -197,23 +197,23 @@ impl Handler for PeersPanel {
         match key {
             KeyCode::Esc => Some(Action::SwitchMode(Mode::Home)),
             KeyCode::Up => {
-                if !app.peers.is_empty() {
-                    if app.selected_peer_idx == 0 {
-                        app.selected_peer_idx = app.peers.len() - 1;
+                if !app.peers.list.is_empty() {
+                    if app.peers.selected_idx == 0 {
+                        app.peers.selected_idx = app.peers.list.len() - 1;
                     } else {
-                        app.selected_peer_idx -= 1;
+                        app.peers.selected_idx -= 1;
                     }
                 }
                 Some(Action::None)
             }
             KeyCode::Down => {
-                if !app.peers.is_empty() {
-                    app.selected_peer_idx = (app.selected_peer_idx + 1) % app.peers.len();
+                if !app.peers.list.is_empty() {
+                    app.peers.selected_idx = (app.peers.selected_idx + 1) % app.peers.list.len();
                 }
                 Some(Action::None)
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                if let Some(peer_id) = app.peers.get(app.selected_peer_idx) {
+                if let Some(peer_id) = app.peers.list.get(app.peers.selected_idx) {
                     let peer_id = peer_id.clone();
                     let display_name = get_display_name(app, &peer_id);
                     if app.is_peer_online(&peer_id) {
@@ -237,7 +237,7 @@ impl Handler for PeersPanel {
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 // Remove a single saved peer (disconnect if online, remove from registry)
-                if let Some(peer_id) = app.peers.get(app.selected_peer_idx) {
+                if let Some(peer_id) = app.peers.list.get(app.peers.selected_idx) {
                     let peer_id = peer_id.clone();
                     if app.is_peer_online(&peer_id) {
                         let node = node.clone();
@@ -261,8 +261,8 @@ impl Handler for PeersPanel {
             }
             KeyCode::Enter => {
                 // Show peer info popup
-                if let Some(peer_id) = app.peers.get(app.selected_peer_idx) {
-                    app.peer_info_popup = Some(peer_id.clone());
+                if let Some(peer_id) = app.peers.list.get(app.peers.selected_idx) {
+                    app.peers.info_popup = Some(peer_id.clone());
                     Some(Action::ShowPopup(UIPopup::PeerInfo))
                 } else {
                     Some(Action::None)
@@ -270,12 +270,12 @@ impl Handler for PeersPanel {
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
                 // Explore remote file system
-                if let Some(peer_id) = app.peers.get(app.selected_peer_idx) {
+                if let Some(peer_id) = app.peers.list.get(app.peers.selected_idx) {
                     let peer_id = peer_id.clone();
-                    app.remote_peer = Some(peer_id.clone());
-                    app.remote_path = "/".to_string();
-                    app.remote_entries.clear();
-                    app.remote_selected = 0;
+                    app.remote.peer = Some(peer_id.clone());
+                    app.remote.path = "/".to_string();
+                    app.remote.entries.clear();
+                    app.remote.selected = 0;
 
                     // Request directory listing starting from root
                     let node = node.clone();

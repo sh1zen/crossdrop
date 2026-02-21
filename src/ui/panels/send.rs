@@ -40,11 +40,11 @@ impl Component for SendPanel {
 
         // Left panel: peer list
         let peer_items: Vec<ListItem> = app
-            .peers
+            .peers.list
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let is_selected = i == app.selected_peer_idx;
+                let is_selected = i == app.peers.selected_idx;
                 let line = Line::from(vec![
                     Span::styled(
                         if is_selected { " > " } else { "   " },
@@ -67,7 +67,7 @@ impl Component for SendPanel {
 
         let peer_list = List::new(peer_items).block(
             Block::default()
-                .title(format!(" Peers ({}) ", app.peers.len()))
+                .title(format!(" Peers ({}) ", app.peers.list.len()))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         );
@@ -172,24 +172,24 @@ impl Handler for SendPanel {
                 Some(Action::SwitchMode(Mode::Home))
             }
             KeyCode::Up => {
-                if !app.peers.is_empty() {
-                    if app.selected_peer_idx == 0 {
-                        app.selected_peer_idx = app.peers.len() - 1;
+                if !app.peers.list.is_empty() {
+                    if app.peers.selected_idx == 0 {
+                        app.peers.selected_idx = app.peers.list.len() - 1;
                     } else {
-                        app.selected_peer_idx -= 1;
+                        app.peers.selected_idx -= 1;
                     }
                 }
                 Some(Action::None)
             }
             KeyCode::Down => {
-                if !app.peers.is_empty() {
-                    app.selected_peer_idx = (app.selected_peer_idx + 1) % app.peers.len();
+                if !app.peers.list.is_empty() {
+                    app.peers.selected_idx = (app.peers.selected_idx + 1) % app.peers.list.len();
                 }
                 Some(Action::None)
             }
             KeyCode::Tab => {
-                if !app.peers.is_empty() {
-                    app.selected_peer_idx = (app.selected_peer_idx + 1) % app.peers.len();
+                if !app.peers.list.is_empty() {
+                    app.peers.selected_idx = (app.peers.selected_idx + 1) % app.peers.list.len();
                 }
                 Some(Action::None)
             }

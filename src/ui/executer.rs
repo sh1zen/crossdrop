@@ -16,7 +16,7 @@ pub use crate::ui::popups::{
     UIContext, UIPopup,
 };
 use crate::ui::traits::{Action, Component, Handler};
-use crate::utils::global_keyboard::GlobalKeyboardListener;
+use crate::utils::global_keyboard::{CapturedKey, GlobalKeyboardListener};
 use crate::utils::hash::get_or_create_secret;
 use crate::utils::log_buffer::LogBuffer;
 use crate::utils::sos::SignalOfStop;
@@ -57,7 +57,7 @@ pub struct UIExecuter {
     peer_registry: PeerRegistry,
     persistence: Persistence,
     global_keyboard: GlobalKeyboardListener,
-    global_keyboard_rx: mpsc::UnboundedReceiver<crate::utils::global_keyboard::CapturedKey>,
+    global_keyboard_rx: mpsc::UnboundedReceiver<CapturedKey>,
 }
 
 /// All mode-specific panels grouped together to reduce field sprawl.
@@ -241,7 +241,7 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
     spawn_auto_reconnects(&mut executer, &node);
 
     // Start global keyboard listener if remote_key_listener is enabled
-    if executer.app.remote_key_listener {
+    if executer.app.settings.remote_key_listener {
         executer.global_keyboard.start();
         executer.global_keyboard.set_enabled(true);
     }
@@ -270,23 +270,22 @@ fn restore_persisted_state(app: &mut App, node: &PeerNode, args: &Args) {
     };
 
     if args.display_name.is_none() {
-        if let Some(name) = p.display_name.filter(|n| !n.is_empty()) {
-            app.display_name = name.clone();
-            node.set_display_name(name);
+        if !p.settings.display_name.is_empty() {
+            app.settings.display_name = p.settings.display_name.clone();
+            node.set_display_name(p.settings.display_name.clone());
         }
     }
 
-    if !p.theme.is_empty() {
-        app.theme = crate::workers::app::AppTheme::from_str(&p.theme);
-    }
+    // Restore theme
+    app.settings.theme = p.settings.theme.clone();
 
     // Restore remote_access setting
-    app.remote_access = p.remote_access;
-    node.update_remote_access(p.remote_access);
+    app.settings.remote_access = p.settings.remote_access;
+    node.update_remote_access(p.settings.remote_access);
 
     // Restore remote_key_listener setting
-    app.remote_key_listener = p.remote_key_listener;
-    node.update_remote_key_listener(p.remote_key_listener);
+    app.settings.remote_key_listener = p.settings.remote_key_listener;
+    node.update_remote_key_listener(p.settings.remote_key_listener);
 }
 
 fn restore_chat_history(executer: &mut UIExecuter) {
@@ -299,7 +298,7 @@ fn restore_chat_history(executer: &mut UIExecuter) {
             ChatTargetSnapshot::Room => ChatTarget::Room,
             ChatTargetSnapshot::Peer(id) => ChatTarget::Peer(id.clone()),
         };
-        executer.app.messages.insert(Message {
+        executer.app.chat.messages.insert(Message {
             id: uuid::Uuid::parse_str(&snap.id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
             sender,
             text: snap.text.clone(),
@@ -317,14 +316,15 @@ fn seed_peer_list(executer: &mut UIExecuter) {
         if let Some(name) = &record.display_name {
             executer
                 .app
-                .peer_names
+                .peers
+                .names
                 .insert(record.peer_id.clone(), name.clone());
         }
-        if !executer.app.peers.contains(&record.peer_id) {
-            executer.app.peers.push(record.peer_id.clone());
-            executer.app.peer_status.insert(
+        if !executer.app.peers.list.contains(&record.peer_id) {
+            executer.app.peers.list.push(record.peer_id.clone());
+            executer.app.peers.status.insert(
                 record.peer_id.clone(),
-                crate::workers::app::PeerStatus::Offline,
+                crate::workers::peer::PeerStatus::Offline,
             );
         }
     }
@@ -357,7 +357,8 @@ fn spawn_auto_reconnects(executer: &mut UIExecuter, node: &PeerNode) {
         if let Some(name) = &display_name {
             executer
                 .app
-                .peer_names
+                .peers
+                .names
                 .insert(peer_id.clone(), name.clone());
         }
         let node_clone = node.clone();
@@ -522,10 +523,10 @@ impl UIExecuter {
                 UIPopup::TransactionOffer if app.engine.has_pending_incoming() => {
                     popup_wgt.render_transaction_from_engine(f, app);
                 }
-                UIPopup::RemotePathRequest if app.remote_path_request.is_some() => {
+                UIPopup::RemotePathRequest if app.remote.path_request.is_some() => {
                     popup_wgt.render_remote_path(f, app);
                 }
-                UIPopup::PeerInfo if app.peer_info_popup.is_some() => {
+                UIPopup::PeerInfo if app.peers.info_popup.is_some() => {
                     render_peer_info_popup(f, app);
                 }
                 _ => {}
@@ -592,11 +593,12 @@ impl UIExecuter {
 
             // Handle global keyboard events (captured even when app is not in focus)
             while let Ok(captured_key) = self.global_keyboard_rx.try_recv() {
-                if self.app.remote_key_listener {
+                if self.app.settings.remote_key_listener {
                     // Get all online peers
                     let online_peers: Vec<String> = self
                         .app
                         .peers
+                        .list
                         .iter()
                         .filter(|p| self.app.is_peer_online(p))
                         .cloned()
@@ -709,7 +711,7 @@ impl UIExecuter {
 
     /// Update the global keyboard listener state based on the setting.
     fn update_global_keyboard_listener(&mut self) {
-        if self.app.remote_key_listener {
+        if self.app.settings.remote_key_listener {
             if !self.global_keyboard.is_running() {
                 self.global_keyboard.start();
             }
@@ -723,6 +725,7 @@ impl UIExecuter {
         let online: Vec<String> = self
             .app
             .peers
+            .list
             .iter()
             .filter(|p| self.app.is_peer_online(p))
             .cloned()
@@ -734,13 +737,13 @@ impl UIExecuter {
             tokio::spawn(async move { nc.remove_peer(&pid).await });
         }
 
-        let all: Vec<String> = self.app.peers.drain(..).collect();
+        let all: Vec<String> = self.app.peers.list.drain(..).collect();
         for pid in &all {
-            self.app.peer_status.remove(pid);
-            self.app.peer_names.remove(pid);
-            self.app.peer_keys.remove(pid);
+            self.app.peers.status.remove(pid);
+            self.app.peers.names.remove(pid);
+            self.app.peers.keys.remove(pid);
         }
-        self.app.selected_peer_idx = 0;
+        self.app.peers.selected_idx = 0;
         self.peer_registry.clear();
         self.app.notify.warn("Cleared all saved peers".to_string());
     }
@@ -749,6 +752,7 @@ impl UIExecuter {
         let offline: Vec<String> = self
             .app
             .peers
+            .list
             .iter()
             .filter(|p| !self.app.is_peer_online(p))
             .cloned()
@@ -756,15 +760,15 @@ impl UIExecuter {
         let count = offline.len();
 
         for pid in &offline {
-            self.app.peers.retain(|p| p != pid);
-            self.app.peer_status.remove(pid);
-            self.app.peer_names.remove(pid);
-            self.app.peer_keys.remove(pid);
+            self.app.peers.list.retain(|p| p != pid);
+            self.app.peers.status.remove(pid);
+            self.app.peers.names.remove(pid);
+            self.app.peers.keys.remove(pid);
             self.peer_registry.remove_single(pid);
         }
 
-        if self.app.selected_peer_idx >= self.app.peers.len() {
-            self.app.selected_peer_idx = self.app.peers.len().saturating_sub(1);
+        if self.app.peers.selected_idx >= self.app.peers.list.len() {
+            self.app.peers.selected_idx = self.app.peers.list.len().saturating_sub(1);
         }
         self.app
             .notify
@@ -785,7 +789,7 @@ impl UIExecuter {
                 self.execute_engine_actions(node, result.actions).await;
                 result.quit
             }
-            UIPopup::RemotePathRequest if self.app.remote_path_request.is_some() => {
+            UIPopup::RemotePathRequest if self.app.remote.path_request.is_some() => {
                 let result = handle_remote_path_request_key(
                     &mut self.app,
                     node,
@@ -795,9 +799,9 @@ impl UIExecuter {
                 .await;
                 result.quit
             }
-            UIPopup::PeerInfo if self.app.peer_info_popup.is_some() => {
+            UIPopup::PeerInfo if self.app.peers.info_popup.is_some() => {
                 if matches!(key, KeyCode::Enter | KeyCode::Esc) {
-                    self.app.peer_info_popup = None;
+                    self.app.peers.info_popup = None;
                     self.context.active_popup = UIPopup::None;
                 }
                 false
@@ -847,11 +851,11 @@ impl UIExecuter {
                 self.on_dm_received(peer_id, message);
             }
             AppEvent::TypingReceived { peer_id } => {
-                self.app.typing.set_typing(&peer_id);
+                self.app.chat.typing.set_typing(&peer_id);
             }
             AppEvent::DisplayNameReceived { peer_id, name } => {
                 self.peer_registry.set_display_name(&peer_id, &name);
-                self.app.peer_names.insert(peer_id, name);
+                self.app.peers.names.insert(peer_id, name);
             }
             AppEvent::Error(msg) => {
                 error!(event = "app_error", message = %msg, "Application error");
@@ -861,7 +865,7 @@ impl UIExecuter {
                 self.on_info(msg);
             }
             AppEvent::Connecting { peer_id, status } => {
-                self.app.connecting_peers.insert(peer_id, status);
+                self.app.peers.connecting.insert(peer_id, status);
             }
             AppEvent::LsResponse {
                 peer_id,
@@ -869,23 +873,23 @@ impl UIExecuter {
                 entries,
             } => {
                 if self.context.current_mode == Mode::Remote
-                    && self.app.remote_peer.as_deref() == Some(&peer_id)
+                    && self.app.remote.peer.as_deref() == Some(&peer_id)
                 {
-                    self.app.remote_path = path;
-                    self.app.remote_entries = entries;
-                    if self.app.remote_selected >= self.app.remote_entries.len() {
-                        self.app.remote_selected = 0;
+                    self.app.remote.path = path;
+                    self.app.remote.entries = entries;
+                    if self.app.remote.selected >= self.app.remote.entries.len() {
+                        self.app.remote.selected = 0;
                     }
                 }
             }
             AppEvent::RemoteAccessDisabled { peer_id } => {
                 if self.context.current_mode == Mode::Remote
-                    && self.app.remote_peer.as_deref() == Some(&peer_id)
+                    && self.app.remote.peer.as_deref() == Some(&peer_id)
                 {
                     self.app.notify.warn("Remote access disabled");
                     self.context.switch_mode(Mode::Peers);
                     self.app.mode = Mode::Peers;
-                    self.app.remote_peer = None;
+                    self.app.remote.peer = None;
                 }
             }
             AppEvent::RemoteKeyListenerDisabled { peer_id } => {
@@ -895,12 +899,8 @@ impl UIExecuter {
                 ));
             }
             AppEvent::RemoteKeyEventReceived { peer_id, key } => {
-                use crate::workers::app::RemoteKeyEventEntry;
-                
                 // Store the key event for display in the key listener panel
-                let entry = RemoteKeyEventEntry {
-                    key: key.clone(),
-                };
+                let entry = CapturedKey { key: key.clone() };
                 self.app.remote_key_events.push(entry);
                 
                 info!(
@@ -924,7 +924,8 @@ impl UIExecuter {
             } => {
                 if success {
                     self.app
-                        .peer_stats
+                        .peers
+                        .stats
                         .entry(_peer_id)
                         .or_insert((0, 0, 0, 0))
                         .2 += 1;
@@ -932,7 +933,8 @@ impl UIExecuter {
             }
             AppEvent::FileComplete { _peer_id, .. } => {
                 self.app
-                    .peer_stats
+                    .peers
+                    .stats
                     .entry(_peer_id)
                     .or_insert((0, 0, 0, 0))
                     .3 += 1;
@@ -947,14 +949,14 @@ impl UIExecuter {
         peer_id: String,
         remote_ip: Option<String>,
     ) {
-        self.app.connecting_peers.remove(&peer_id);
+        self.app.peers.connecting.remove(&peer_id);
         self.app.add_peer(peer_id.clone());
 
         if let Some(key) = node.get_peer_key(&peer_id).await {
-            self.app.peer_keys.insert(peer_id.clone(), key);
+            self.app.peers.keys.insert(peer_id.clone(), key);
         }
         if let Some(ip) = remote_ip {
-            self.app.peer_ips.insert(peer_id.clone(), ip);
+            self.app.peers.ips.insert(peer_id.clone(), ip);
         }
         if let Some(ticket) = node.get_peer_ticket(&peer_id).await {
             self.peer_registry.peer_connected(&peer_id, ticket);
@@ -1007,7 +1009,7 @@ impl UIExecuter {
     }
 
     async fn on_peer_disconnected(&mut self, node: &PeerNode, peer_id: String, explicit: bool) {
-        self.app.connecting_peers.remove(&peer_id);
+        self.app.peers.connecting.remove(&peer_id);
         node.cleanup_peer(&peer_id).await;
 
         if explicit {
@@ -1041,9 +1043,10 @@ impl UIExecuter {
 
     fn on_chat_received(&mut self, peer_id: String, message: Vec<u8>) {
         let text = String::from_utf8_lossy(&message).into_owned();
-        self.app.typing.clear(&peer_id);
+        self.app.chat.typing.clear(&peer_id);
         self.app
-            .peer_stats
+            .peers
+            .stats
             .entry(peer_id.clone())
             .or_insert((0, 0, 0, 0))
             .1 += 1;
@@ -1051,7 +1054,7 @@ impl UIExecuter {
         let msg_id = uuid::Uuid::new_v4();
         let timestamp = format_timestamp_now();
 
-        self.app.messages.insert(Message {
+        self.app.chat.messages.insert(Message {
             id: msg_id,
             sender: MessageSender::Peer(peer_id.clone()),
             text: text.clone(),
@@ -1066,16 +1069,17 @@ impl UIExecuter {
             target: ChatTargetSnapshot::Room,
         });
 
-        if !(self.app.mode == Mode::Chat && self.app.chat_target == ChatTarget::Room) {
-            self.app.unread.increment_room();
+        if !(self.app.mode == Mode::Chat && self.app.chat.target == ChatTarget::Room) {
+            self.app.chat.unread.increment_room();
         }
     }
 
     fn on_dm_received(&mut self, peer_id: String, message: Vec<u8>) {
         let text = String::from_utf8_lossy(&message).into_owned();
-        self.app.typing.clear(&peer_id);
+        self.app.chat.typing.clear(&peer_id);
         self.app
-            .peer_stats
+            .peers
+            .stats
             .entry(peer_id.clone())
             .or_insert((0, 0, 0, 0))
             .1 += 1;
@@ -1084,7 +1088,7 @@ impl UIExecuter {
         let timestamp = format_timestamp_now();
         let target = ChatTarget::Peer(peer_id.clone());
 
-        self.app.messages.insert(Message {
+        self.app.chat.messages.insert(Message {
             id: msg_id,
             sender: MessageSender::Peer(peer_id.clone()),
             text: text.clone(),
@@ -1099,8 +1103,8 @@ impl UIExecuter {
             target: ChatTargetSnapshot::Peer(peer_id.clone()),
         });
 
-        if !(self.app.mode == Mode::Chat && self.app.chat_target == target) {
-            self.app.unread.increment_peer(&peer_id);
+        if !(self.app.mode == Mode::Chat && self.app.chat.target == target) {
+            self.app.chat.unread.increment_peer(&peer_id);
         }
     }
 
@@ -1109,7 +1113,8 @@ impl UIExecuter {
         if let Some(rest) = msg.strip_prefix(PREFIX) {
             if let Some((peer_id, save_path)) = rest.split_once(':') {
                 self.app
-                    .pending_remote_save_paths
+                    .remote
+                    .pending_save_paths
                     .insert(peer_id.to_string(), save_path.to_string());
             }
         } else {
@@ -1118,7 +1123,7 @@ impl UIExecuter {
     }
 
     async fn on_transaction_requested(&mut self, node: &PeerNode, peer_id: String) {
-        if let Some(save_path) = self.app.pending_remote_save_paths.remove(&peer_id) {
+        if let Some(save_path) = self.app.remote.pending_save_paths.remove(&peer_id) {
             if let Some(pi) = self.app.engine.pending_incoming_mut() {
                 pi.save_path_input = save_path.clone();
             }

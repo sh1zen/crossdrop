@@ -76,7 +76,7 @@ pub enum AppEvent {
     LsResponse {
         peer_id: String,
         path: String,
-        entries: Vec<crate::workers::app::RemoteEntry>,
+        entries: Vec<crate::workers::peer::RemoteEntry>,
     },
     RemoteAccessDisabled {
         peer_id: String,

@@ -59,7 +59,7 @@ impl SavePathPopup {
     }
 
     pub fn render_remote_path<'a>(&self, f: &mut Frame, app: &'a App) {
-        if let Some(req) = &app.remote_path_request {
+        if let Some(req) = &app.remote.path_request {
             let context = OfferContext::RemotePath {
                 name: &req.name,
                 size_str: format_file_size(req.size),

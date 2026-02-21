@@ -9,7 +9,7 @@ use ratatui::{
 
 /// Render the peer info popup.
 pub fn render_peer_info_popup(f: &mut Frame, app: &App) {
-    let peer_id = match &app.peer_info_popup {
+    let peer_id = match &app.peers.info_popup {
         Some(id) => id,
         None => return,
     };
@@ -30,28 +30,28 @@ pub fn render_peer_info_popup(f: &mut Frame, app: &App) {
 
     // Get cipher key
     let key_str = app
-        .peer_keys
+        .peers.keys
         .get(peer_id)
         .map(|k| hex::encode(k))
         .unwrap_or_else(|| "N/A".to_string());
 
     // Get connection time
     let connected_at = app
-        .peer_connected_at
+        .peers.connected_at
         .get(peer_id)
         .cloned()
         .unwrap_or_else(|| "N/A".to_string());
 
     // Get remote IP address
     let ip_str = app
-        .peer_ips
+        .peers.ips
         .get(peer_id)
         .cloned()
         .unwrap_or_else(|| "N/A".to_string());
 
     // Get per-peer stats (messages_sent, messages_received, files_sent, files_received)
     let (msg_sent, msg_recv, files_sent, files_recv) = app
-        .peer_stats
+        .peers.stats
         .get(peer_id)
         .cloned()
         .unwrap_or((0, 0, 0, 0));

@@ -136,7 +136,7 @@ pub enum ControlMessage {
     /// Directory listing response.
     LsResponse {
         path: String,
-        entries: Vec<crate::workers::app::RemoteEntry>,
+        entries: Vec<crate::workers::peer::RemoteEntry>,
     },
     /// Request the peer to fetch a file or folder.
     FetchRequest { path: String, is_folder: bool },
@@ -228,7 +228,7 @@ pub enum ConnectionMessage {
     /// Response to a remote directory listing request.
     LsResponse {
         path: String,
-        entries: Vec<crate::workers::app::RemoteEntry>,
+        entries: Vec<crate::workers::peer::RemoteEntry>,
     },
     /// Remote access is disabled on the peer.
     RemoteAccessDisabled,

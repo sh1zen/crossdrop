@@ -2,7 +2,8 @@ use crate::core::initializer::PeerNode;
 use crate::ui::helpers::{format_file_size, get_display_name};
 use crate::ui::popups::UIPopup;
 use crate::ui::traits::{Action, Component, Handler};
-use crate::workers::app::{App, Mode, RemotePathRequest};
+use crate::workers::app::{App, Mode};
+use crate::workers::peer::RemotePathRequest;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -35,11 +36,11 @@ impl Component for RemotePanel {
 
         let title = format!(
             " Remote Files: {} @ {} ",
-            get_display_name(app, app.remote_peer.as_deref().unwrap_or("?")),
-            app.remote_path
+            get_display_name(app, app.remote.peer.as_deref().unwrap_or("?")),
+            app.remote.path
         );
 
-        let path_widget = Paragraph::new(app.remote_path.as_str()).block(
+        let path_widget = Paragraph::new(app.remote.path.as_str()).block(
             Block::default()
                 .title(" Remote Path ")
                 .borders(Borders::ALL)
@@ -48,11 +49,11 @@ impl Component for RemotePanel {
         f.render_widget(path_widget, chunks[0]);
 
         let items: Vec<ListItem> = app
-            .remote_entries
+            .remote.entries
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                let style = if i == app.remote_selected {
+                let style = if i == app.remote.selected {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::White)
@@ -90,40 +91,40 @@ impl Handler for RemotePanel {
     fn handle_key(&mut self, app: &mut App, node: &PeerNode, key: KeyCode) -> Option<Action> {
         match key {
             KeyCode::Esc => {
-                app.remote_peer = None;
-                app.remote_entries.clear();
+                app.remote.peer = None;
+                app.remote.entries.clear();
                 Some(Action::SwitchMode(Mode::Peers))
             }
             KeyCode::Up => {
-                if !app.remote_entries.is_empty() {
-                    if app.remote_selected == 0 {
-                        app.remote_selected = app.remote_entries.len() - 1;
+                if !app.remote.entries.is_empty() {
+                    if app.remote.selected == 0 {
+                        app.remote.selected = app.remote.entries.len() - 1;
                     } else {
-                        app.remote_selected -= 1;
+                        app.remote.selected -= 1;
                     }
                 }
                 Some(Action::None)
             }
             KeyCode::Down => {
-                if !app.remote_entries.is_empty() {
-                    app.remote_selected = (app.remote_selected + 1) % app.remote_entries.len();
+                if !app.remote.entries.is_empty() {
+                    app.remote.selected = (app.remote.selected + 1) % app.remote.entries.len();
                 }
                 Some(Action::None)
             }
             KeyCode::Enter => {
-                if let Some(entry) = app.remote_entries.get(app.remote_selected).cloned() {
+                if let Some(entry) = app.remote.entries.get(app.remote.selected).cloned() {
                     if entry.is_dir {
                         // Navigate into directory
-                        let new_path = if app.remote_path.ends_with('/') {
-                            format!("{}{}", app.remote_path, entry.name)
+                        let new_path = if app.remote.path.ends_with('/') {
+                            format!("{}{}", app.remote.path, entry.name)
                         } else {
-                            format!("{}/{}", app.remote_path, entry.name)
+                            format!("{}/{}", app.remote.path, entry.name)
                         };
-                        app.remote_path = new_path.clone();
-                        app.remote_entries.clear();
-                        app.remote_selected = 0;
+                        app.remote.path = new_path.clone();
+                        app.remote.entries.clear();
+                        app.remote.selected = 0;
 
-                        if let Some(peer_id) = &app.remote_peer {
+                        if let Some(peer_id) = &app.remote.peer {
                             let peer_id = peer_id.clone();
                             let node = node.clone();
                             tokio::spawn(async move {
@@ -132,17 +133,17 @@ impl Handler for RemotePanel {
                         }
                     } else {
                         // Show request file popup
-                        if let Some(peer_id) = &app.remote_peer {
-                            let remote_path = if app.remote_path.ends_with('/') {
-                                format!("{}{}", app.remote_path, entry.name)
+                        if let Some(peer_id) = &app.remote.peer {
+                            let remote_path = if app.remote.path.ends_with('/') {
+                                format!("{}{}", app.remote.path, entry.name)
                             } else {
-                                format!("{}/{}", app.remote_path, entry.name)
+                                format!("{}/{}", app.remote.path, entry.name)
                             };
 
                             let save_dir = std::env::current_dir()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|_| ".".to_string());
-                            app.remote_path_request = Some(RemotePathRequest {
+                            app.remote.path_request = Some(RemotePathRequest {
                                 peer_id: peer_id.clone(),
                                 name: entry.name.clone(),
                                 size: entry.size,
@@ -160,23 +161,23 @@ impl Handler for RemotePanel {
             }
             KeyCode::Backspace => {
                 // Go up one directory - allow going up beyond launch directory to root
-                if app.remote_path != "/" {
-                    let path = app.remote_path.trim_end_matches('/');
+                if app.remote.path != "/" {
+                    let path = app.remote.path.trim_end_matches('/');
                     if let Some(last_slash) = path.rfind('/') {
-                        app.remote_path = if last_slash == 0 {
+                        app.remote.path = if last_slash == 0 {
                             "/".to_string()
                         } else {
                             path[..last_slash].to_string()
                         };
                     } else {
-                        app.remote_path = "/".to_string();
+                        app.remote.path = "/".to_string();
                     }
-                    app.remote_entries.clear();
-                    app.remote_selected = 0;
+                    app.remote.entries.clear();
+                    app.remote.selected = 0;
 
-                    if let Some(peer_id) = &app.remote_peer {
+                    if let Some(peer_id) = &app.remote.peer {
                         let peer_id = peer_id.clone();
-                        let path = app.remote_path.clone();
+                        let path = app.remote.path.clone();
                         let node = node.clone();
                         tokio::spawn(async move {
                             let _ = node.list_remote_directory(&peer_id, path).await;
@@ -187,19 +188,19 @@ impl Handler for RemotePanel {
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 // Show request folder popup
-                if let Some(entry) = app.remote_entries.get(app.remote_selected).cloned() {
+                if let Some(entry) = app.remote.entries.get(app.remote.selected).cloned() {
                     if entry.is_dir {
-                        if let Some(peer_id) = &app.remote_peer {
-                            let remote_path = if app.remote_path.ends_with('/') {
-                                format!("{}{}", app.remote_path, entry.name)
+                        if let Some(peer_id) = &app.remote.peer {
+                            let remote_path = if app.remote.path.ends_with('/') {
+                                format!("{}{}", app.remote.path, entry.name)
                             } else {
-                                format!("{}/{}", app.remote_path, entry.name)
+                                format!("{}/{}", app.remote.path, entry.name)
                             };
 
                             let save_dir = std::env::current_dir()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|_| ".".to_string());
-                            app.remote_path_request = Some(RemotePathRequest {
+                            app.remote.path_request = Some(RemotePathRequest {
                                 peer_id: peer_id.clone(),
                                 name: entry.name.clone(),
                                 size: entry.size,

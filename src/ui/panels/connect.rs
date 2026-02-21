@@ -27,7 +27,7 @@ impl ConnectPanel {
 
 impl Component for ConnectPanel {
     fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
-        let constraints = if app.connecting_peers.is_empty() {
+        let constraints = if app.peers.connecting.is_empty() {
             vec![
                 Constraint::Min(1),
                 Constraint::Length(3),
@@ -38,7 +38,7 @@ impl Component for ConnectPanel {
                 Constraint::Min(1),
                 Constraint::Length(3),
                 Constraint::Length(1), // Spacer
-                Constraint::Length(2 + app.connecting_peers.len() as u16),
+                Constraint::Length(2 + app.peers.connecting.len() as u16),
                 Constraint::Min(1),
             ]
         };
@@ -64,9 +64,9 @@ impl Component for ConnectPanel {
             .style(Style::default().fg(Color::White));
         f.render_widget(input_widget, chunks[1]);
 
-        if !app.connecting_peers.is_empty() {
+        if !app.peers.connecting.is_empty() {
             let mut connecting_items = Vec::new();
-            for (peer_id, status) in &app.connecting_peers {
+            for (peer_id, status) in &app.peers.connecting {
                 connecting_items.push(ListItem::new(Line::from(vec![
                     Span::styled(
                         format!(" {} ", short_peer_id(peer_id)),

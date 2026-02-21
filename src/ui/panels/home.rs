@@ -84,8 +84,8 @@ impl Component for HomePanel {
                     Span::raw(mode.label()),
                 ])),
                 Mode::Peers => {
-                    let online_count = app.peers.iter().filter(|p| app.is_peer_online(p)).count();
-                    let total_count = app.peers.len();
+                    let online_count = app.peers.list.iter().filter(|p| app.is_peer_online(p)).count();
+                    let total_count = app.peers.list.len();
                     ListItem::new(Line::from(vec![
                         Span::styled(" 💻  ".to_string(), Style::default().fg(Color::Cyan)),
                         Span::raw(mode.label()),
@@ -183,8 +183,8 @@ impl Handler for HomePanel {
                 if let Some(mode) = Self::index_to_mode(sel) {
                     app.notify.clear();
                     if mode == Mode::Chat {
-                        app.chat_target = ChatTarget::Room;
-                        app.chat_sidebar_idx = 0;
+                        app.chat.target = ChatTarget::Room;
+                        app.chat.sidebar_idx = 0;
                     }
                     Some(Action::SwitchMode(mode))
                 } else {
