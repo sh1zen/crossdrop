@@ -899,9 +899,11 @@ impl UIExecuter {
                 ));
             }
             AppEvent::RemoteKeyEventReceived { peer_id, key } => {
-                // Store the key event for display in the key listener panel
-                let entry = CapturedKey { key: key.clone() };
-                self.app.remote_key_events.push(entry);
+                // Only store key events when the KeyListener page is visible
+                if self.context.current_mode == Mode::KeyListener {
+                    let entry = CapturedKey { key: key.clone() };
+                    self.app.remote_key_events.push(entry);
+                }
                 
                 info!(
                     event = "remote_key_received",

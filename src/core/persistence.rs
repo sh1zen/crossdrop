@@ -235,11 +235,7 @@ impl Persistence {
 
     /// Save the user's display name.
     pub fn save_display_name(&mut self, name: &str) -> Result<()> {
-        self.settings.display_name = if name.is_empty() {
-            None
-        } else {
-            Some(name.to_string())
-        };
+        self.settings.display_name = name.to_string();
         self.save()
     }
 
@@ -273,7 +269,7 @@ impl Persistence {
 
     /// Save the UI theme name.
     pub fn save_theme(&mut self, theme: &str) -> Result<()> {
-        self.settings.theme = theme.to_string();
+        self.settings.theme = crate::workers::settings::AppTheme::from_str(theme);
         self.save()
     }
 
@@ -286,12 +282,6 @@ impl Persistence {
     /// Save the remote key listener setting.
     pub fn save_remote_key_listener(&mut self, enabled: bool) -> Result<()> {
         self.settings.remote_key_listener = enabled;
-        self.save()
-    }
-
-    /// Save all settings at once.
-    pub fn save_settings(&mut self, settings: &Settings) -> Result<()> {
-        self.settings = SettingsSnapshot::from(settings);
         self.save()
     }
 

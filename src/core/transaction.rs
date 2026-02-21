@@ -13,6 +13,7 @@
 //! There is exactly one Transaction per transfer request.
 
 pub use crate::core::config::CHUNK_SIZE;
+use crate::core::config::TRANSACTION_EXPIRY_SECS;
 use crate::core::pipeline::chunk::ChunkBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -824,8 +825,6 @@ pub struct TransactionSnapshot {
 }
 
 impl TransactionSnapshot {
-    const EXPIRY_SECS: u64 = 24 * 3600;
-
     /// Returns true if this resumable/interrupted transaction has expired.
     pub fn is_expired(&self) -> bool {
         if !matches!(
@@ -843,7 +842,7 @@ impl TransactionSnapshot {
         self.expiration_time.map_or(false, |exp| now >= exp)
             || self
                 .interrupted_at
-                .map_or(false, |at| now >= at + Self::EXPIRY_SECS)
+                .map_or(false, |at| now >= at + TRANSACTION_EXPIRY_SECS)
     }
 }
 

@@ -98,6 +98,12 @@ pub const DC_SEND_MAX_RETRIES: u32 = 10;
 /// Timeout for waiting for a data channel to reopen during a send retry.
 pub const DC_REOPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum wait time for backpressure to clear before proceeding anyway.
+pub const DC_BACKPRESSURE_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll interval for checking buffer space during backpressure.
+pub const DC_BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// High water mark for the WebRTC data channel SCTP send buffer (bytes).
 /// When `buffered_amount` exceeds this value, the sender pauses chunk
 /// transmission until the buffer drains below the low water mark.
@@ -141,3 +147,7 @@ pub const TYPING_TIMEOUT_SECS: u64 = 3;
 
 /// Maximum log entries kept in the in-memory ring buffer.
 pub const MAX_LOG_ENTRIES: usize = 500;
+
+/// Transaction snapshot expiry time in seconds (24 hours).
+/// Used for resumable/interrupted transaction cleanup.
+pub const TRANSACTION_EXPIRY_SECS: u64 = 24 * 3600;

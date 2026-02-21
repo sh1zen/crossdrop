@@ -1,22 +1,617 @@
-# Crossdrop Architecture Infographics
+# Crossdrop Architecture Documentation
 
-This document provides visual representations of the message handling, file transfer pipelines, and remote file request systems in Crossdrop.
+This document provides comprehensive documentation of the Crossdrop architecture, including module organization, data flows, and implementation details.
 
 ---
 
 ## Table of Contents
 
-1. [Message Pipeline](#1-message-pipeline)
-2. [File Transfer Pipeline](#2-file-transfer-pipeline)
-3. [Remote File Request System](#3-remote-file-request-system)
-4. [Transaction State Machine](#4-transaction-state-machine)
-5. [WebRTC Data Flow](#5-webrtc-data-flow)
+1. [Project Overview](#1-project-overview)
+2. [Module Structure](#2-module-structure)
+3. [Core Module](#3-core-module)
+4. [Connection Layer](#4-connection-layer)
+5. [Pipeline Module](#5-pipeline-module)
+6. [Security Module](#6-security-module)
+7. [UI Module](#7-ui-module)
+8. [Utils Module](#8-utils-module)
+9. [Workers Module](#9-workers-module)
+10. [Message Pipeline](#10-message-pipeline)
+11. [File Transfer Pipeline](#11-file-transfer-pipeline)
+12. [Transaction State Machine](#12-transaction-state-machine)
+13. [WebRTC Data Flow](#13-webrtc-data-flow)
+14. [Configuration Constants](#14-configuration-constants)
 
 ---
 
-## 1. Message Pipeline
+## 1. Project Overview
 
-### 1.1 Message Sending Flow
+Crossdrop is a peer-to-peer file sharing and chat application built in Rust. It uses:
+- **Iroh** for P2P discovery and signaling
+- **WebRTC** for direct peer connections with data channels
+- **SHA3-256** and **AES-256-GCM** for cryptographic operations
+- **Ratatui** for the terminal UI
+
+### Key Features
+- Direct peer-to-peer file transfers with resume capability
+- Real-time chat (broadcast and direct messages)
+- Remote file system browsing
+- End-to-end encryption with session key rotation
+- Merkle tree integrity verification for file transfers
+
+---
+
+## 2. Module Structure
+
+```
+src/
+├── main.rs              # Application entry point
+├── core/                # Business logic and transfer coordination
+│   ├── mod.rs
+│   ├── config.rs        # Centralized configuration constants
+│   ├── engine.rs        # TransferEngine - transfer state machine
+│   ├── initializer.rs   # PeerNode - connection management
+│   ├── peer_registry.rs # Saved peer persistence
+│   ├── persistence.rs   # JSON-based state persistence
+│   ├── transaction.rs   # Transaction data structures
+│   ├── connection/      # Network layer
+│   │   ├── mod.rs
+│   │   ├── iroh.rs      # Iroh endpoint wrapper
+│   │   ├── ticket.rs    # Connection ticket parsing
+│   │   ├── crypto.rs    # ECDH key exchange
+│   │   └── webrtc/      # WebRTC implementation
+│   ├── pipeline/        # File transfer pipeline
+│   │   ├── mod.rs
+│   │   ├── chunk.rs     # Chunk bitmap for resume
+│   │   ├── merkle.rs    # Merkle tree integrity
+│   │   ├── receiver.rs  # Streaming file writer
+│   │   └── sender.rs    # Disk reader pipeline
+│   └── security/        # Authentication and replay protection
+│       ├── mod.rs
+│       ├── identity.rs      # Ed25519 identity
+│       ├── message_auth.rs  # HMAC authentication
+│       └── replay.rs        # Replay guard
+├── ui/                  # Terminal UI (Ratatui)
+│   ├── mod.rs
+│   ├── executer.rs      # Main UI loop
+│   ├── commands.rs      # UI commands
+│   ├── notify.rs        # Notification manager
+│   ├── traits.rs        # Component traits
+│   ├── panels/          # UI panels
+│   ├── popups/          # Modal dialogs
+│   ├── helpers/         # Formatting utilities
+│   └── widgets/         # Reusable widgets
+├── utils/               # Shared utilities
+│   ├── mod.rs
+│   ├── crypto.rs        # HMAC-SHA3-256
+│   ├── hash.rs          # Compression and key management
+│   ├── data_dir.rs      # Data directory management
+│   ├── clipboard.rs     # Clipboard operations
+│   ├── atomic_write.rs  # Atomic file writes
+│   ├── log_buffer.rs    # In-memory log buffer
+│   ├── global_keyboard.rs # Global hotkeys
+│   └── sos.rs           # Signal-of-stop for cancellation
+└── workers/             # Application state
+    ├── mod.rs
+    ├── app.rs           # App struct and Mode enum
+    ├── args.rs          # CLI argument parsing
+    ├── peer.rs          # Peer state types
+    └── settings.rs      # User settings
+```
+
+---
+
+## 3. Core Module
+
+### 3.1 TransferEngine ([`engine.rs`](src/core/engine.rs))
+
+The `TransferEngine` is the **sole coordinator** of all file transfer logic. It is a pure state machine with no async/network concerns.
+
+**Architecture Rule**: No transfer logic may exist outside this module.
+
+```
+                                    TransferEngine Architecture
+                                    ==========================
+
+    UI Layer                    Core Layer                    Transport Layer
+    ========                    ==========                    ===============
+
+    UIExecuter                  TransferEngine                WebRTCConnection
+        |                           |                              |
+        | initiate_file_send()      |                              |
+        +-------------------------->|                              |
+        |                           |                              |
+        |                     EngineAction                        |
+        |                           |                              |
+        |                           +--- send_control() ----------->|
+        |                           |                              |
+```
+
+**Key Types**:
+
+| Type | Purpose |
+|------|---------|
+| `EngineAction` | Declarative side-effects returned to UIExecuter |
+| `EngineOutcome` | Result containing actions and status message |
+| `PendingIncoming` | Incoming transaction awaiting user acceptance |
+| `DataStats` | Comprehensive transfer statistics |
+
+**Engine Actions**:
+```rust
+pub enum EngineAction {
+    SendTransactionRequest { ... },
+    SendTransactionResponse { ... },
+    PrepareReceive { ... },
+    SendFileData { ... },
+    SendFolderData { ... },
+    SendTransactionComplete { ... },
+    AcceptResume { ... },
+    SendResumeRequest { ... },
+    RejectResume { ... },
+    ResendFiles { ... },
+    HandleRemoteFetch { ... },
+    CancelTransaction { ... },
+    RetransmitChunks { ... },
+    TransactionCompleteAck { ... },
+}
+```
+
+### 3.2 PeerNode ([`initializer.rs`](src/core/initializer.rs))
+
+`PeerNode` manages peer connections, message routing, and event dispatch.
+
+**Responsibilities**:
+- Iroh endpoint management
+- WebRTC connection establishment (offerer/answerer)
+- ECDH handshake coordination
+- Event broadcasting to UI layer
+- Message queuing for offline peers
+
+**AppEvent Enum**:
+```rust
+pub enum AppEvent {
+    PeerConnected { peer_id, remote_ip },
+    PeerDisconnected { peer_id, explicit },
+    ChatReceived { peer_id, message },
+    DmReceived { peer_id, message },
+    TypingReceived { peer_id },
+    FileProgress { file_id, received_chunks, ... },
+    SendProgress { file_id, sent_chunks, ... },
+    SendComplete { file_id, success },
+    FileComplete { file_id, filename, merkle_root, ... },
+    TransactionRequested { ... },
+    TransactionAccepted { ... },
+    TransactionRejected { ... },
+    // ... more variants
+}
+```
+
+### 3.3 Transaction ([`transaction.rs`](src/core/transaction.rs))
+
+Manages transaction lifecycle, state transitions, and resume capability.
+
+**Transaction States**:
+```
+Pending → Active → Completed
+        ↘ Rejected
+        ↘ Cancelled
+        ↘ Interrupted → Resumable
+```
+
+### 3.4 Persistence ([`persistence.rs`](src/core/persistence.rs))
+
+JSON-based state persistence for:
+- Transfer history
+- Transaction snapshots (for resume)
+- Transfer statistics
+- Chat history
+- Saved peers
+- Queued messages
+
+---
+
+## 4. Connection Layer
+
+### 4.1 Iroh ([`connection/iroh.rs`](src/core/connection/iroh.rs))
+
+Wrapper around Iroh endpoint for P2P connectivity.
+
+**Features**:
+- Endpoint creation with port binding retry logic
+- Connection establishment via tickets
+- Ticket generation for incoming connections
+- Relay support for NAT traversal
+
+### 4.2 Ticket ([`connection/ticket.rs`](src/core/connection/ticket.rs))
+
+Connection tickets are compressed, serialized endpoint addresses.
+
+```
+Ticket Format:
+==============
+1. JSON serialize EndpointAddr
+2. Brotli compress
+3. URL-safe Base64 encode
+4. Prepend version byte
+```
+
+### 4.3 Crypto ([`connection/crypto.rs`](src/core/connection/crypto.rs))
+
+ECDH key exchange and session key derivation.
+
+**Handshake Protocol**:
+```
+Offerer                          Answerer
+─────────                        ─────────
+eph_pk_A  ──────────────────────►
+eph_pk_B  ◄──────────────────────
+
+shared_secret = X25519(eph_sk_A, eph_pk_B)
+session_key = HKDF-SHA3-256(
+    ikm  = shared_secret,
+    salt = sort(iroh_pk_A, iroh_pk_B),
+    info = b"crossdrop-session-v1"
+)
+```
+
+**Key Rotation**:
+- Hourly automatic rotation
+- New ephemeral X25519 key pair
+- Forward secrecy via previous key mixing
+
+### 4.4 WebRTC ([`connection/webrtc/`](src/core/connection/webrtc/))
+
+**Module Layout**:
+
+| File | Responsibility |
+|------|----------------|
+| `types.rs` | Protocol enums and internal state structs |
+| `helpers.rs` | Crypto, compression, path sanitization |
+| `connection.rs` | `WebRTCConnection` struct |
+| `data.rs` | Binary frame encode/decode |
+| `control.rs` | Incoming message dispatch |
+| `sender.rs` | TX operations: files, messages, control frames |
+| `receiver.rs` | RX operations: finalization and hash verification |
+| `initializer.rs` | Connection setup and data-channel negotiation |
+
+**Frame Types**:
+```rust
+pub const FRAME_CONTROL: u8 = 0x01;  // JSON ControlMessage
+pub const FRAME_CHUNK: u8 = 0x02;    // Binary file chunk
+```
+
+**ControlMessage Enum**:
+```rust
+pub enum ControlMessage {
+    // Chat
+    Text(Vec<u8>),
+    DirectMessage(Vec<u8>),
+    Typing,
+    AuthenticatedText(Vec<u8>),
+    AuthenticatedDm(Vec<u8>),
+    DisplayName(String),
+
+    // File transfer
+    Metadata { file_id, total_chunks, filename, filesize },
+    ChunkHashBatch { file_id, start_index, chunk_hashes },
+    Hash { file_id, merkle_root },
+    HashResult { file_id, ok },
+    ChunkRetransmitRequest { file_id, chunk_indices },
+    FileReceived { file_id },
+
+    // Transactions
+    TransactionRequest { ... },
+    TransactionResponse { ... },
+    TransactionComplete { ... },
+    TransactionCancel { ... },
+    TransactionResumeRequest { ... },
+    TransactionResumeResponse { ... },
+    TransactionCompleteAck { ... },
+
+    // Remote access
+    LsRequest { path },
+    LsResponse { path, entries },
+    FetchRequest { path, is_folder },
+    RemoteAccessDisabled,
+    RemoteKeyEvent { key },
+    RemoteKeyListenerDisabled,
+
+    // Key rotation
+    KeyRotation { ephemeral_pub },
+
+    // Liveness
+    AreYouAwake,
+    ImAwake,
+}
+```
+
+---
+
+## 5. Pipeline Module
+
+### 5.1 Chunk Bitmap ([`pipeline/chunk.rs`](src/core/pipeline/chunk.rs))
+
+Bit-vector tracking which chunks have been received.
+
+```rust
+pub struct ChunkBitmap {
+    pub total_chunks: u32,
+    bits: Vec<u64>,  // 64 bits per word
+}
+```
+
+**Wire Format**:
+```
+[4 bytes: total_chunks][N * 8 bytes: bits]
+```
+
+### 5.2 Merkle Tree ([`pipeline/merkle.rs`](src/core/pipeline/merkle.rs))
+
+Merkle tree for file integrity verification.
+
+**Incremental Verification Flow**:
+1. Sender computes chunk hashes while reading file
+2. Sender sends `ChunkHashBatch` messages BEFORE chunks
+3. Receiver stores expected chunk hashes
+4. Each chunk verified against expected hash on arrival
+5. Mismatches trigger retransmission requests
+
+```rust
+pub struct IncrementalMerkleBuilder {
+    leaves: Vec<[u8; 32]>,
+}
+
+pub struct ChunkHashVerifier {
+    chunk_hashes: Vec<Option<[u8; 32]>>,
+}
+```
+
+### 5.3 Streaming File Writer ([`pipeline/receiver.rs`](src/core/pipeline/receiver.rs))
+
+Streams received chunks directly to disk with bounded memory usage.
+
+**Memory Model**:
+```
+Per-file memory: O(total_chunks × 33 bytes)
+- chunk_hashes: Vec<Option<[u8; 32]>>
+- bitmap: ChunkBitmap
+- write_buffer: BTreeMap<u32, Vec<u8>> (bounded)
+```
+
+**Write Strategy**:
+1. Chunks written to sparse temp file at correct offset
+2. Sequential runs flushed immediately
+3. Out-of-order chunks buffered until gap fills
+4. Finalize: sync, compute Merkle root, atomic rename
+
+### 5.4 Sender Pipeline ([`pipeline/sender.rs`](src/core/pipeline/sender.rs))
+
+Async disk reader with read-ahead buffering.
+
+```
+┌──────────┐   prefetch_tx   ┌─────────────────────┐
+│ DiskRead │ ───────────────►│ Send loop           │──► WebRTC DC
+│ (async)  │   bounded chan  │ (encrypt+tx)        │
+└──────────┘                 └─────────────────────┘
+```
+
+---
+
+## 6. Security Module
+
+### 6.1 Identity ([`security/identity.rs`](src/core/security/identity.rs))
+
+Long-term Ed25519-style identity for peer authentication.
+
+```rust
+pub struct PeerIdentity {
+    secret: [u8; 32],
+    pub public_key: [u8; 32],  // SHA3-256(IDENTITY_DOMAIN || secret)
+}
+```
+
+**Features**:
+- Persistent key pair storage
+- HMAC-based signing scheme
+- Constant-time verification
+
+### 6.2 Message Authentication ([`security/message_auth.rs`](src/core/security/message_auth.rs))
+
+HMAC computation and verification for protocol messages.
+
+```rust
+pub struct AuthenticatedMessage {
+    pub transaction_id: Uuid,
+    pub counter: u64,
+    pub payload: Vec<u8>,
+    pub hmac: [u8; 32],  // HMAC(session_key, txn_id || counter || payload)
+}
+```
+
+### 6.3 Replay Protection ([`security/replay.rs`](src/core/security/replay.rs))
+
+Global replay guard tracking registered transactions.
+
+```rust
+pub struct ReplayGuard {
+    transactions: HashSet<Uuid>,
+}
+```
+
+---
+
+## 7. UI Module
+
+### 7.1 Component Traits ([`ui/traits.rs`](src/ui/traits.rs))
+
+```rust
+pub trait Component {
+    fn render(&mut self, f: &mut Frame, app: &App, area: Rect);
+    fn on_focus(&mut self, _app: &mut App) {}
+    fn on_blur(&mut self, _app: &mut App) {}
+}
+
+pub trait Handler {
+    fn handle_key(&mut self, app: &mut App, node: &PeerNode, key: KeyCode) -> Option<Action>;
+}
+
+pub trait Focusable {
+    fn focusable_elements(&self) -> Vec<FocusableElement>;
+    fn focused_index(&self) -> usize;
+    fn set_focus(&mut self, index: usize);
+}
+```
+
+### 7.2 Panels ([`ui/panels/`](src/ui/panels/))
+
+| Panel | Purpose |
+|-------|---------|
+| `HomePanel` | Main menu navigation |
+| `ChatPanel` | Room and DM messaging |
+| `SendPanel` | File/folder sending |
+| `ConnectPanel` | Peer connection via ticket |
+| `PeersPanel` | Connected peer list |
+| `FilesPanel` | Transfer history and active transfers |
+| `RemotePanel` | Remote file system browsing |
+| `SettingsPanel` | User settings configuration |
+| `IdPanel` | Display own peer ID and ticket |
+| `LogsPanel` | Application log viewer |
+| `KeyListenerPanel` | Remote key event viewer |
+
+### 7.3 Popups ([`ui/popups/`](src/ui/popups/))
+
+| Popup | Purpose |
+|-------|---------|
+| `SavePathPopup` | Accept incoming transfer with path selection |
+| `RemotePathPopup` | Confirm remote file fetch |
+| `PeerInfoPopup` | Display peer details |
+| `TransactionPopup` | Transaction offer handling |
+
+### 7.4 Helpers ([`ui/helpers/`](src/ui/helpers/))
+
+- `formatters.rs`: File size formatting, name truncation
+- `loader.rs`: Loading animation frames
+- `time.rs`: Timestamp formatting
+
+### 7.5 Widgets ([`ui/widgets/`](src/ui/widgets/))
+
+- `progress_bar.rs`: Custom progress bar component
+
+---
+
+## 8. Utils Module
+
+### 8.1 Crypto ([`utils/crypto.rs`](src/utils/crypto.rs))
+
+Centralized HMAC-SHA3-256 implementation.
+
+```rust
+pub fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32];
+pub fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool;
+```
+
+### 8.2 Hash ([`utils/hash.rs`](src/utils/hash.rs))
+
+- Brotli string compression/expansion
+- Instance locking for single-instance enforcement
+- Secret key slot management
+
+### 8.3 Other Utilities
+
+| Module | Purpose |
+|--------|---------|
+| `data_dir.rs` | Cross-platform data directory |
+| `clipboard.rs` | System clipboard access |
+| `atomic_write.rs` | Atomic file writes |
+| `log_buffer.rs` | In-memory log ring buffer |
+| `global_keyboard.rs` | Global hotkey listener |
+| `sos.rs` | Signal-of-stop for graceful shutdown |
+
+---
+
+## 9. Workers Module
+
+### 9.1 App ([`workers/app.rs`](src/workers/app.rs))
+
+Main application state container.
+
+```rust
+pub struct App {
+    pub mode: Mode,
+    pub input: String,
+    pub peer_id: String,
+    pub ticket: String,
+    pub engine: TransferEngine,
+    pub peers: PeerState,
+    pub chat: ChatState,
+    pub remote: RemoteState,
+    pub files: FilesPanelState,
+    pub settings: Settings,
+    pub notify: NotifyManager,
+    // ...
+}
+```
+
+**Mode Enum**:
+```rust
+pub enum Mode {
+    Home, Chat, Send, Connect, Peers,
+    Files, Logs, Id, Settings, Remote, KeyListener,
+}
+```
+
+### 9.2 Chat State
+
+```rust
+pub struct ChatState {
+    pub messages: MessageTable,
+    pub unread: UnreadTracker,
+    pub typing: TypingState,
+    pub target: ChatTarget,
+    // ...
+}
+
+pub enum ChatTarget {
+    Room,  // Broadcast to all peers
+    Peer(String),  // DM with specific peer
+}
+```
+
+### 9.3 Args ([`workers/args.rs`](src/workers/args.rs))
+
+CLI argument parsing with TOML config file support.
+
+```rust
+pub struct Args {
+    pub ipv4_addr: Option<SocketAddrV4>,
+    pub ipv6_addr: Option<SocketAddrV6>,
+    pub port: u16,
+    pub verbose: u8,
+    pub relay: RelayModeOption,
+    pub show_secret: bool,
+    pub remote_access: bool,
+    pub display_name: Option<String>,
+    pub conf: Option<PathBuf>,
+}
+```
+
+### 9.4 Settings ([`workers/settings.rs`](src/workers/settings.rs))
+
+User-configurable settings with theme support.
+
+```rust
+pub struct Settings {
+    pub display_name: String,
+    pub remote_access: bool,
+    pub remote_key_listener: bool,
+    pub theme: AppTheme,
+}
+```
+
+---
+
+## 10. Message Pipeline
+
+### 10.1 Message Sending Flow
 
 ```
                                     MESSAGE SENDING FLOW
@@ -64,7 +659,7 @@ This document provides visual representations of the message handling, file tran
         |                           |                     +-----------------+
 ```
 
-### 1.2 Message Receiving Flow
+### 10.2 Message Receiving Flow
 
 ```
                                     MESSAGE RECEIVING FLOW
@@ -112,69 +707,11 @@ This document provides visual representations of the message handling, file tran
         |                                    |                     (Chat Panel)
 ```
 
-### 1.3 Message Types
-
-```
-                                    CONTROL MESSAGE TYPES
-                                    =====================
-
-    ControlMessage Enum
-    ===================
-    |
-    +-- Text(Vec<u8>)                    : Plain chat message (broadcast)
-    |
-    +-- DirectMessage(Vec<u8>)           : 1-to-1 direct message
-    |
-    +-- AuthenticatedText(Vec<u8>)       : HMAC + counter protected broadcast
-    |
-    +-- AuthenticatedDm(Vec<u8>)         : HMAC + counter protected DM
-    |
-    +-- Typing                           : Ephemeral typing indicator
-    |
-    +-- DisplayName(String)              : Peer display name announcement
-    |
-    +-- TransactionRequest {...}         : File/folder transfer request
-    |
-    +-- TransactionResponse {...}        : Accept/reject transfer
-    |
-    +-- TransactionComplete {...}       : Transfer completion notice
-    |
-    +-- TransactionCancel {...}         : Transfer cancellation
-    |
-    +-- TransactionResumeRequest {...}  : Resume interrupted transfer
-    |
-    +-- TransactionResumeResponse {...} : Resume acceptance
-    |
-    +-- Metadata {...}                  : File metadata before chunks
-    |
-    +-- Hash {...}                      : File integrity hash (SHA3-256 + Merkle)
-    |
-    +-- HashResult {...}                : Hash verification result
-    |
-    +-- LsRequest {path}                : Remote directory listing request
-    |
-    +-- LsResponse {path, entries}      : Remote directory listing response
-    |
-    +-- FetchRequest {path, is_folder}  : Remote file/folder fetch request
-    |
-    +-- RemoteAccessDisabled            : Remote access denied notice
-    |
-    +-- KeyRotation {ephemeral_pub}     : Session key rotation
-    |
-    +-- ChunkRetransmitRequest {file_id}: Request file retransmission
-    |
-    +-- TransactionCompleteAck {...}    : Acknowledge transfer completion
-    |
-    +-- AreYouAwake                     : Liveness probe request
-    |
-    +-- ImAwake                         : Liveness probe response
-```
-
 ---
 
-## 2. File Transfer Pipeline
+## 11. File Transfer Pipeline
 
-### 2.1 Outbound File Transfer (Sender Side)
+### 11.1 Outbound File Transfer (Sender Side)
 
 ```
                                     OUTBOUND FILE TRANSFER
@@ -288,7 +825,7 @@ This document provides visual representations of the message handling, file tran
         |                     +-----------+                        |
 ```
 
-### 2.2 Inbound File Transfer (Receiver Side)
+### 11.2 Inbound File Transfer (Receiver Side)
 
 ```
                                     INBOUND FILE TRANSFER
@@ -411,7 +948,7 @@ This document provides visual representations of the message handling, file tran
         |                                    |                     Update UI
 ```
 
-### 2.3 File Chunk Frame Format
+### 11.3 File Chunk Frame Format
 
 ```
                                     CHUNK FRAME FORMAT
@@ -448,225 +985,11 @@ This document provides visual representations of the message handling, file tran
     - 0x01 = Brotli compressed (control messages)
 ```
 
-### 2.4 Streaming File Writer Memory Model
-
-```
-                                    STREAMING FILE WRITER
-                                    =====================
-
-    Memory Usage Per File:
-    ======================
-
-    +-------------------+-------------------+-------------------+
-    | Chunk Hashes      | Chunk Bitmap      | Write Buffer      |
-    | O(chunks × 32B)   | O(chunks / 8)     | O(buffer_chunks)  |
-    +-------------------+-------------------+-------------------+
-
-    Example: 1GB file (48KB chunks)
-    - Total chunks: ~21,845
-    - Chunk hashes: 21,845 × 32 = ~684 KB
-    - Chunk bitmap: 21,845 / 8 = ~2.7 KB
-    - Write buffer: 16 chunks × 48KB = 768 KB
-    - Total RAM: ~1.4 MB (vs 1GB in-memory approach)
-
-    Write Buffer Strategy:
-    ======================
-
-    +-------------------+
-    | BTreeMap<seq, data>|
-    +---------+---------+
-              |
-    +---------v---------+     +-------------------+
-    | Flush when:       |---->| Sequential write  |
-    | - seq == expected |     | (coalesced I/O)   |
-    | - buffer >= limit |     +-------------------+
-    +-------------------+
-
-    Disk Layout:
-    ============
-
-    +-------------------+
-    | Sparse Temp File   |
-    | (.crossdrop-tmp)  |
-    +---------+---------+
-              |
-    +---------v---------+     +-------------------+
-    | Chunks written    |---->| Finalize:         |
-    | at correct offset |     | - Sync to disk    |
-    | (seek + write)    |     | - Read back       |
-    +-------------------+     | - Compute SHA3    |
-                              | - Atomic rename   |
-                              +-------------------+
-```
-
 ---
 
-## 3. Remote File Request System
+## 12. Transaction State Machine
 
-### 3.1 Remote Directory Listing Flow
-
-```
-                                    REMOTE LS FLOW
-                                    ==============
-
-    Local Peer                                    Remote Peer
-    ==========                                    ===========
-
-    Remote Panel                                  WebRTCConnection
-        |                                              |
-        | list_remote_directory(peer_id, path)         |
-        +--------------------------------------------->|
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Check           |
-        |                                     | remote_access   |
-        |                                     +--------+--------+
-        |                                              |
-        |                              +-------+-------+-------+
-        |                              |                       |
-        |                     +--------v--------+     +--------v--------+
-        |                     | Access Enabled  |     | Access Disabled  |
-        |                     +--------+--------+     +--------+--------+
-        |                              |                       |
-        |                     +--------v--------+     +--------v--------+
-        |                     | Read directory  |     | Send            |
-        |                     | entries         |     | RemoteAccessDisabled
-        |                     +--------+--------+     +--------+--------+
-        |                              |                       |
-        |                     +--------v--------+             |
-        |                     | Send LsResponse |             |
-        |                     | {path, entries} |             |
-        |                     +--------+--------+             |
-        |                                              |
-        |<---------------------------------------------|
-        |     LsResponse {path, entries}                |
-        |                                              |
-        +--------v--------+                            |
-        | Update UI       |                            |
-        | (remote_entries)|                            |
-        +-----------------+                            |
-```
-
-### 3.2 Remote File Fetch Flow
-
-```
-                                    REMOTE FILE FETCH FLOW
-                                    ======================
-
-    Local Peer (Receiver)                         Remote Peer (Sender)
-    =====================                         ====================
-
-    Remote Panel                                  TransferEngine
-        |                                              |
-        | User selects file, confirms save path        |
-        |                                              |
-        +--------v--------+                            |
-        | Create          |                            |
-        | RemoteFileRequest|                           |
-        +--------+--------+                            |
-        |                                              |
-        | send_control(FetchRequest {path, is_folder}) |
-        +--------------------------------------------->|
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Check           |
-        |                                     | remote_access   |
-        |                                     +--------+--------+
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Create          |
-        |                                     | Transaction     |
-        |                                     | (outbound)      |
-        |                                     +--------+--------+
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Send            |
-        |                                     | TransactionRequest
-        |                                     +--------+--------+
-        |                                              |
-        |<---------------------------------------------|
-        |     TransactionRequest {manifest, ...}       |
-        |                                              |
-        +--------v--------+                            |
-        | Show popup      |                            |
-        | (Accept/Reject) |                            |
-        +--------+--------+                            |
-        |                                              |
-        | User accepts                                 |
-        |                                              |
-        +--------v--------+                            |
-        | Create          |                            |
-        | Inbound         |                            |
-        | Transaction     |                            |
-        +--------+--------+                            |
-        |                                              |
-        | send_control(TransactionResponse {accepted}) |
-        +--------------------------------------------->|
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Activate        |
-        |                                     | Transaction     |
-        |                                     +--------+--------+
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Send file data |
-        |                                     | (normal file   |
-        |                                     |  transfer flow)|
-        |                                     +-----------------+
-        |                                              |
-        |<---- Metadata, Chunks, Hash -----------------|
-        |                                              |
-        | (Normal inbound file transfer continues...)  |
-```
-
-### 3.3 Remote Folder Fetch Flow
-
-```
-                                    REMOTE FOLDER FETCH FLOW
-                                    ========================
-
-    Local Peer (Receiver)                         Remote Peer (Sender)
-    =====================                         ====================
-
-        |                                              |
-        | send_control(FetchRequest {path, is_folder: true})
-        +--------------------------------------------->|
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Scan folder     |
-        |                                     | recursively     |
-        |                                     +--------+--------+
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Build manifest  |
-        |                                     | (all files with |
-        |                                     |  relative paths)|
-        |                                     +--------+--------+
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Create          |
-        |                                     | Transaction     |
-        |                                     | (folder type)   |
-        |                                     +--------+--------+
-        |                                              |
-        |<---- TransactionRequest {manifest, parent_dir}|
-        |                                              |
-        | (Same flow as single file, but with          |
-        |  multiple files in manifest)                 |
-        |                                              |
-        |                                     +--------v--------+
-        |                                     | Send each file  |
-        |                                     | sequentially    |
-        |                                     | with relative   |
-        |                                     | paths preserved |
-        |                                     +-----------------+
-```
-
----
-
-## 4. Transaction State Machine
-
-### 4.1 Transaction States
+### 12.1 Transaction States
 
 ```
                                     TRANSACTION STATE MACHINE
@@ -708,29 +1031,29 @@ This document provides visual representations of the message handling, file tran
                                     | Peer Reconnects     |
                                     +---------+----------+
                                               |
-                           +------------------+------------------+
-                           |                                     |
-                    +------v------+                       +------v------+
-                    | Resume      |                       | Resume      |
-                    | (inbound)   |                       | (outbound)  |
-                    +------+------+                       +------+------+
-                           |                                     |
-                    +------v------+                       +------v------+
-                    | Send        |                       | Wait for    |
-                    | ResumeRequest|                      | ResumeRequest
-                    +------+------+                       +------+------+
-                           |                                     |
-                    +------v------+                       +------v------+
-                    | ResumeAccepted|                     | Process     |
-                    +------+------+                       | ResumeRequest
-                           |                              +------+------+
-                    +------v------+                              |
-                    | Reactivate  |                       +------v------+
-                    | Transaction |                       | ResendFiles |
-                    +-------------+                       +-------------+
+                             +------------------+------------------+
+                             |                                     |
+                      +------v------+                       +------v------+
+                      | Resume      |                       | Resume      |
+                      | (inbound)   |                       | (outbound)  |
+                      +------+------+                       +------+------+
+                             |                                     |
+                      +------v------+                       +------v------+
+                      | Send        |                       | Wait for    |
+                      | ResumeRequest|                      | ResumeRequest
+                      +------+------+                       +------+------+
+                             |                                     |
+                      +------v------+                       +------v------+
+                      | ResumeAccepted|                     | Process     |
+                      +------+------+                       | ResumeRequest
+                             |                              +------+------+
+                      +------v------+                              |
+                      | Reactivate  |                       +------v------+
+                      | Transaction |                       | ResendFiles |
+                      +-------------+                       +-------------+
 ```
 
-### 4.2 Transaction Lifecycle Events
+### 12.2 Transaction Lifecycle Events
 
 ```
                                     TRANSACTION LIFECYCLE
@@ -749,7 +1072,7 @@ This document provides visual representations of the message handling, file tran
 
     3. FileProgress events (during transfer)
        -> State: Active (ongoing)
-       -> Persist every 20 chunks
+       -> Persist every 10 chunks
 
     4. SendComplete received (per file)
        -> Mark file complete
@@ -796,7 +1119,7 @@ This document provides visual representations of the message handling, file tran
 
     3. FileProgress events (during transfer)
        -> State: Active (ongoing)
-       -> Persist every 20 chunks
+       -> Persist every 10 chunks
 
     4. FileComplete received (per file)
        -> Mark file complete
@@ -822,9 +1145,9 @@ This document provides visual representations of the message handling, file tran
 
 ---
 
-## 5. WebRTC Data Flow
+## 13. WebRTC Data Flow
 
-### 5.1 Connection Architecture
+### 13.1 Connection Architecture
 
 ```
                                     WEBRTC CONNECTION ARCHITECTURE
@@ -880,7 +1203,7 @@ This document provides visual representations of the message handling, file tran
     +-------------------------------------------------------------------+
 ```
 
-### 5.2 Encryption Pipeline
+### 13.2 Encryption Pipeline
 
 ```
                                     ENCRYPTION PIPELINE
@@ -921,7 +1244,7 @@ This document provides visual representations of the message handling, file tran
     +-------------+     +-------------+     +-------------+     +-------------+
 ```
 
-### 5.3 Backpressure Handling
+### 13.3 Backpressure Handling
 
 ```
                                     BACKPRESSURE MECHANISM
@@ -946,7 +1269,7 @@ This document provides visual representations of the message handling, file tran
     +--------+----------+
              |
     +--------v----------+
-    | Poll every 100ms  |
+    | Poll every 10ms   |
     | (max 10 seconds)  |
     +--------+----------+
              |
@@ -964,21 +1287,86 @@ This document provides visual representations of the message handling, file tran
     Constants:
     ==========
 
-    DC_BUFFERED_AMOUNT_HIGH = 1MB
+    DC_BUFFERED_AMOUNT_HIGH = 4MB
     - Maximum buffered data before applying backpressure
 
-    DC_SEND_MAX_RETRIES = 3
+    DC_SEND_MAX_RETRIES = 10
     - Retries for transient "not open" errors
 
-    DC_REOPEN_TIMEOUT = 5 seconds
+    DC_REOPEN_TIMEOUT = 10 seconds
     - Time to wait for channel to reopen
 ```
 
 ---
 
-## 6. Data Structures Summary
+## 14. Configuration Constants
 
-### 6.1 Key Types
+All configuration constants are centralized in [`core/config.rs`](src/core/config.rs).
+
+### 14.1 Transfer / Chunking
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `CHUNK_SIZE` | 48 KB | Size of each file chunk |
+| `PIPELINE_SIZE` | 32 | Chunks per progress report batch |
+| `SENDER_READ_AHEAD_CHUNKS` | 64 | Prefetch buffer size |
+| `RECEIVER_WRITE_BUFFER_CHUNKS` | 64 | In-memory write buffer capacity |
+| `MAX_PENDING_FILE_ACKS` | 5 | Maximum files waiting for ACK |
+
+### 14.2 Transactions
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_CONCURRENT_TRANSACTIONS` | 6 | Maximum simultaneous active transfers |
+| `MAX_TRANSACTION_RETRIES` | 100 | Maximum total retries per transaction |
+| `TRANSACTION_TIMEOUT` | 24 hours | Transaction expiration time |
+| `MAX_FILE_RETRANSMISSIONS` | 3 | Retries per file before failure |
+
+### 14.3 Safety / Abuse Prevention
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_PENDING_CHUNKS_PER_FILE` | 64 | Max buffered chunks before Metadata |
+| `MAX_PENDING_FILE_IDS` | 16 | Max distinct file IDs in pending buffer |
+
+### 14.4 Connection / Network
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SCTP_MAX_MESSAGE_SIZE` | 1 MB | Explicit SCTP max message size |
+| `CONNECTION_TIMEOUT` | 60 seconds | WebRTC peer connection timeout |
+| `DATA_CHANNEL_TIMEOUT` | 30 seconds | Data channel open timeout |
+| `DC_SEND_MAX_RETRIES` | 10 | Transient error retries |
+| `DC_REOPEN_TIMEOUT` | 10 seconds | Channel reopen wait time |
+| `DC_BACKPRESSURE_MAX_WAIT` | 10 seconds | Max wait for backpressure |
+| `DC_BUFFERED_AMOUNT_HIGH` | 4 MB | Backpressure threshold |
+| `ICE_GATHER_TIMEOUT` | 15 seconds | ICE candidate gathering timeout |
+| `KEY_ROTATION_INTERVAL` | 1 hour | Session key rotation interval |
+| `PORT_RETRY_ATTEMPTS` | 10 | Port binding retry attempts |
+
+### 14.5 Liveness / Reconnect
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `AWAKE_CHECK_TIMEOUT` | 5 seconds | Liveness probe timeout |
+| `INITIAL_CONNECT_MAX_RETRIES` | 3 | Initial connection retries |
+| `INITIAL_CONNECT_RETRY_DELAYS` | [5, 15, 30] | Delays between retries (seconds) |
+| `RECONNECT_MAX_RETRIES` | 5 | Reconnect attempts after drop |
+| `RECONNECT_RETRY_DELAYS` | [3, 5, 10, 20, 30] | Reconnect delays (seconds) |
+
+### 14.6 UI / Misc
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `TYPING_TIMEOUT_SECS` | 3 | Typing indicator expiration |
+| `MAX_LOG_ENTRIES` | 500 | In-memory log ring buffer size |
+| `TRANSACTION_EXPIRY_SECS` | 24 hours | Resumable transaction cleanup |
+
+---
+
+## 15. Data Structures Summary
+
+### 15.1 Key Types
 
 ```
                                     KEY DATA STRUCTURES
@@ -1003,6 +1391,7 @@ This document provides visual representations of the message handling, file tran
     | transferred_chunks| completed: bool   |
     | verified: Option  | chunk_bitmap: Option
     | merkle_root: Option| retransmit_count |
+    | full_path: Option |                   |
     +-------------------+-------------------+
 
     TransactionManifest:
@@ -1030,6 +1419,7 @@ This document provides visual representations of the message handling, file tran
     | total_chunks: u32 | received_chunks   |
     | chunk_hashes: Vec | bitmap: ChunkBitmap
     | write_buffer: BTreeMap| next_flush_seq |
+    | verifier: Option  | failed_chunks: Vec|
     +-------------------+-------------------+
 
     ReceiveFileState:
@@ -1041,63 +1431,4 @@ This document provides visual representations of the message handling, file tran
 
 ---
 
-## 7. Configuration Constants
-
-```
-                                    CONFIGURATION CONSTANTS
-                                    =======================
-
-    Transfer Settings:
-    ==================
-    CHUNK_SIZE = 48KB
-    - Size of each file chunk
-
-    MAX_CONCURRENT_TRANSACTIONS = 3
-    - Maximum simultaneous transfers
-
-    MAX_FILE_RETRANSMISSIONS = 3
-    - Retries before marking file as failed
-
-    MAX_TRANSACTION_RETRIES = 5
-    - Resume attempts before giving up
-
-    TRANSACTION_TIMEOUT = 5 minutes
-    - Manifest expiration time
-
-    Pipeline Settings:
-    ==================
-    PIPELINE_SIZE = 8
-    - Chunks per progress report batch
-
-    SENDER_READ_AHEAD_CHUNKS = 16
-    - Prefetch buffer size for disk reader
-
-    RECEIVER_WRITE_BUFFER_CHUNKS = 16
-    - In-memory write buffer capacity
-
-    WebRTC Settings:
-    ================
-    DC_BUFFERED_AMOUNT_HIGH = 1MB
-    - Backpressure threshold
-
-    DC_SEND_MAX_RETRIES = 3
-    - Transient error retries
-
-    DC_REOPEN_TIMEOUT = 5 seconds
-    - Channel reopen wait time
-
-    AWAKE_CHECK_TIMEOUT = 5 seconds
-    - Liveness probe timeout
-
-    Pending Chunk Limits:
-    =====================
-    MAX_PENDING_FILE_IDS = 10
-    - Maximum files with pending chunks
-
-    MAX_PENDING_CHUNKS_PER_FILE = 100
-    - Maximum buffered chunks per file
-```
-
----
-
-This document provides a comprehensive visual reference for understanding the Crossdrop architecture. For implementation details, refer to the source code in the respective modules.
+This document provides a comprehensive reference for understanding the Crossdrop architecture. For implementation details, refer to the source code in the respective modules.

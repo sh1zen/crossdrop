@@ -5,7 +5,8 @@ use super::{
     ControlMessage, WebRTCConnection, CHAT_HMAC_CHANNEL,
 };
 use crate::core::config::{
-    CHUNK_SIZE, DC_BUFFERED_AMOUNT_HIGH, DC_REOPEN_TIMEOUT, DC_SEND_MAX_RETRIES, PIPELINE_SIZE,
+    CHUNK_SIZE, DC_BACKPRESSURE_MAX_WAIT, DC_BACKPRESSURE_POLL_INTERVAL, DC_BUFFERED_AMOUNT_HIGH,
+    DC_REOPEN_TIMEOUT, DC_SEND_MAX_RETRIES, PIPELINE_SIZE,
 };
 use crate::core::connection::webrtc::data::{encode_chunk_frame_into, encode_control_frame, CHUNK_FRAME_MIN_SIZE};
 use crate::core::pipeline::chunk::ChunkBitmap;
@@ -143,9 +144,7 @@ async fn wait_for_buffer_space(dc: &Arc<RTCDataChannel>, next_msg_size: usize) -
         "Applying backpressure - waiting for buffer to drain"
     );
 
-    const MAX_WAIT: Duration = Duration::from_secs(10);
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
-    let deadline = std::time::Instant::now() + MAX_WAIT;
+    let deadline = std::time::Instant::now() + DC_BACKPRESSURE_MAX_WAIT;
 
     loop {
         if dc.ready_state() != RTCDataChannelState::Open {
@@ -160,7 +159,7 @@ async fn wait_for_buffer_space(dc: &Arc<RTCDataChannel>, next_msg_size: usize) -
         if std::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(DC_BACKPRESSURE_POLL_INTERVAL).await;
     }
 
     if dc.ready_state() == RTCDataChannelState::Open {

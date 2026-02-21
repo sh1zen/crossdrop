@@ -141,8 +141,8 @@ impl Handler for RemotePanel {
                             };
 
                             let save_dir = std::env::current_dir()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|_| ".".to_string());
+                                .map(|p| p.join(&entry.name).display().to_string())
+                                .unwrap_or_else(|_| entry.name.clone());
                             app.remote.path_request = Some(RemotePathRequest {
                                 peer_id: peer_id.clone(),
                                 name: entry.name.clone(),
@@ -198,8 +198,8 @@ impl Handler for RemotePanel {
                             };
 
                             let save_dir = std::env::current_dir()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|_| ".".to_string());
+                                .map(|p| p.join(&entry.name).display().to_string())
+                                .unwrap_or_else(|_| entry.name.clone());
                             app.remote.path_request = Some(RemotePathRequest {
                                 peer_id: peer_id.clone(),
                                 name: entry.name.clone(),

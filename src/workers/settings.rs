@@ -2,8 +2,9 @@ use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
 /// Available UI themes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum AppTheme {
+    #[default]
     Default,
     Blue,
     Green,
