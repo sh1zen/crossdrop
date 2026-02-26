@@ -138,10 +138,7 @@ impl FileLogLayer {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             writer: Arc::new(Mutex::new(file)),
         })
@@ -166,7 +163,11 @@ impl<S: Subscriber> Layer<S> for FileLogLayer {
 // ── Helper Functions ───────────────────────────────────────────────────────────
 
 /// Create a log entry from a tracing event.
-fn create_log_entry<F>(event: &Event<'_>, meta: &tracing::Metadata<'_>, format_timestamp: F) -> LogEntry
+fn create_log_entry<F>(
+    event: &Event<'_>,
+    meta: &tracing::Metadata<'_>,
+    format_timestamp: F,
+) -> LogEntry
 where
     F: FnOnce() -> String,
 {
@@ -201,7 +202,9 @@ fn format_timestamp_time_only() -> String {
 
 /// Format timestamp as ISO 8601 with timezone (for file logging).
 fn format_timestamp_iso8601() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        .to_string()
 }
 
 /// Convert log level to string representation.

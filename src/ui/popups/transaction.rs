@@ -22,20 +22,12 @@ fn cycle_focus(current: usize, forward: bool) -> usize {
 }
 
 /// Result of handling a transaction offer key event.
+#[derive(Default)]
 pub struct TransactionOfferResult {
     /// Whether the app should quit.
     pub quit: bool,
     /// Engine actions to execute.
     pub actions: Vec<EngineAction>,
-}
-
-impl Default for TransactionOfferResult {
-    fn default() -> Self {
-        Self {
-            quit: false,
-            actions: Vec::new(),
-        }
-    }
 }
 
 /// Handle keyboard events for the transaction offer popup.
@@ -135,17 +127,17 @@ pub async fn handle_transaction_offer_key(
             }
         }
         KeyCode::Backspace => {
-            if let Some(pi) = app.engine.pending_incoming_mut() {
-                if pi.path_editing {
-                    pi.save_path_input.pop();
-                }
+            if let Some(pi) = app.engine.pending_incoming_mut()
+                && pi.path_editing
+            {
+                pi.save_path_input.pop();
             }
         }
         KeyCode::Char(c) => {
-            if let Some(pi) = app.engine.pending_incoming_mut() {
-                if pi.path_editing {
-                    pi.save_path_input.push(c);
-                }
+            if let Some(pi) = app.engine.pending_incoming_mut()
+                && pi.path_editing
+            {
+                pi.save_path_input.push(c);
             }
         }
         KeyCode::Esc => {

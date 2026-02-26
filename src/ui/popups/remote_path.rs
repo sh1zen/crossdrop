@@ -23,15 +23,10 @@ fn cycle_focus(current: usize, forward: bool) -> usize {
 }
 
 /// Result of handling a remote path request key event.
+#[derive(Default)]
 pub struct RemotePathResult {
     /// Whether the app should quit.
     pub quit: bool,
-}
-
-impl Default for RemotePathResult {
-    fn default() -> Self {
-        Self { quit: false }
-    }
 }
 
 /// Handle keyboard events for the remote path request popup (file or folder).
@@ -50,12 +45,12 @@ pub async fn handle_remote_path_request_key(
             }
         }
         KeyCode::Enter => {
-            if let Some(req) = &mut app.state.remote.path_request {
-                if req.is_path_editing {
-                    req.button_focus = 0;
-                    req.is_path_editing = false;
-                    return RemotePathResult::default();
-                }
+            if let Some(req) = &mut app.state.remote.path_request
+                && req.is_path_editing
+            {
+                req.button_focus = 0;
+                req.is_path_editing = false;
+                return RemotePathResult::default();
             }
             let req = app.state.remote.path_request.take().unwrap();
             let button_focus = req.button_focus;
@@ -99,10 +94,10 @@ pub async fn handle_remote_path_request_key(
             }
         }
         KeyCode::Backspace => {
-            if let Some(req) = &mut app.state.remote.path_request {
-                if req.is_path_editing {
-                    req.save_path_input.pop();
-                }
+            if let Some(req) = &mut app.state.remote.path_request
+                && req.is_path_editing
+            {
+                req.save_path_input.pop();
             }
         }
         KeyCode::Char(c) => {
@@ -117,12 +112,12 @@ pub async fn handle_remote_path_request_key(
             }
         }
         KeyCode::Esc => {
-            if let Some(req) = &mut app.state.remote.path_request {
-                if req.is_path_editing {
-                    req.button_focus = 0;
-                    req.is_path_editing = false;
-                    return RemotePathResult::default();
-                }
+            if let Some(req) = &mut app.state.remote.path_request
+                && req.is_path_editing
+            {
+                req.button_focus = 0;
+                req.is_path_editing = false;
+                return RemotePathResult::default();
             }
             let req = app.state.remote.path_request.take().unwrap();
             *active_popup = UIPopup::None;

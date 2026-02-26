@@ -126,9 +126,10 @@ impl Args {
 // ── Relay Mode Option ──────────────────────────────────────────────────────────
 
 /// Available command line options for configuring relays.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum RelayModeOption {
     Disabled,
+    #[default]
     Default,
     Custom(RelayUrl),
 }
@@ -162,11 +163,5 @@ impl From<RelayModeOption> for RelayMode {
             RelayModeOption::Default => RelayMode::Default,
             RelayModeOption::Custom(url) => RelayMode::Custom(url.into()),
         }
-    }
-}
-
-impl Default for RelayModeOption {
-    fn default() -> Self {
-        Self::Default
     }
 }

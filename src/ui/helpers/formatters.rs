@@ -30,7 +30,9 @@ pub fn short_peer_id(id: &str) -> String {
 
 /// Gets display name for a peer, falling back to shortened ID
 pub fn get_display_name(app: &App, id: &str) -> String {
-    app.state.peers.names
+    app.state
+        .peers
+        .names
         .get(id)
         .cloned()
         .unwrap_or_else(|| short_peer_id(id))

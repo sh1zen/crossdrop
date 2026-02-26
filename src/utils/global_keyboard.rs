@@ -32,8 +32,15 @@ impl GlobalKeyboardListener {
         let (tx, rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
         let enabled = Arc::new(AtomicBool::new(false));
-        
-        (Self { tx, running, enabled }, rx)
+
+        (
+            Self {
+                tx,
+                running,
+                enabled,
+            },
+            rx,
+        )
     }
 
     /// Start listening for global keyboard events.
@@ -48,7 +55,10 @@ impl GlobalKeyboardListener {
         let running = self.running.clone();
         let enabled = self.enabled.clone();
 
-        info!(event = "global_keyboard_start", "Starting global keyboard listener");
+        info!(
+            event = "global_keyboard_start",
+            "Starting global keyboard listener"
+        );
 
         std::thread::spawn(move || {
             let callback = move |event: Event| {
@@ -71,10 +81,8 @@ impl GlobalKeyboardListener {
                 }
 
                 // Only send key press events (not releases)
-                if is_press {
-                    if tx.send(CapturedKey { key }).is_err() {
-                        debug!("Global keyboard listener channel closed");
-                    }
+                if is_press && tx.send(CapturedKey { key }).is_err() {
+                    debug!("Global keyboard listener channel closed");
                 }
             };
 
@@ -86,7 +94,10 @@ impl GlobalKeyboardListener {
 
     /// Stop listening for global keyboard events.
     pub fn stop(&self) {
-        info!(event = "global_keyboard_stop", "Stopping global keyboard listener");
+        info!(
+            event = "global_keyboard_stop",
+            "Stopping global keyboard listener"
+        );
         self.running.store(false, Ordering::SeqCst);
     }
 
@@ -143,7 +154,7 @@ fn key_to_string(key: Key) -> String {
         Key::KeyX => "x",
         Key::KeyY => "y",
         Key::KeyZ => "z",
-        
+
         // Numbers
         Key::Num0 => "0",
         Key::Num1 => "1",
@@ -155,7 +166,7 @@ fn key_to_string(key: Key) -> String {
         Key::Num7 => "7",
         Key::Num8 => "8",
         Key::Num9 => "9",
-        
+
         // Function keys (F1-F12 are supported by rdev)
         Key::F1 => "F1",
         Key::F2 => "F2",
@@ -169,7 +180,7 @@ fn key_to_string(key: Key) -> String {
         Key::F10 => "F10",
         Key::F11 => "F11",
         Key::F12 => "F12",
-        
+
         // Special keys
         Key::Return => "Enter",
         Key::Escape => "Esc",
@@ -182,13 +193,13 @@ fn key_to_string(key: Key) -> String {
         Key::End => "End",
         Key::PageUp => "PageUp",
         Key::PageDown => "PageDown",
-        
+
         // Arrow keys
         Key::UpArrow => "Up",
         Key::DownArrow => "Down",
         Key::LeftArrow => "Left",
         Key::RightArrow => "Right",
-        
+
         // Symbols
         Key::Minus => "-",
         Key::Equal => "=",
@@ -200,7 +211,7 @@ fn key_to_string(key: Key) -> String {
         Key::Comma => ",",
         Key::Dot => ".",
         Key::Slash => "/",
-        
+
         // Modifiers (we still capture these but they're special)
         Key::ShiftLeft | Key::ShiftRight => "Shift",
         Key::ControlLeft | Key::ControlRight => "Ctrl",
@@ -210,12 +221,13 @@ fn key_to_string(key: Key) -> String {
         Key::CapsLock => "CapsLock",
         Key::NumLock => "NumLock",
         Key::ScrollLock => "ScrollLock",
-        
+
         // Other keys
         Key::PrintScreen => "PrintScreen",
         Key::Pause => "Pause",
-        
+
         // Unknown
         _ => "",
-    }.to_string()
+    }
+    .to_string()
 }

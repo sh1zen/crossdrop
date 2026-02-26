@@ -34,21 +34,21 @@ impl SendPanel {
 impl Component for SendPanel {
     fn on_focus(&mut self, app: &mut App, node: &PeerNode) {
         // Check liveness of the currently selected peer when entering the send panel
-        if let Some(peer_id) = app.selected_peer().cloned() {
-            if app.is_peer_online(&peer_id) {
-                let node = node.clone();
-                let pid = peer_id.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = node.check_peer_liveness(&pid).await {
-                        tracing::debug!(
-                            event = "send_panel_liveness_check_failed",
-                            peer = %pid,
-                            error = %e,
-                            "Peer failed liveness check on send panel focus"
-                        );
-                    }
-                });
-            }
+        if let Some(peer_id) = app.selected_peer().cloned()
+            && app.is_peer_online(&peer_id)
+        {
+            let node = node.clone();
+            let pid = peer_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = node.check_peer_liveness(&pid).await {
+                    tracing::debug!(
+                        event = "send_panel_liveness_check_failed",
+                        peer = %pid,
+                        error = %e,
+                        "Peer failed liveness check on send panel focus"
+                    );
+                }
+            });
         }
     }
 
@@ -60,7 +60,9 @@ impl Component for SendPanel {
 
         // Left panel: peer list
         let peer_items: Vec<ListItem> = app
-            .state.peers.list
+            .state
+            .peers
+            .list
             .iter()
             .enumerate()
             .map(|(i, p)| {
@@ -200,13 +202,15 @@ impl Handler for SendPanel {
             }
             KeyCode::Down => {
                 if !app.state.peers.list.is_empty() {
-                    app.state.peers.selected_idx = (app.state.peers.selected_idx + 1) % app.state.peers.list.len();
+                    app.state.peers.selected_idx =
+                        (app.state.peers.selected_idx + 1) % app.state.peers.list.len();
                 }
                 Some(Action::None)
             }
             KeyCode::Tab => {
                 if !app.state.peers.list.is_empty() {
-                    app.state.peers.selected_idx = (app.state.peers.selected_idx + 1) % app.state.peers.list.len();
+                    app.state.peers.selected_idx =
+                        (app.state.peers.selected_idx + 1) % app.state.peers.list.len();
                 }
                 Some(Action::None)
             }
@@ -221,15 +225,15 @@ impl Handler for SendPanel {
                     // Verify peer is actually connected before initiating transfer
                     let peer_id_for_check = peer_id.clone();
                     let is_connected = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            node.is_peer_connected(&peer_id_for_check).await
-                        })
+                        tokio::runtime::Handle::current()
+                            .block_on(async { node.is_peer_connected(&peer_id_for_check).await })
                     });
-                    
+
                     if !is_connected {
-                        return Some(Action::SetStatus(
-                            format!("Peer {} is not connected", get_display_name(app, &peer_id))
-                        ));
+                        return Some(Action::SetStatus(format!(
+                            "Peer {} is not connected",
+                            get_display_name(app, &peer_id)
+                        )));
                     }
                     // Clean up the path: trim whitespace and strip surrounding quotes
                     let path = app.state.transfer.send_file_path.trim().to_string();
@@ -272,17 +276,17 @@ impl Handler for SendPanel {
                                         let p = entry.path();
                                         if ft.is_dir() {
                                             collect_files_sync(root, &p, files, total);
-                                        } else if ft.is_file() {
-                                            if let Ok(meta) = std::fs::metadata(&p) {
-                                                let size = meta.len();
-                                                *total += size;
-                                                let relative = p
-                                                    .strip_prefix(root)
-                                                    .unwrap_or(&p)
-                                                    .to_string_lossy()
-                                                    .replace('\\', "/");
-                                                files.push((relative, size));
-                                            }
+                                        } else if ft.is_file()
+                                            && let Ok(meta) = std::fs::metadata(&p)
+                                        {
+                                            let size = meta.len();
+                                            *total += size;
+                                            let relative = p
+                                                .strip_prefix(root)
+                                                .unwrap_or(&p)
+                                                .to_string_lossy()
+                                                .replace('\\', "/");
+                                            files.push((relative, size));
                                         }
                                     }
                                 }

@@ -146,10 +146,7 @@ fn try_acquire_lock(lock_path: &Path) -> bool {
 
 /// Create a new lock file (atomic create-new operation).
 fn create_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 /// Write PID to lock file.
@@ -245,7 +242,10 @@ fn secret_key_slots() -> impl Iterator<Item = String> {
 }
 
 /// Try to acquire a secret key slot.
-fn try_acquire_secret_slot(base_dir: &Path, slot_name: &str) -> Option<(SecretKey, Option<InstanceGuard>)> {
+fn try_acquire_secret_slot(
+    base_dir: &Path,
+    slot_name: &str,
+) -> Option<(SecretKey, Option<InstanceGuard>)> {
     let key_path = base_dir.join(slot_name);
     let lock_path = base_dir.join(format!("{slot_name}.lock"));
 

@@ -95,8 +95,7 @@ pub use types::{AckContext, ConnectionMessage, ControlMessage, SignalingMessage}
 pub use types::{PendingHash, ReceiveFileState};
 
 pub use helpers::{
-    compress_data, decompress_data, decrypt_with, derive_chat_hmac_key,
-    encrypt_with,
+    compress_data, decompress_data, decrypt_with, derive_chat_hmac_key, encrypt_with,
 };
 // ── Frame-type constants ──────────────────────────────────────────────────────
 

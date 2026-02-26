@@ -39,6 +39,7 @@ type SharedDc = Arc<RwLock<Option<Arc<RTCDataChannel>>>>;
 // ── Connection State Shared Resources ────────────────────────────────────────
 
 /// Shared state for a WebRTC connection being initialized.
+#[allow(clippy::type_complexity)]
 struct ConnectionState {
     control_channel: SharedDc,
     data_channel: SharedDc,
@@ -51,6 +52,24 @@ struct ConnectionState {
     chat_recv_counter: Arc<RwLock<u64>>,
     file_ack_semaphore: Arc<Semaphore>,
     cancelled_transactions: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// Cumulative wire bytes received on the data channel; drives DataAck pacing.
+    data_rx_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// One-shot channels for the two-phase file-verification handshake.
+    file_decision_tx: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                Uuid,
+                tokio::sync::oneshot::Sender<super::types::ReceiverDecision>,
+            >,
+        >,
+    >,
+    /// Files pre-determined as identical by a receiver-side background Merkle check.
+    pre_skip_files:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, (std::path::PathBuf, [u8; 32])>>>,
+    /// File IDs for which this receiver already sent `FileSkip`.
+    skipped_files: Arc<tokio::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// Reverse index: file_id → transaction_id, for O(1) lookup.
+    file_to_transaction: Arc<tokio::sync::Mutex<std::collections::HashMap<Uuid, Uuid>>>,
 }
 
 /// Receiver-side state that must survive connection replacement.
@@ -92,6 +111,13 @@ impl ConnectionState {
             cancelled_transactions: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            data_rx_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            file_decision_tx: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            pre_skip_files: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            skipped_files: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            file_to_transaction: Arc::new(
+                tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
         }
     }
 
@@ -119,6 +145,11 @@ impl ConnectionState {
             file_ack_semaphore: Arc::clone(&self.file_ack_semaphore),
             remote_access_enabled,
             cancelled_transactions: Arc::clone(&self.cancelled_transactions),
+            data_rx_bytes: Arc::clone(&self.data_rx_bytes),
+            file_decision_tx: Arc::clone(&self.file_decision_tx),
+            pre_skip_files: Arc::clone(&self.pre_skip_files),
+            skipped_files: Arc::clone(&self.skipped_files),
+            file_to_transaction: Arc::clone(&self.file_to_transaction),
         }
     }
 
@@ -149,6 +180,11 @@ impl ConnectionState {
             awake_notify,
             file_ack_semaphore: self.file_ack_semaphore,
             cancelled_transactions: self.cancelled_transactions,
+            file_decision_tx: self.file_decision_tx,
+            pre_skip_files: self.pre_skip_files,
+            skipped_files: self.skipped_files,
+            prewarmed_hashes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            file_to_transaction: self.file_to_transaction,
         }
     }
 }
@@ -222,12 +258,11 @@ impl WebRTCConnection {
         pc.on_ice_gathering_state_change(Box::new(move |state| {
             let tx = Arc::clone(&tx);
             Box::pin(async move {
-                if state == RTCIceGathererState::Complete {
-                    if let Ok(mut guard) = tx.lock() {
-                        if let Some(tx) = guard.take() {
-                            let _ = tx.send(());
-                        }
-                    }
+                if state == RTCIceGathererState::Complete
+                    && let Ok(mut guard) = tx.lock()
+                    && let Some(tx) = guard.take()
+                {
+                    let _ = tx.send(());
                 }
             })
         }));
@@ -280,8 +315,9 @@ fn setup_connection_state_monitor(
                 RTCPeerConnectionState::Disconnected => {
                     warn!(
                         event = "webrtc_disconnected",
-                        role, "WebRTC transient disconnect (ICE may recover)"
+                        role, "WebRTC connection disconnected"
                     );
+                    let _ = tx.send(ConnectionMessage::Disconnected);
                 }
                 RTCPeerConnectionState::Closed => {
                     info!(
@@ -320,6 +356,7 @@ fn expect_sdp(msg: SignalingMessage, expected: &'static str) -> Result<RTCSessio
 impl WebRTCConnection {
     /// Shared setup for both `create_offer` and `accept_offer`:
     /// builds the WebRTC API, peer connection, connection state, and handler context.
+    #[allow(clippy::too_many_arguments)]
     async fn setup_peer(
         app_tx: &Option<mpsc::UnboundedSender<ConnectionMessage>>,
         shared_key: &Arc<RwLock<[u8; 32]>>,
@@ -350,6 +387,7 @@ impl WebRTCConnection {
         Ok((pc, state, ctx, key_manager))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_offer(
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,
         shared_key: Arc<RwLock<[u8; 32]>>,
@@ -392,6 +430,7 @@ impl WebRTCConnection {
         Ok((conn, SignalingMessage::Offer(gathered_sdp)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accept_offer(
         offer: SignalingMessage,
         app_tx: Option<mpsc::UnboundedSender<ConnectionMessage>>,

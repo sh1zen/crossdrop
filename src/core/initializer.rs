@@ -1,4 +1,5 @@
 use crate::core::connection::crypto::SessionKeyManager;
+use crate::core::connection::webrtc::types::FilePullRequestItem;
 use crate::core::connection::webrtc::{
     AckContext, ConnectionMessage, ControlMessage, SignalingMessage, WebRTCConnection,
 };
@@ -55,6 +56,7 @@ pub enum AppEvent {
         _filename: String,
         _total_chunks: u32,
         wire_bytes: u64,
+        chunks_sent: u32,
     },
     SendComplete {
         _peer_id: String,
@@ -125,13 +127,31 @@ pub enum AppEvent {
         transaction_id: Uuid,
         reason: Option<String>,
     },
+    TransactionManifestReceived {
+        peer_id: String,
+        transaction_id: Uuid,
+        manifest: TransactionManifest,
+        total_size: u64,
+    },
+    FilePullRequested {
+        peer_id: String,
+        transaction_id: Uuid,
+        file_id: Uuid,
+    },
+    FilePullBatchRequested {
+        peer_id: String,
+        transaction_id: Uuid,
+        requests: Vec<FilePullRequestItem>,
+    },
     ChunkRetransmitRequested {
         peer_id: String,
         file_id: Uuid,
         chunk_indices: Vec<u32>,
     },
     /// Unified acknowledgement received from peer.
-    AckReceived { context: AckContext },
+    AckReceived {
+        context: AckContext,
+    },
     Error(String),
     Info(String),
     Connecting {
@@ -249,6 +269,7 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             filename,
             total_chunks,
             wire_bytes,
+            chunks_sent,
             ..
         } => AppEvent::SendProgress {
             _peer_id: peer_id(),
@@ -256,6 +277,7 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             _filename: filename,
             _total_chunks: total_chunks,
             wire_bytes,
+            chunks_sent,
         },
         ConnectionMessage::SendComplete { file_id, success } => AppEvent::SendComplete {
             _peer_id: peer_id(),
@@ -340,6 +362,32 @@ fn map_connection_to_app_event(pid: &str, msg: ConnectionMessage) -> Option<AppE
             transaction_id,
             reason,
         },
+        ConnectionMessage::TransactionManifestReceived {
+            transaction_id,
+            manifest,
+            total_size,
+        } => AppEvent::TransactionManifestReceived {
+            peer_id: peer_id(),
+            transaction_id,
+            manifest,
+            total_size,
+        },
+        ConnectionMessage::FilePullRequested {
+            transaction_id,
+            file_id,
+        } => AppEvent::FilePullRequested {
+            peer_id: peer_id(),
+            transaction_id,
+            file_id,
+        },
+        ConnectionMessage::FilePullBatchRequested {
+            transaction_id,
+            requests,
+        } => AppEvent::FilePullBatchRequested {
+            peer_id: peer_id(),
+            transaction_id,
+            requests,
+        },
         ConnectionMessage::ChunkRetransmitRequested {
             file_id,
             chunk_indices,
@@ -379,7 +427,7 @@ impl PeerNode {
             )
             .await?,
         );
-        
+
         let initial_name = args.display_name.clone().unwrap_or_default();
         let (display_name_tx, display_name_rx) = tokio::sync::watch::channel(initial_name);
 
@@ -441,10 +489,10 @@ impl PeerNode {
                     disconnect_sent = true;
                 }
 
-                if let Some(event) = map_connection_to_app_event(&peer_id, msg) {
-                    if event_tx.send(event).is_err() {
-                        break;
-                    }
+                if let Some(event) = map_connection_to_app_event(&peer_id, msg)
+                    && event_tx.send(event).is_err()
+                {
+                    break;
                 }
             }
         });
@@ -668,7 +716,9 @@ impl PeerNode {
                 // Close our WebRTC peer connection so the remote side detects
                 // the dead half promptly instead of timing out.
                 let pc = webrtc_conn.peer_connection.clone();
-                tokio::spawn(async move { let _ = pc.close().await; });
+                tokio::spawn(async move {
+                    let _ = pc.close().await;
+                });
                 return Ok(());
             }
             peers.insert(
@@ -845,17 +895,15 @@ impl PeerNode {
                     tokio::spawn(async move {
                         if let Err(e) = this.handle_incoming(incoming).await {
                             error!(event = "incoming_connection_error", error = %e, "Incoming connection failed");
-                            let _ = this
-                                .event_tx
-                                .send(AppEvent::Error(format!("Incoming error: {e}")));
+                            // Do not send an AppEvent::Error to the UI for connection failures
+                            // This prevents the user from seeing "DataChannel 'control' is permanently closed"
+                            // as an application error
                         }
                     });
                 }
                 Ok(Err(e)) => {
                     error!(event = "accept_error", error = %e, "Accept loop error");
-                    let _ = self
-                        .event_tx
-                        .send(AppEvent::Error(format!("Accept error: {e}")));
+                    // Do not send an AppEvent::Error to the UI for accept loop errors
                 }
             }
         }
@@ -974,10 +1022,10 @@ impl PeerNode {
         file_id: Uuid,
         file_path: &str,
         filename: &str,
+        transaction_id: Option<Uuid>,
     ) -> Result<()> {
         let filesize = tokio::fs::metadata(file_path).await?.len();
         let conn = self.get_connection(peer_id).await?;
-        self.check_alive_or_disconnect(peer_id, &conn).await?;
 
         info!(
             "Sending file '{}' ({} bytes) to {} [txn file_id={}]",
@@ -988,6 +1036,7 @@ impl PeerNode {
             std::path::PathBuf::from(file_path),
             filesize,
             filename,
+            transaction_id,
         )
         .await
     }
@@ -999,10 +1048,10 @@ impl PeerNode {
         file_path: &str,
         filename: &str,
         bitmap: crate::core::pipeline::chunk::ChunkBitmap,
+        transaction_id: Option<Uuid>,
     ) -> Result<()> {
         let filesize = tokio::fs::metadata(file_path).await?.len();
         let conn = self.get_connection(peer_id).await?;
-        self.check_alive_or_disconnect(peer_id, &conn).await?;
 
         let missing_count = bitmap.missing_count();
         info!(
@@ -1015,94 +1064,9 @@ impl PeerNode {
             filesize,
             filename,
             bitmap,
+            transaction_id,
         )
         .await
-    }
-
-    pub async fn send_folder_data(
-        &self,
-        peer_id: &str,
-        transaction_id: Uuid,
-        file_entries: Vec<(Uuid, String, String)>, // (file_id, full_path, relative_path)
-    ) -> Result<()> {
-        let conn = self.get_connection(peer_id).await?;
-        self.check_alive_or_disconnect(peer_id, &conn).await?;
-
-        info!(
-            "Sending folder ({} files) to {} via Transaction protocol (async streaming)",
-            file_entries.len(),
-            peer_id
-        );
-
-        let peer_id_owned = peer_id.to_string();
-        let total_files = file_entries.len(); // used in error message below
-
-        for (idx, (file_id, full_path, relative_path)) in file_entries.into_iter().enumerate() {
-            // Check if the transaction was cancelled before sending each file.
-            if conn.is_transaction_cancelled(transaction_id).await {
-                info!(
-                    "Folder send cancelled for transaction {} — stopping after {} of {} files",
-                    transaction_id, idx, total_files
-                );
-                break;
-            }
-
-            // NOTE: The file-ACK semaphore is acquired inside send_file / send_file_resuming
-            // via wait_for_file_slot(). Do NOT acquire it here as well — a double acquisition
-            // would exhaust all MAX_PENDING_FILE_ACKS permits (each file uses 2 permits but
-            // only 1 is restored on FileReceived ACK), causing the transfer to deadlock
-            // after the first few files.
-
-            let full_path = std::path::PathBuf::from(&full_path);
-
-            let filesize = match tokio::fs::metadata(&full_path).await {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    error!(
-                        "Failed to stat file for folder transfer: {} — {}",
-                        full_path.display(),
-                        e
-                    );
-                    let _ = self.event_tx.send(AppEvent::SendComplete {
-                        _peer_id: peer_id_owned.clone(),
-                        file_id,
-                        success: false,
-                    });
-                    continue;
-                }
-            };
-
-            debug!(
-                "Sending file '{}' ({} bytes) [file_id={}]",
-                relative_path, filesize, file_id
-            );
-
-            if let Err(e) = conn
-                .send_file(file_id, full_path, filesize, &relative_path)
-                .await
-            {
-                let err_str = e.to_string();
-                error!(
-                    "Failed to send file '{}' [file_id={}]: {}",
-                    relative_path, file_id, err_str
-                );
-                let _ = self.event_tx.send(AppEvent::SendComplete {
-                    _peer_id: peer_id_owned.clone(),
-                    file_id,
-                    success: false,
-                });
-                if err_str.contains("permanently closed") || err_str.contains("not available") {
-                    let remaining = total_files.saturating_sub(idx + 1);
-                    error!(
-                        "Connection to peer lost — aborting remaining {} file(s) in folder transfer",
-                        remaining
-                    );
-                    break;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     // ── Transaction API ──────────────────────────────────────────────────
@@ -1284,6 +1248,69 @@ impl PeerNode {
             .await
     }
 
+    pub async fn send_transaction_manifest(
+        &self,
+        peer_id: &str,
+        transaction_id: Uuid,
+        manifest: TransactionManifest,
+        total_size: u64,
+    ) -> Result<()> {
+        let conn = self.get_connection(peer_id).await?;
+        conn.wait_data_channels_open()
+            .await
+            .context("Data channels not ready for transaction manifest")?;
+        conn.send_transaction_manifest(transaction_id, manifest, total_size)
+            .await
+    }
+
+    pub async fn request_file_pull_batch(
+        &self,
+        peer_id: &str,
+        transaction_id: Uuid,
+        requests: Vec<FilePullRequestItem>,
+    ) -> Result<()> {
+        let conn = self.get_connection(peer_id).await?;
+        conn.wait_data_channels_open()
+            .await
+            .context("Data channels not ready for batch file pull request")?;
+        conn.send_file_pull_batch_request(transaction_id, requests)
+            .await
+    }
+
+    pub async fn send_file_chunks_data(
+        &self,
+        peer_id: &str,
+        file_id: Uuid,
+        file_path: &str,
+        filename: &str,
+        chunk_indices: Vec<u32>,
+        transaction_id: Option<Uuid>,
+    ) -> Result<()> {
+        let filesize = tokio::fs::metadata(file_path).await?.len();
+        let conn = self.get_connection(peer_id).await?;
+        conn.send_file_chunks(
+            file_id,
+            std::path::PathBuf::from(file_path),
+            filesize,
+            filename,
+            chunk_indices,
+            transaction_id,
+        )
+        .await
+    }
+
+    pub async fn prewarm_file_data(
+        &self,
+        peer_id: &str,
+        file_id: Uuid,
+        file_path: &str,
+    ) -> Result<()> {
+        let filesize = tokio::fs::metadata(file_path).await?.len();
+        let conn = self.get_connection(peer_id).await?;
+        conn.prewarm_file_hashes(file_id, std::path::PathBuf::from(file_path), filesize)
+            .await
+    }
+
     /// Mark a transaction as cancelled on the connection so in-flight send tasks stop early.
     pub async fn mark_transaction_cancelled(&self, peer_id: &str, transaction_id: Uuid) {
         if let Some(conn) = self.try_get_connection(peer_id).await {
@@ -1369,7 +1396,7 @@ impl PeerNode {
         let path = std::path::PathBuf::from(file_path);
 
         if chunk_indices.is_empty() {
-            conn.send_file(file_id, path, filesize, &relative_path)
+            conn.send_file(file_id, path, filesize, &relative_path, Some(txn_id))
                 .await
         } else {
             conn.send_file_chunks(
@@ -1378,6 +1405,7 @@ impl PeerNode {
                 filesize,
                 &relative_path,
                 chunk_indices.to_vec(),
+                Some(txn_id),
             )
             .await
         }
@@ -1387,8 +1415,10 @@ impl PeerNode {
 
     pub async fn send_remote_key_event(&self, peer_id: &str, key: &str) -> Result<()> {
         if let Some(conn) = self.try_get_connection(peer_id).await {
-            conn.send_control(&ControlMessage::RemoteKeyEvent { key: key.to_string() })
-                .await?;
+            conn.send_control(&ControlMessage::RemoteKeyEvent {
+                key: key.to_string(),
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1471,6 +1501,21 @@ impl PeerNode {
         let conn = self.get_connection(peer_id).await?;
         for (file_id, dest_path) in files {
             conn.register_file_destination(file_id, dest_path).await;
+        }
+        Ok(())
+    }
+
+    /// Register files that the receiver has pre-determined are identical to a
+    /// locally-existing file.  When Metadata arrives for these files, the
+    /// control handler sends `FileSkip` immediately — no data is transferred.
+    pub async fn register_pre_skip_files(
+        &self,
+        peer_id: &str,
+        files: Vec<(Uuid, std::path::PathBuf, [u8; 32])>,
+    ) -> anyhow::Result<()> {
+        let conn = self.get_connection(peer_id).await?;
+        for (file_id, path, merkle_root) in files {
+            conn.register_pre_skip(file_id, path, merkle_root).await;
         }
         Ok(())
     }

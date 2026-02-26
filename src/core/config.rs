@@ -27,21 +27,20 @@ pub const CHUNK_SIZE: usize = 56 * 1024;
 /// Also controls the batch size for sending chunk hashes ahead of data.
 pub const PIPELINE_SIZE: usize = 64;
 
-/// Sender read-ahead buffer: max chunks prefetched from disk and queued
-/// for encryption+send.  Keeps the data channel saturated while the disk
-/// reads the next batch.
-pub const SENDER_READ_AHEAD_CHUNKS: usize = 64;
-
 /// Receiver write-buffer: max chunks held in memory before flushing a
 /// sequential run to disk.  Batching sequential writes reduces syscall
 /// overhead and improves throughput on rotational media.
-pub const RECEIVER_WRITE_BUFFER_CHUNKS: usize = 64;
+pub const RECEIVER_WRITE_BUFFER_CHUNKS: usize = 256;
 
 /// Maximum files in-flight (sent but not yet acknowledged via FileReceived).
 /// Sender pauses if this many files are pending ACK.
 /// Higher values improve throughput by overlapping the next file's transfer
 /// with the previous file's finalization on the receiver side.
 pub const MAX_PENDING_FILE_ACKS: usize = 5;
+
+/// Byte interval at which the receiver sends a `DataAck` and the sender
+/// acquires one flow-control permit.  5 permits × 20 MB = 100 MB max in-flight.
+pub const DATA_ACK_INTERVAL_BYTES: u64 = 20 * 1024 * 1024;
 
 /// AreYouAwake polling interval while sender is paused waiting for file ACKs.
 pub const FILE_ACK_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -80,7 +79,7 @@ pub const MAX_PENDING_FILE_IDS: usize = 16;
 /// Explicit large SCTP max message size (1 MiB).
 /// Using a concrete value instead of Unbounded (0) because some WebRTC
 /// implementations interpret 0 as "use default 64 KB" rather than unlimited.
-pub const SCTP_MAX_MESSAGE_SIZE: u32 = 1 * 1024 * 1024;
+pub const SCTP_MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 
 /// Whether to allow loopback connections (same-machine testing).
 pub const SCTP_USE_LOOPBACK: bool = false;
@@ -90,13 +89,6 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout waiting for the data channel to open.
 pub const DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum retries when the data channel is transiently not open during a file send.
-/// Prevents aborting an entire transfer on a momentary SCTP hiccup.
-pub const DC_SEND_MAX_RETRIES: u32 = 10;
-
-/// Timeout for waiting for a data channel to reopen during a send retry.
-pub const DC_REOPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum wait time for backpressure to clear before proceeding anyway.
 pub const DC_BACKPRESSURE_MAX_WAIT: Duration = Duration::from_secs(10);
@@ -109,7 +101,7 @@ pub const DC_BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// transmission until the buffer drains below the low watermark.
 /// 4 MB provides enough headroom to keep the SCTP transport saturated
 /// on fast links while still protecting slow links (TURN relays, mobile).
-pub const DC_BUFFERED_AMOUNT_HIGH: usize = 4 * 1024 * 1024; // 4 MB
+pub const DC_BUFFERED_AMOUNT_HIGH: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Timeout for ICE candidate gathering.
 pub const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);

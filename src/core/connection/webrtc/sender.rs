@@ -1,19 +1,15 @@
-//! Sender: TX operations — sending files, messages, control frames.
+//! Sender: TX operations - messaging, control frames, and transport primitives.
 
 use super::{
-    compress_data, derive_chat_hmac_key, encrypt_with, ConnectionMessage, ControlMessage,
-    WebRTCConnection, CHAT_HMAC_CHANNEL,
+    compress_data, derive_chat_hmac_key, encrypt_with, ControlMessage, WebRTCConnection,
+    CHAT_HMAC_CHANNEL,
 };
 use crate::core::config::{
-    CHUNK_SIZE, DC_BACKPRESSURE_MAX_WAIT, DC_BACKPRESSURE_POLL_INTERVAL, DC_BUFFERED_AMOUNT_HIGH,
-    DC_REOPEN_TIMEOUT, DC_SEND_MAX_RETRIES, FILE_ACK_POLL_INTERVAL, MAX_PENDING_FILE_ACKS,
-    PIPELINE_SIZE,
+    DC_BACKPRESSURE_MAX_WAIT, DC_BACKPRESSURE_POLL_INTERVAL, DC_BUFFERED_AMOUNT_HIGH,
 };
-use crate::core::connection::webrtc::data::{
-    encode_chunk_frame_into, encode_control_frame, CHUNK_FRAME_MIN_SIZE,
-};
+use crate::core::connection::webrtc::data::encode_control_frame;
+use crate::core::connection::webrtc::types::FilePullRequestItem;
 use crate::core::pipeline::chunk::ChunkBitmap;
-use crate::core::pipeline::merkle::IncrementalMerkleBuilder;
 use crate::core::security::message_auth::MessageAuthenticator;
 use crate::core::transaction::TransactionManifest;
 use aes_gcm::{aead::KeyInit, Aes256Gcm};
@@ -23,19 +19,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
-use crate::core::helpers::compute_total_chunks;
-// ── Wire-level send primitives ────────────────────────────────────────────────
 
 /// Outcome of a single encrypted send: wire bytes written.
 type WireBytes = usize;
 
-/// Shared arguments for the hot-path encrypted send functions.
-/// Groups the data channel + wire counter together to reduce parameter lists.
 struct SendTarget<'a> {
     dc: &'a Arc<RTCDataChannel>,
     wire_tx: &'a Arc<AtomicU64>,
@@ -46,7 +37,6 @@ impl<'a> SendTarget<'a> {
         Self { dc, wire_tx }
     }
 
-    /// Verify the channel is `Open`; return an error otherwise.
     fn assert_open(&self) -> Result<()> {
         let state = self.dc.ready_state();
         if state == RTCDataChannelState::Open {
@@ -61,16 +51,11 @@ impl<'a> SendTarget<'a> {
         }
     }
 
-    /// Account for bytes that left the wire.
     fn record(&self, n: usize) {
         self.wire_tx.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
 
-/// Build the on-wire frame: `[compress_flag] ++ encrypted([maybe_compressed] plaintext)`.
-///
-/// When `compress=false` the flag byte is `0x00` and no intermediate copy is made.
-/// When `compress=true`  the flag byte is `0x01` and plaintext is compressed first.
 fn build_wire_frame_cipher(
     cipher: &Aes256Gcm,
     plaintext: &[u8],
@@ -104,9 +89,6 @@ fn prepend_flag(flag: u8, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-// ── Backpressure ──────────────────────────────────────────────────────────────
-
-/// Poll until the SCTP send buffer has room for `next_msg_size` bytes, or time out.
 async fn wait_for_buffer_space(dc: &Arc<RTCDataChannel>, next_msg_size: usize) -> Result<()> {
     let state = dc.ready_state();
     if state != RTCDataChannelState::Open {
@@ -156,14 +138,7 @@ async fn wait_for_buffer_space(dc: &Arc<RTCDataChannel>, next_msg_size: usize) -
     }
 }
 
-// ── WebRTCConnection send methods ────────────────────────────────────────────
-
 impl WebRTCConnection {
-    // ── Low-level encrypted send ──────────────────────────────────────────
-
-    /// Send an encrypted frame on a data channel (derives cipher per call).
-    ///
-    /// Wire format: `[0x00|0x01] ++ AES-256-GCM([maybe_compressed] plaintext)`
     pub async fn send_encrypted(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
@@ -181,9 +156,6 @@ impl WebRTCConnection {
         Ok(n)
     }
 
-    /// Send an encrypted frame using a pre-initialized cipher (hot-path variant).
-    ///
-    /// Includes backpressure: blocks if the SCTP send buffer is above the high watermark.
     pub async fn send_encrypted_with_cipher(
         dc: &Arc<RTCDataChannel>,
         cipher: &Aes256Gcm,
@@ -201,7 +173,6 @@ impl WebRTCConnection {
         Ok(n)
     }
 
-    /// Wait for `dc` to enter `Open` state, retrying up to `max_retries` times.
     pub async fn wait_for_data_channel_open(
         dc: &Arc<RTCDataChannel>,
         max_retries: u32,
@@ -245,9 +216,6 @@ impl WebRTCConnection {
         }
     }
 
-    // ── Control channel helpers ───────────────────────────────────────────
-
-    /// Encode, compress, and encrypt a control message; return wire bytes sent.
     pub async fn send_control_counted(&self, msg: &ControlMessage) -> Result<u64> {
         let dc = self
             .control_channel
@@ -262,12 +230,10 @@ impl WebRTCConnection {
             .map(|n| n as u64)
     }
 
-    /// Encode and send a control message; discard the byte count.
     pub async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
         self.send_control_counted(msg).await.map(|_| ())
     }
 
-    /// Send a control message on an arbitrary data channel (static helper).
     pub async fn send_control_on(
         dc: &Arc<RTCDataChannel>,
         key: &[u8; 32],
@@ -279,23 +245,18 @@ impl WebRTCConnection {
         Ok(())
     }
 
-    // ── Public messaging API ──────────────────────────────────────────────
-
-    /// Send an HMAC-authenticated, encrypted chat broadcast.
     pub async fn send_message(&self, bytes: Vec<u8>) -> Result<()> {
         let envelope = self.build_authenticated_envelope(bytes).await?;
         self.send_control(&ControlMessage::AuthenticatedText(envelope))
             .await
     }
 
-    /// Send an HMAC-authenticated, encrypted direct message.
     pub async fn send_dm(&self, bytes: Vec<u8>) -> Result<()> {
         let envelope = self.build_authenticated_envelope(bytes).await?;
         self.send_control(&ControlMessage::AuthenticatedDm(envelope))
             .await
     }
 
-    /// Build and serialize an `AuthenticatedMessage` envelope.
     async fn build_authenticated_envelope(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         let key = *self.shared_key.read().await;
         let hmac_key = derive_chat_hmac_key(&key);
@@ -315,374 +276,6 @@ impl WebRTCConnection {
     pub async fn send_display_name(&self, name: String) -> Result<()> {
         self.send_control(&ControlMessage::DisplayName(name)).await
     }
-
-    // ── File send API ─────────────────────────────────────────────────────
-
-    /// Send a complete file; delegates to `send_file_resuming` with `start_chunk = 0`.
-    pub async fn send_file(
-        &self,
-        file_id: Uuid,
-        file_path: impl Into<PathBuf>,
-        filesize: u64,
-        filename: impl Into<String>,
-    ) -> Result<()> {
-        info!(
-            event = "send_file_called",
-            %file_id,
-            filesize,
-            "send_file called - will send Metadata with this file_id"
-        );
-        self.send_file_resuming(file_id, file_path, filesize, filename, 0)
-            .await
-    }
-
-    /// Send a file, skipping already-sent chunks (`0..start_chunk`).
-    ///
-    /// Uses a streaming disk reader with a prefetch buffer to avoid loading the
-    /// full file into memory.  Chunk hashes are sent in batches ahead of their
-    /// data chunks so the receiver can start incremental Merkle verification.
-    pub async fn send_file_resuming(
-        &self,
-        file_id: Uuid,
-        file_path: impl Into<PathBuf>,
-        filesize: u64,
-        filename: impl Into<String>,
-        start_chunk: u32,
-    ) -> Result<()> {
-        let filename = filename.into();
-        let file_path = file_path.into();
-
-        // Acquire a slot before starting: limits in-flight unACKed files and probes
-        // liveness if the receiver stops acknowledging for FILE_ACK_POLL_INTERVAL.
-        self.wait_for_file_slot().await?;
-
-        self.wait_data_channels_open().await?;
-
-        let dc = self
-            .data_channel
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("Data channel not available"))?;
-
-        let total_chunks = compute_total_chunks(filesize);
-
-        // Send metadata first; include its wire bytes in the first progress report.
-        info!(
-            event = "send_file_metadata",
-            %file_id,
-            %filename,
-            filesize,
-            total_chunks,
-            "Sending Metadata control message"
-        );
-        let mut batch_wire: u64 = self
-            .send_control_counted(&ControlMessage::Metadata {
-                file_id,
-                total_chunks,
-                filename: filename.clone(),
-                filesize,
-            })
-            .await?;
-
-        // Give the Metadata frame a head-start on the control channel.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        info!(
-            event = "file_send_start",
-            %file_id, %filename, filesize, total_chunks, start_chunk,
-            "Starting file send with incremental Merkle"
-        );
-
-        let (mut chunk_rx, reader_handle) = crate::core::pipeline::sender::spawn_reader(
-            file_path.clone(),
-            filesize,
-            total_chunks,
-            CHUNK_SIZE,
-            start_chunk,
-        );
-
-        debug!(event = "reader_spawned", %file_id, "Disk reader spawned");
-
-        let key = *self.shared_key.read().await;
-        let cipher = make_cipher(&key)?;
-        let mut chunk_frame_buf = chunk_frame_buf();
-        let mut merkle = IncrementalMerkleBuilder::with_capacity(total_chunks as usize);
-
-        // Pending hash / chunk batches: hashes are sent before their data.
-        let mut hash_batch: Vec<[u8; 32]> = Vec::with_capacity(PIPELINE_SIZE);
-        let mut hash_batch_start: u32 = 0;
-        let mut chunk_batch: Vec<(u32, Vec<u8>)> = Vec::with_capacity(PIPELINE_SIZE);
-
-        let mut batch_count: u32 = 0;
-
-        while let Some(rc) = chunk_rx.recv().await {
-            merkle.add_leaf(rc.hash);
-
-            if hash_batch.is_empty() {
-                hash_batch_start = rc.seq;
-            }
-            hash_batch.push(rc.hash);
-            chunk_batch.push((rc.seq, rc.data.to_vec()));
-
-            if hash_batch.len() >= PIPELINE_SIZE {
-                batch_wire += self
-                    .flush_hash_batch(file_id, hash_batch_start, &mut hash_batch)
-                    .await?;
-
-                for (seq, data) in chunk_batch.drain(..) {
-                    batch_wire += self
-                        .send_chunk_with_retry(
-                            &dc,
-                            &cipher,
-                            &mut chunk_frame_buf,
-                            file_id,
-                            seq,
-                            &data,
-                        )
-                        .await? as u64;
-                    batch_count += 1;
-                }
-
-                if batch_count >= PIPELINE_SIZE as u32 {
-                    self.report_progress(file_id, &filename, total_chunks, batch_wire);
-                    batch_wire = 0;
-                    batch_count = 0;
-                }
-            }
-        }
-
-        // Final progress for any incomplete batch
-        if batch_count > 0 || batch_wire > 0 {
-            self.report_progress(file_id, &filename, total_chunks, batch_wire);
-        }
-
-        // Await reader completion.
-        let _reader_result = reader_handle
-            .await
-            .map_err(|e| anyhow!("Reader task panicked: {}", e))?
-            .map_err(|e| anyhow!("Reader error: {}", e))?;
-
-        // Flush any leftover hash/chunk batches.
-        let mut tail_wire: u64 = 0;
-        if !hash_batch.is_empty() {
-            tail_wire += self
-                .flush_hash_batch(file_id, hash_batch_start, &mut hash_batch)
-                .await?;
-
-            for (seq, data) in chunk_batch.drain(..) {
-                tail_wire += self
-                    .send_chunk_with_retry(&dc, &cipher, &mut chunk_frame_buf, file_id, seq, &data)
-                    .await? as u64;
-            }
-        }
-
-        let merkle_root = *merkle.build().root();
-        info!(
-            event = "merkle_tree_built",
-            %file_id,
-            chunk_count = total_chunks,
-            "Built Merkle tree incrementally during send"
-        );
-
-        tail_wire += self
-            .send_control_counted(&ControlMessage::Hash {
-                file_id,
-                merkle_root,
-            })
-            .await?;
-
-        if tail_wire > 0 {
-            self.report_progress(file_id, &filename, total_chunks, tail_wire);
-        }
-
-        Ok(())
-    }
-
-    /// Send only the specified chunks of a file (targeted retransmission).
-    pub async fn send_file_chunks(
-        &self,
-        file_id: Uuid,
-        file_path: impl Into<PathBuf>,
-        filesize: u64,
-        filename: impl Into<String>,
-        chunk_indices: Vec<u32>,
-    ) -> Result<()> {
-        let filename = filename.into();
-        let file_path = file_path.into();
-
-        self.wait_data_channels_open().await?;
-
-        let dc = self
-            .data_channel
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("Data channel not available"))?;
-
-        let total_chunks = compute_total_chunks(filesize);
-
-        info!(
-            event = "file_chunks_send_start",
-            %file_id, %filename, chunks = ?chunk_indices,
-            "Sending specific chunks for retransmission"
-        );
-
-        let key = *self.shared_key.read().await;
-        let cipher = make_cipher(&key)?;
-        let mut file = tokio::fs::File::open(&file_path).await?;
-        let mut frame_buf = chunk_frame_buf();
-
-        for seq in chunk_indices {
-            if seq >= total_chunks {
-                warn!(event = "invalid_chunk_index", %file_id, seq, total_chunks, "Skipping invalid chunk index");
-                continue;
-            }
-
-            let buf = read_chunk(&mut file, filesize, seq).await?;
-            encode_chunk_frame_into(&mut frame_buf, file_id, seq, &buf);
-
-            let wb =
-                Self::send_encrypted_with_cipher(&dc, &cipher, &frame_buf, false, &self.wire_tx)
-                    .await?;
-
-            if let Some(tx) = &self.app_tx {
-                let _ = tx.send(ConnectionMessage::SendProgress {
-                    file_id,
-                    filename: filename.clone(),
-                    total_chunks,
-                    wire_bytes: wb as u64,
-                });
-            }
-        }
-
-        info!(event = "file_chunks_send_complete", %file_id, %filename, "Completed sending requested chunks");
-        Ok(())
-    }
-
-    /// Send missing chunks according to a bitmap (non-contiguous resume).
-    ///
-    /// All chunk hashes are computed for Merkle correctness; only missing chunks
-    /// are sent over the wire.
-    pub async fn send_file_with_bitmap(
-        &self,
-        file_id: Uuid,
-        file_path: impl Into<PathBuf>,
-        filesize: u64,
-        filename: impl Into<String>,
-        bitmap: ChunkBitmap,
-    ) -> Result<()> {
-        let filename = filename.into();
-        let file_path = file_path.into();
-
-        // Acquire a slot before starting (same backpressure as send_file_resuming).
-        self.wait_for_file_slot().await?;
-
-        self.wait_data_channels_open().await?;
-
-        let dc = self
-            .data_channel
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("Data channel not available"))?;
-
-        let total_chunks = compute_total_chunks(filesize);
-        let missing: Vec<u32> = bitmap.missing_chunks().collect();
-        let missing_count = missing.len() as u32;
-
-        if missing_count == 0 {
-            info!(event = "file_send_complete_all_chunks", %file_id, %filename, "All chunks already received, nothing to send");
-            return Ok(());
-        }
-
-        let mut batch_wire: u64 = self
-            .send_control_counted(&ControlMessage::Metadata {
-                file_id,
-                total_chunks,
-                filename: filename.clone(),
-                filesize,
-            })
-            .await?;
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        info!(
-            event = "file_send_resume_bitmap",
-            %file_id, %filename, filesize, total_chunks, missing_count,
-            "Resuming file send with bitmap ({} missing chunks)", missing_count
-        );
-
-        let key = *self.shared_key.read().await;
-        let cipher = make_cipher(&key)?;
-        let mut file = tokio::fs::File::open(&file_path).await?;
-        let mut frame_buf = chunk_frame_buf();
-        let mut merkle = IncrementalMerkleBuilder::with_capacity(total_chunks as usize);
-
-        let mut hash_batch: Vec<[u8; 32]> = Vec::with_capacity(PIPELINE_SIZE);
-        let mut hash_batch_start: u32 = 0;
-        let mut chunks_sent: u32 = 0;
-
-        for seq in 0..total_chunks {
-            let buf = read_chunk(&mut file, filesize, seq).await?;
-            let hash = crate::core::pipeline::merkle::hash_chunk(&buf);
-            merkle.add_leaf(hash);
-
-            if hash_batch.is_empty() {
-                hash_batch_start = seq;
-            }
-            hash_batch.push(hash);
-
-            if hash_batch.len() >= PIPELINE_SIZE {
-                batch_wire += self
-                    .flush_hash_batch(file_id, hash_batch_start, &mut hash_batch)
-                    .await?;
-            }
-
-            if !bitmap.is_set(seq) {
-                encode_chunk_frame_into(&mut frame_buf, file_id, seq, &buf);
-                let wb = Self::send_encrypted_with_cipher(
-                    &dc,
-                    &cipher,
-                    &frame_buf,
-                    false,
-                    &self.wire_tx,
-                )
-                .await?;
-                chunks_sent += 1;
-                batch_wire += wb as u64;
-
-                if chunks_sent % 20 == 0 {
-                    self.report_progress(file_id, &filename, total_chunks, batch_wire);
-                    batch_wire = 0;
-                }
-            }
-        }
-
-        // Flush remaining hashes.
-        if !hash_batch.is_empty() {
-            batch_wire += self
-                .flush_hash_batch(file_id, hash_batch_start, &mut hash_batch)
-                .await?;
-        }
-
-        // Send final Hash message with Merkle root.
-        let merkle_root = *merkle.build().root();
-
-        self.send_control(&ControlMessage::Hash {
-            file_id,
-            merkle_root,
-        })
-        .await?;
-
-        // Report final progress as complete.
-        self.report_progress(file_id, &filename, total_chunks, batch_wire);
-
-        info!(event = "file_send_resume_complete", %file_id, %filename, chunks_sent, "Completed file resume send");
-        Ok(())
-    }
-
-    // ── Transaction API ───────────────────────────────────────────────────
 
     pub async fn send_transaction_request(
         &self,
@@ -728,6 +321,32 @@ impl WebRTCConnection {
         .await
     }
 
+    pub async fn send_transaction_manifest(
+        &self,
+        transaction_id: Uuid,
+        manifest: TransactionManifest,
+        total_size: u64,
+    ) -> Result<()> {
+        self.send_control(&ControlMessage::TransactionManifest {
+            transaction_id,
+            manifest,
+            total_size,
+        })
+        .await
+    }
+
+    pub async fn send_file_pull_batch_request(
+        &self,
+        transaction_id: Uuid,
+        requests: Vec<FilePullRequestItem>,
+    ) -> Result<()> {
+        self.send_control(&ControlMessage::FilePullBatchRequest {
+            transaction_id,
+            requests,
+        })
+        .await
+    }
+
     pub async fn send_transaction_cancel(
         &self,
         transaction_id: Uuid,
@@ -766,7 +385,7 @@ impl WebRTCConnection {
         use crate::core::connection::crypto;
 
         if self.key_manager.is_none() {
-            return Err(anyhow!("No SessionKeyManager — cannot rotate keys"));
+            return Err(anyhow!("No SessionKeyManager - cannot rotate keys"));
         }
         let eph = crypto::prepare_rotation();
         let pub_bytes = eph.public.to_vec();
@@ -781,139 +400,9 @@ impl WebRTCConnection {
         );
         Ok(())
     }
-
-    // ── Private helpers ───────────────────────────────────────────────────
-
-    /// Flush a pending hash batch over the control channel; clears `batch`.
-    async fn flush_hash_batch(
-        &self,
-        file_id: Uuid,
-        start_index: u32,
-        batch: &mut Vec<[u8; 32]>,
-    ) -> Result<u64> {
-        let wb = self
-            .send_control_counted(&ControlMessage::ChunkHashBatch {
-                file_id,
-                start_index,
-                chunk_hashes: std::mem::take(batch),
-            })
-            .await?;
-        // Small delay: ensure hash batch arrives before the data chunks that follow.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        Ok(wb)
-    }
-
-    /// Send one chunk with retry logic for transient "channel not open" errors.
-    async fn send_chunk_with_retry(
-        &self,
-        dc: &Arc<RTCDataChannel>,
-        cipher: &Aes256Gcm,
-        frame_buf: &mut Vec<u8>,
-        file_id: Uuid,
-        seq: u32,
-        data: &[u8],
-    ) -> Result<WireBytes> {
-        encode_chunk_frame_into(frame_buf, file_id, seq, data);
-
-        let mut retries = 0u32;
-        loop {
-            match Self::send_encrypted_with_cipher(dc, cipher, frame_buf, false, &self.wire_tx)
-                .await
-            {
-                Ok(n) => return Ok(n),
-                Err(e) if e.to_string().contains("not open") && retries < DC_SEND_MAX_RETRIES => {
-                    retries += 1;
-                    warn!(
-                        event = "send_retry",
-                        %file_id, seq, retry = retries, max = DC_SEND_MAX_RETRIES, %e,
-                        "Data channel not open, waiting before retry"
-                    );
-                    Self::wait_for_data_channel_open(dc, DC_SEND_MAX_RETRIES - retries, DC_REOPEN_TIMEOUT)
-                        .await
-                        .map_err(|we| {
-                            error!(event = "channel_wait_failed", %file_id, error = %we, "Data channel failed to reopen");
-                            we
-                        })?;
-                }
-                Err(e) => {
-                    error!(event = "send_failed", %file_id, seq, retries, %e, "Failed to send chunk");
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Acquire a file-send slot before starting a new file transfer.
-    ///
-    /// The semaphore starts with `MAX_PENDING_FILE_ACKS` permits.  The sender
-    /// forgets the permit so that the ACK handler in `control.rs` can restore it
-    /// via `add_permits(1)` when `FileReceived` arrives.
-    ///
-    /// If all slots are occupied for longer than `FILE_ACK_POLL_INTERVAL`, the
-    /// peer is probed with `AreYouAwake`.  A failed probe propagates an error
-    /// back to the caller so the transfer task can be aborted.
-    async fn wait_for_file_slot(&self) -> Result<()> {
-        loop {
-            match tokio::time::timeout(FILE_ACK_POLL_INTERVAL, self.file_ack_semaphore.acquire())
-                .await
-            {
-                Ok(Ok(permit)) => {
-                    // forget() — the ACK handler restores the permit with add_permits(1).
-                    permit.forget();
-                    return Ok(());
-                }
-                Ok(Err(_)) => return Err(anyhow!("File ACK semaphore closed")),
-                Err(_) => {
-                    // All MAX_PENDING_FILE_ACKS slots in-flight with no ACK in time.
-                    warn!(
-                        event = "file_ack_slot_wait",
-                        pending = MAX_PENDING_FILE_ACKS,
-                        timeout = ?FILE_ACK_POLL_INTERVAL,
-                        "Waiting for file ACK slot — probing peer liveness"
-                    );
-                    self.check_peer_alive().await.map_err(|e| {
-                        anyhow!("Peer not responding while waiting for file ACK slot: {}", e)
-                    })?;
-                    // Peer is alive; loop and wait for the next permit.
-                }
-            }
-        }
-    }
-
-    /// Emit a `SendProgress` event if an app channel is registered.
-    fn report_progress(&self, file_id: Uuid, filename: &str, total_chunks: u32, wire_bytes: u64) {
-        if let Some(tx) = &self.app_tx {
-            let _ = tx.send(ConnectionMessage::SendProgress {
-                file_id,
-                filename: filename.to_owned(),
-                total_chunks,
-                wire_bytes,
-            });
-        }
-    }
 }
 
-// ── Module-level helpers ──────────────────────────────────────────────────────
-
-/// Create a reusable AES-256-GCM cipher from a 32-byte key.
 #[inline]
 fn make_cipher(key: &[u8; 32]) -> Result<Aes256Gcm> {
     Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("Failed to create AES cipher: {}", e))
-}
-
-/// Allocate the reusable chunk-frame buffer (header + max chunk payload).
-#[inline]
-fn chunk_frame_buf() -> Vec<u8> {
-    // 1 byte type tag + 16 bytes UUID + 4 bytes seq + CHUNK_SIZE data
-    Vec::with_capacity(CHUNK_FRAME_MIN_SIZE + CHUNK_SIZE)
-}
-
-/// Read exactly the bytes belonging to chunk `seq` from `file`.
-async fn read_chunk(file: &mut tokio::fs::File, filesize: u64, seq: u32) -> Result<Vec<u8>> {
-    let offset = seq as u64 * CHUNK_SIZE as u64;
-    let len = (CHUNK_SIZE as u64).min(filesize.saturating_sub(offset)) as usize;
-    file.seek(SeekFrom::Start(offset)).await?;
-    let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf).await?;
-    Ok(buf)
 }

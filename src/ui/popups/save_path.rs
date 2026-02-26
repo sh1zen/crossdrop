@@ -41,7 +41,7 @@ impl SavePathPopup {
     }
 
     /// Render the pending incoming transaction popup from the engine.
-    pub fn render_transaction_from_engine<'a>(&self, f: &mut Frame, app: &'a App) {
+    pub fn render_transaction_from_engine(&self, f: &mut Frame, app: &App) {
         if let Some(pi) = app.engine.pending_incoming() {
             let context = OfferContext::Transaction {
                 name: &pi.display_name,
@@ -58,7 +58,7 @@ impl SavePathPopup {
         }
     }
 
-    pub fn render_remote_path<'a>(&self, f: &mut Frame, app: &'a App) {
+    pub fn render_remote_path(&self, f: &mut Frame, app: &App) {
         if let Some(req) = &app.state.remote.path_request {
             let context = OfferContext::RemotePath {
                 name: &req.name,
@@ -67,7 +67,11 @@ impl SavePathPopup {
                 save_path: &req.save_path_input,
                 is_editing: req.is_path_editing,
                 button_focus: req.button_focus,
-                border_color: if req.is_folder { Color::Magenta } else { Color::Cyan },
+                border_color: if req.is_folder {
+                    Color::Magenta
+                } else {
+                    Color::Cyan
+                },
                 height: 12,
                 is_folder: req.is_folder,
             };
@@ -128,7 +132,11 @@ impl SavePathPopup {
                     button_focus,
                     is_folder,
                 ),
-                if is_folder { " Request Folder " } else { " Request File " },
+                if is_folder {
+                    " Request Folder "
+                } else {
+                    " Request File "
+                },
             ),
         };
 
@@ -302,7 +310,10 @@ impl SavePathPopup {
         vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled(format!("  {}: ", label), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("  {}: ", label),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     name.to_string(),
                     Style::default()

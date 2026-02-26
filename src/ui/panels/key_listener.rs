@@ -21,9 +21,7 @@ impl Default for KeyListenerPanel {
 
 impl KeyListenerPanel {
     pub fn new() -> Self {
-        Self {
-            scroll_offset: 0,
-        }
+        Self { scroll_offset: 0 }
     }
 }
 
@@ -73,12 +71,14 @@ impl Component for KeyListenerPanel {
             Color::DarkGray
         };
 
-        let header = Paragraph::new(status).style(Style::default().fg(status_color)).block(
-            Block::default()
-                .title(" Key Listener Status ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
+        let header = Paragraph::new(status)
+            .style(Style::default().fg(status_color))
+            .block(
+                Block::default()
+                    .title(" Key Listener Status ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
         f.render_widget(header, chunks[0]);
 
         // Build a text stream of all received keys
@@ -92,12 +92,12 @@ impl Component for KeyListenerPanel {
         // Split into lines for display
         let lines: Vec<&str> = text_content.split('\n').collect();
         let total_lines = lines.len();
-        
+
         // Apply scroll offset
         let visible_height = chunks[1].height.saturating_sub(2) as usize; // Account for borders
         let max_scroll = total_lines.saturating_sub(visible_height);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
-        
+
         let visible_lines: Vec<&str> = lines
             .iter()
             .skip(self.scroll_offset)
@@ -108,7 +108,10 @@ impl Component for KeyListenerPanel {
         let content = visible_lines.join("\n");
 
         let count = app.state.key_listener.remote_key_events.len();
-        let title = format!(" Received Key Events ({}) - Press 'c' to clear, ↑/↓ to scroll ", count);
+        let title = format!(
+            " Received Key Events ({}) - Press 'c' to clear, ↑/↓ to scroll ",
+            count
+        );
 
         let text_widget = Paragraph::new(content).block(
             Block::default()

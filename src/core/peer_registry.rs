@@ -103,16 +103,17 @@ impl PeerRegistry {
     /// Record that a peer has connected.
     pub fn peer_connected(&mut self, peer_id: &str, ticket: String) {
         let now = now_unix();
-        let entry = self.peers.entry(peer_id.to_string()).or_insert_with(|| {
-            PeerRecord {
+        let entry = self
+            .peers
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerRecord {
                 peer_id: peer_id.to_string(),
                 ticket: ticket.clone(),
                 display_name: None,
                 last_connected: now,
                 last_disconnected: None,
                 removed: false,
-            }
-        });
+            });
 
         entry.ticket = ticket;
         entry.last_connected = now;

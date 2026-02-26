@@ -49,7 +49,9 @@ impl Component for RemotePanel {
         f.render_widget(path_widget, chunks[0]);
 
         let items: Vec<ListItem> = app
-            .state.remote.entries
+            .state
+            .remote
+            .entries
             .iter()
             .enumerate()
             .map(|(i, entry)| {
@@ -107,12 +109,19 @@ impl Handler for RemotePanel {
             }
             KeyCode::Down => {
                 if !app.state.remote.entries.is_empty() {
-                    app.state.remote.selected = (app.state.remote.selected + 1) % app.state.remote.entries.len();
+                    app.state.remote.selected =
+                        (app.state.remote.selected + 1) % app.state.remote.entries.len();
                 }
                 Some(Action::None)
             }
             KeyCode::Enter => {
-                if let Some(entry) = app.state.remote.entries.get(app.state.remote.selected).cloned() {
+                if let Some(entry) = app
+                    .state
+                    .remote
+                    .entries
+                    .get(app.state.remote.selected)
+                    .cloned()
+                {
                     if entry.is_dir {
                         // Navigate into directory
                         let new_path = if app.state.remote.path.ends_with('/') {
@@ -188,31 +197,35 @@ impl Handler for RemotePanel {
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
                 // Show request folder popup
-                if let Some(entry) = app.state.remote.entries.get(app.state.remote.selected).cloned() {
-                    if entry.is_dir {
-                        if let Some(peer_id) = &app.state.remote.peer {
-                            let remote_path = if app.state.remote.path.ends_with('/') {
-                                format!("{}{}", app.state.remote.path, entry.name)
-                            } else {
-                                format!("{}/{}", app.state.remote.path, entry.name)
-                            };
+                if let Some(entry) = app
+                    .state
+                    .remote
+                    .entries
+                    .get(app.state.remote.selected)
+                    .cloned()
+                    && entry.is_dir
+                    && let Some(peer_id) = &app.state.remote.peer
+                {
+                    let remote_path = if app.state.remote.path.ends_with('/') {
+                        format!("{}{}", app.state.remote.path, entry.name)
+                    } else {
+                        format!("{}/{}", app.state.remote.path, entry.name)
+                    };
 
-                            let save_dir = std::env::current_dir()
-                                .map(|p| p.join(&entry.name).display().to_string())
-                                .unwrap_or_else(|_| entry.name.clone());
-                            app.state.remote.path_request = Some(RemotePathRequest {
-                                peer_id: peer_id.clone(),
-                                name: entry.name.clone(),
-                                size: entry.size,
-                                remote_path,
-                                save_path_input: save_dir,
-                                button_focus: 0,
-                                is_path_editing: false,
-                                is_folder: true,
-                            });
-                            return Some(Action::ShowPopup(UIPopup::RemotePathRequest));
-                        }
-                    }
+                    let save_dir = std::env::current_dir()
+                        .map(|p| p.join(&entry.name).display().to_string())
+                        .unwrap_or_else(|_| entry.name.clone());
+                    app.state.remote.path_request = Some(RemotePathRequest {
+                        peer_id: peer_id.clone(),
+                        name: entry.name.clone(),
+                        size: entry.size,
+                        remote_path,
+                        save_path_input: save_dir,
+                        button_focus: 0,
+                        is_path_editing: false,
+                        is_folder: true,
+                    });
+                    return Some(Action::ShowPopup(UIPopup::RemotePathRequest));
                 }
                 Some(Action::None)
             }

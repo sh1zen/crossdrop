@@ -46,14 +46,16 @@ impl Ticket {
             })
             .context("failed to decompress ticket")?;
 
-        let ticket: Self = serde_json::from_str(&s).map_err(|e| {
-            error!(
-                event = "ticket_deserialize_failure",
-                error = %e,
-                "Failed to deserialize ticket"
-            );
-            anyhow::anyhow!(e)
-        }).context("failed to deserialize ticket")?;
+        let ticket: Self = serde_json::from_str(&s)
+            .map_err(|e| {
+                error!(
+                    event = "ticket_deserialize_failure",
+                    error = %e,
+                    "Failed to deserialize ticket"
+                );
+                anyhow::anyhow!(e)
+            })
+            .context("failed to deserialize ticket")?;
 
         Ok(ticket)
     }

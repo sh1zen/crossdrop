@@ -1,5 +1,6 @@
 //! Receiver: RX operations — file finalization, hash verification, commit.
 use super::{AckContext, ConnectionMessage, ControlMessage, ReceiveFileState, WebRTCConnection};
+use crate::core::helpers::notify_app;
 use anyhow::Result;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -7,7 +8,6 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
-use crate::core::helpers::notify_app;
 // ── Verification result ───────────────────────────────────────────────────────
 
 /// Outcome of all integrity checks run after a file is fully received.

@@ -34,7 +34,7 @@ use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tracing::{info, warn};
 
 // ── Public result types ────────────────────────────────────────────────────────
@@ -176,6 +176,7 @@ impl StreamingFileWriter {
     }
 
     /// Shared field initialisation for both constructors.
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         file: fs::File,
         temp_path: PathBuf,
@@ -323,18 +324,34 @@ impl StreamingFileWriter {
     /// Drain any sequential run from `next_flush_seq`; warn on high watermark.
     /// Persists the bitmap to disk after each flush for crash resilience.
     async fn flush_buffer(&mut self) -> Result<()> {
-        while let Some(data) = self.write_buffer.remove(&self.next_flush_seq) {
-            let offset = self.next_flush_seq as u64 * CHUNK_SIZE as u64;
-            self.file.seek(SeekFrom::Start(offset)).await?;
-            self.file.write_all(&data).await?;
-
-            // Update the last persisted byte offset
-            self.last_persisted_byte_offset = offset + data.len() as u64;
-            self.next_flush_seq += 1;
+        loop {
+            if let Some(data) = self.write_buffer.remove(&self.next_flush_seq) {
+                let offset = self.next_flush_seq as u64 * CHUNK_SIZE as u64;
+                self.file.seek(SeekFrom::Start(offset)).await?;
+                self.file.write_all(&data).await?;
+                self.last_persisted_byte_offset = offset + data.len() as u64;
+                self.next_flush_seq += 1;
+            } else if self.next_flush_seq < self.total_chunks
+                && self.bitmap.is_set(self.next_flush_seq)
+            {
+                // Chunk was pre-filled directly (e.g. load_from_existing_file) —
+                // it is already on disk, so just advance the frontier.
+                self.next_flush_seq += 1;
+            } else {
+                break;
+            }
         }
 
-        // Persist the bitmap to disk for crash resilience
-        self.persist_bitmap().await?;
+        // Persist the bitmap to disk for crash resilience (fire-and-forget to
+        // avoid blocking the receive path on disk I/O).
+        let bitmap_bytes = self.bitmap.to_bytes();
+        let bitmap_path = self.bitmap_path.clone();
+        tokio::spawn(async move {
+            let tmp_path = bitmap_path.with_extension("bitmap.tmp");
+            if let Ok(()) = tokio::fs::write(&tmp_path, &bitmap_bytes).await {
+                let _ = tokio::fs::rename(&tmp_path, &bitmap_path).await;
+            }
+        });
 
         let buf_len = self.write_buffer.len();
         if buf_len >= RECEIVER_WRITE_BUFFER_CHUNKS {
@@ -354,26 +371,6 @@ impl StreamingFileWriter {
         Ok(())
     }
 
-    /// Persist the current bitmap to disk for crash-resilient resume.
-    ///
-    /// Uses a temp-file + rename pattern so that a crash during the write never
-    /// leaves a partially-written (corrupt) bitmap on disk.  A corrupt bitmap
-    /// would cause `detect_existing_progress` to return `None`, forcing a
-    /// full retransmission from chunk 0 instead of resuming from the last
-    /// confirmed chunk.
-    async fn persist_bitmap(&self) -> Result<()> {
-        let bitmap_bytes = self.bitmap.to_bytes();
-        let tmp_path = self.bitmap_path.with_extension("bitmap.tmp");
-        tokio::fs::write(&tmp_path, &bitmap_bytes).await?;
-        tokio::fs::rename(&tmp_path, &self.bitmap_path).await.map_err(|e| {
-            // Best-effort cleanup of the temp file on rename failure.
-            let tp = tmp_path.clone();
-            tokio::spawn(async move { let _ = tokio::fs::remove_file(&tp).await; });
-            e
-        })?;
-        Ok(())
-    }
-
     // ── Accessors ──────────────────────────────────────────────────────────────
 
     pub fn received_chunks(&self) -> u32 {
@@ -387,6 +384,89 @@ impl StreamingFileWriter {
     }
     pub fn bitmap(&self) -> &ChunkBitmap {
         &self.bitmap
+    }
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+    pub fn chunk_hashes(&self) -> &[Option<[u8; 32]>] {
+        &self.chunk_hashes
+    }
+    pub fn temp_path_ref(&self) -> &Path {
+        &self.temp_path
+    }
+    pub fn bitmap_path_ref(&self) -> &Path {
+        &self.bitmap_path
+    }
+
+    // ── Existing-file pre-fill ─────────────────────────────────────────────────
+
+    /// Copy matching chunks from `existing_path` into the temp file.
+    ///
+    /// For each chunk where `self.chunk_hashes[seq]` matches the hash computed
+    /// from `existing_path`, the chunk data is written directly to the temp file
+    /// and the chunk is marked as received in the bitmap.
+    ///
+    /// Returns a bitmap of all pre-matched chunks (usable as `FileHaveChunks`
+    /// payload so the sender can skip them in Phase 2).
+    pub async fn load_from_existing_file(&mut self, existing_path: &Path) -> Result<ChunkBitmap> {
+        let mut existing = fs::OpenOptions::new()
+            .read(true)
+            .open(existing_path)
+            .await?;
+        let existing_size = existing.metadata().await?.len();
+        let mut matched = ChunkBitmap::new(self.total_chunks);
+        let mut existing_cursor: u64 = 0;
+        let mut temp_cursor: u64 = 0;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+
+        for seq in 0..self.total_chunks {
+            // Chunks already received in this session are already on disk.
+            if self.bitmap.is_set(seq) {
+                matched.set(seq);
+                continue;
+            }
+
+            let offset = seq as u64 * CHUNK_SIZE as u64;
+            if offset >= existing_size {
+                break;
+            }
+
+            // Read chunk from existing file (seek only when needed to keep I/O mostly sequential).
+            let chunk_end = (offset + CHUNK_SIZE as u64).min(existing_size);
+            let chunk_len = (chunk_end - offset) as usize;
+            if existing_cursor != offset {
+                existing.seek(SeekFrom::Start(offset)).await?;
+                existing_cursor = offset;
+            }
+            existing.read_exact(&mut buf[..chunk_len]).await?;
+            existing_cursor += chunk_len as u64;
+
+            let existing_hash = crate::core::pipeline::merkle::hash_chunk(&buf[..chunk_len]);
+
+            // Compare with the hash the sender sent for this chunk.
+            if let Some(sender_hash) = self.chunk_hashes[seq as usize]
+                && existing_hash == sender_hash
+            {
+                // Write matching chunk directly to temp file.
+                if temp_cursor != offset {
+                    self.file.seek(SeekFrom::Start(offset)).await?;
+                    temp_cursor = offset;
+                }
+                self.file.write_all(&buf[..chunk_len]).await?;
+                temp_cursor += chunk_len as u64;
+                self.bitmap.set(seq);
+                self.received_chunks += 1;
+                matched.set(seq);
+            }
+        }
+
+        // Update next_flush_seq to the new contiguous prefix.
+        let new_frontier = (0..self.total_chunks)
+            .take_while(|&i| self.bitmap.is_set(i))
+            .count() as u32;
+        self.next_flush_seq = new_frontier;
+
+        Ok(matched)
     }
 
     // ── Finalization ───────────────────────────────────────────────────────────
@@ -452,14 +532,21 @@ impl FinalizedFile {
     /// Atomically move the temp file to its final destination.
     /// Also cleans up the bitmap file.
     pub async fn commit(self) -> Result<PathBuf> {
-        let Self { temp_path, bitmap_path, final_path, .. } = self;
-        if let Some(parent) = final_path.parent() {
-            if !parent.exists() {
-                let _ = fs::create_dir_all(parent).await;
-            }
+        let Self {
+            temp_path,
+            bitmap_path,
+            final_path,
+            ..
+        } = self;
+        if let Some(parent) = final_path.parent()
+            && !parent.exists()
+        {
+            let _ = fs::create_dir_all(parent).await;
         }
         if let Err(e) = fs::rename(&temp_path, &final_path).await {
-            tokio::spawn(async move { let _ = fs::remove_file(&temp_path).await; });
+            tokio::spawn(async move {
+                let _ = fs::remove_file(&temp_path).await;
+            });
             return Err(anyhow!("Failed to rename temp file to final path: {e}"));
         }
         // Clean up the bitmap file after successful commit

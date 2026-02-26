@@ -26,32 +26,44 @@ pub fn render_peer_info_popup(f: &mut Frame, app: &App) {
     let _short_id = short_peer_id(peer_id);
     let is_online = app.is_peer_online(peer_id);
     let status = if is_online { "Online" } else { "Offline" };
-    let status_color = if is_online { Color::Green } else { Color::DarkGray };
+    let status_color = if is_online {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
 
     // Get cipher key
     let key_str = app
-        .state.peers.keys
+        .state
+        .peers
+        .keys
         .get(peer_id)
-        .map(|k| hex::encode(k))
+        .map(hex::encode)
         .unwrap_or_else(|| "N/A".to_string());
 
     // Get connection time
     let connected_at = app
-        .state.peers.connected_at
+        .state
+        .peers
+        .connected_at
         .get(peer_id)
         .cloned()
         .unwrap_or_else(|| "N/A".to_string());
 
     // Get remote IP address
     let ip_str = app
-        .state.peers.ips
+        .state
+        .peers
+        .ips
         .get(peer_id)
         .cloned()
         .unwrap_or_else(|| "N/A".to_string());
 
     // Get per-peer stats (messages_sent, messages_received, files_sent, files_received)
     let (msg_sent, msg_recv, files_sent, files_recv) = app
-        .state.peers.stats
+        .state
+        .peers
+        .stats
         .get(peer_id)
         .cloned()
         .unwrap_or((0, 0, 0, 0));
@@ -67,7 +79,12 @@ pub fn render_peer_info_popup(f: &mut Frame, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status,
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Key: ", Style::default().fg(Color::DarkGray)),

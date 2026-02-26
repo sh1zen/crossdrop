@@ -95,7 +95,7 @@ pub struct Message {
     /// Absolute timestamp formatted at creation (e.g. `"14:32"`).
     pub timestamp: String,
     /// Which chat context this message belongs to.
-    pub target: ChatTarget
+    pub target: ChatTarget,
 }
 
 /// The logical message table.  Rendering consumes this — not network events.
@@ -187,7 +187,6 @@ impl UnreadTracker {
 ///
 /// * Peer-specific — does **not** create message entries.
 /// * Auto-expires after `TYPING_TIMEOUT_SECS`.
-
 pub struct TypingState {
     /// peer_id → when the peer last signalled "typing".
     typing: HashMap<String, Instant>,
@@ -375,7 +374,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(peer_id: String, ticket: String, display_name: Option<String>, cumulative_tx: Arc<AtomicU64>, cumulative_rx: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        peer_id: String,
+        ticket: String,
+        display_name: Option<String>,
+        cumulative_tx: Arc<AtomicU64>,
+        cumulative_rx: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             mode: Mode::Home,
             input: String::new(),
@@ -417,16 +422,24 @@ impl App {
             self.state.peers.list.push(peer_id.clone());
         }
         // Mark as online (re-connection or first connection)
-        self.state.peers.status.insert(peer_id.clone(), PeerStatus::Online);
+        self.state
+            .peers
+            .status
+            .insert(peer_id.clone(), PeerStatus::Online);
         // Track connection time
-        self.state.peers.connected_at.insert(peer_id, crate::ui::helpers::format_absolute_timestamp_now());
+        self.state
+            .peers
+            .connected_at
+            .insert(peer_id, crate::ui::helpers::format_absolute_timestamp_now());
     }
 
     /// Transition a peer to offline state.
     /// Preserves identity, chat history, display name, and keys.
     /// Does NOT remove the peer from the list.
     pub fn set_peer_offline(&mut self, peer_id: &str) {
-        self.state.peers.status
+        self.state
+            .peers
+            .status
             .insert(peer_id.to_string(), PeerStatus::Offline);
 
         // Clean up ephemeral typing indicator
@@ -443,7 +456,9 @@ impl App {
     pub fn remove_peer(&mut self, peer_id: &str) {
         self.state.peers.list.retain(|p| p != peer_id);
         self.state.peers.status.remove(peer_id);
-        if self.state.peers.selected_idx >= self.state.peers.list.len() && !self.state.peers.list.is_empty() {
+        if self.state.peers.selected_idx >= self.state.peers.list.len()
+            && !self.state.peers.list.is_empty()
+        {
             self.state.peers.selected_idx = self.state.peers.list.len() - 1;
         }
         // If DM with this peer, go back to Room

@@ -9,6 +9,18 @@ use crate::core::transaction::{ResumeInfo, TransactionManifest};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePullRequestItem {
+    pub file_id: Uuid,
+    /// Empty means full-file pull. Non-empty means only these chunk indices.
+    #[serde(default)]
+    pub chunk_indices: Vec<u32>,
+    /// Optional receiver-side have bitmap. When present, sender can do sparse
+    /// resume directly without retransmitting already-known chunks.
+    #[serde(default)]
+    pub have_bitmap: Option<Vec<u8>>,
+}
+
 // ── Signaling ─────────────────────────────────────────────────────────────────
 // Exchanged via Iroh during connection establishment, not on the data channel.
 
@@ -131,8 +143,36 @@ pub enum ControlMessage {
         transaction_id: Uuid,
         accepted: bool,
     },
+    /// Sender publishes (or refreshes) the transaction manifest.
+    /// Used by pull-based file transfer and resume.
+    TransactionManifest {
+        transaction_id: Uuid,
+        manifest: TransactionManifest,
+        total_size: u64,
+    },
+    /// Receiver requests a specific file by ID; sender then starts the
+    /// normal per-file hash/chunk negotiation for that file.
+    FilePullRequest { transaction_id: Uuid, file_id: Uuid },
+    /// Receiver requests multiple file/chunk pulls in one roundtrip.
+    FilePullBatchRequest {
+        transaction_id: Uuid,
+        requests: Vec<FilePullRequestItem>,
+    },
     /// Unified acknowledgement for various contexts.
     Ack { context: AckContext },
+    /// Flow-control acknowledgement: sent by the receiver every
+    /// `DATA_ACK_INTERVAL_BYTES` of received chunk data to release one
+    /// flow-control permit on the sender side.
+    DataAck { bytes_received: u64 },
+    /// Sender has finished sending all chunk hashes for a file.
+    /// Receiver should check whether it already has a matching file locally
+    /// and respond with [`FileSkip`] or [`FileHaveChunks`].
+    AllHashesSent { file_id: Uuid },
+    /// Receiver already has an identical file locally; sender may skip sending data.
+    FileSkip { file_id: Uuid },
+    /// Receiver already has some chunks locally; `have_bitmap` is a serialized
+    /// [`crate::core::pipeline::chunk::ChunkBitmap`] of chunks the receiver already has.
+    FileHaveChunks { file_id: Uuid, have_bitmap: Vec<u8> },
 
     // ── Remote access ─────────────────────────────────────────────────────────
     /// Request a directory listing from the peer.
@@ -211,6 +251,8 @@ pub enum ConnectionMessage {
         total_chunks: u32,
         /// Wire bytes sent in this progress window (post-encryption).
         wire_bytes: u64,
+        /// Cumulative chunks sent so far (including already-received chunks on resume).
+        chunks_sent: u32,
     },
     /// Outgoing file send finished (with integrity result).
     SendComplete {
@@ -281,6 +323,19 @@ pub enum ConnectionMessage {
         transaction_id: Uuid,
         reason: Option<String>,
     },
+    TransactionManifestReceived {
+        transaction_id: Uuid,
+        manifest: TransactionManifest,
+        total_size: u64,
+    },
+    FilePullRequested {
+        transaction_id: Uuid,
+        file_id: Uuid,
+    },
+    FilePullBatchRequested {
+        transaction_id: Uuid,
+        requests: Vec<FilePullRequestItem>,
+    },
 
     // ── Connection state ──────────────────────────────────────────────────────
     /// Peer responded to an `AreYouAwake` probe.
@@ -294,6 +349,19 @@ pub enum ConnectionMessage {
 }
 
 // ── Internal receive state ────────────────────────────────────────────────────
+
+/// Internal decision returned by the receiver after [`ControlMessage::AllHashesSent`].
+///
+/// The sender's `send_file_resuming` waits on a oneshot channel for this value
+/// before deciding whether to skip the file or send only missing chunks.
+#[derive(Debug, Clone)]
+pub enum ReceiverDecision {
+    /// Receiver already has an identical file; sender should skip it.
+    Skip,
+    /// Receiver has some chunks already. `have_bitmap` is the serialized set of
+    /// already-present chunks (sender skips those in Phase 2).
+    HaveChunks(Vec<u8>),
+}
 
 /// Buffered hash parameters when `Hash` arrives before the last chunk.
 ///

@@ -5,7 +5,7 @@
 //! the two methods that depend directly on the `peer_connection` handle.
 
 use super::initializer::SharedReceiverState;
-use super::types::{ConnectionMessage, ControlMessage, ReceiveFileState};
+use super::types::{ConnectionMessage, ControlMessage, ReceiveFileState, ReceiverDecision};
 use crate::core::connection::crypto::SessionKeyManager;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 ///
 /// All mutable state is behind `Arc<RwLock<_>>` or `AtomicU64`.
 /// The struct is `Send + Sync`.
+#[allow(clippy::type_complexity)]
 pub struct WebRTCConnection {
     // ── WebRTC core ───────────────────────────────────────────────────────────
     pub peer_connection: Arc<RTCPeerConnection>,
@@ -50,8 +51,7 @@ pub struct WebRTCConnection {
     /// Chunks buffered before their Metadata frame arrives.
     pub pending_chunks: Arc<RwLock<HashMap<Uuid, Vec<(u32, Vec<u8>, u64)>>>>,
     /// Per-file chunk bitmaps for resume support.
-    pub resume_bitmaps:
-        Arc<RwLock<HashMap<Uuid, crate::core::pipeline::chunk::ChunkBitmap>>>,
+    pub resume_bitmaps: Arc<RwLock<HashMap<Uuid, crate::core::pipeline::chunk::ChunkBitmap>>>,
     /// Limits the number of concurrently in-flight (sent but unacknowledged) files.
     pub file_ack_semaphore: Arc<Semaphore>,
 
@@ -59,8 +59,7 @@ pub struct WebRTCConnection {
     pub shared_key: Arc<RwLock<[u8; 32]>>,
     pub key_manager: Option<SessionKeyManager>,
     /// Ephemeral keypair held during an in-progress key rotation.
-    pub pending_rotation:
-        Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
+    pub pending_rotation: Arc<RwLock<Option<crate::core::connection::crypto::EphemeralKeypair>>>,
 
     // ── Counters ──────────────────────────────────────────────────────────────
     /// Monotonic outgoing chat counter (replay protection).
@@ -71,6 +70,29 @@ pub struct WebRTCConnection {
     // ── Cancellation ──────────────────────────────────────────────────────────
     /// Transactions that have been cancelled; checked by in-flight send tasks.
     pub cancelled_transactions: Arc<Mutex<HashSet<Uuid>>>,
+
+    // ── File verification ─────────────────────────────────────────────────────
+    /// One-shot channels the sender inserts while waiting for a receiver decision
+    /// after sending `AllHashesSent`.  The control handler fires them when
+    /// `FileSkip` or `FileHaveChunks` arrives from the remote peer.
+    pub file_decision_tx: Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<ReceiverDecision>>>>,
+
+    /// Files the receiver has pre-determined are identical to a locally-existing
+    /// file (Merkle root match during PrepareReceive).  When `Metadata` arrives
+    /// for one of these files, the receiver sends `FileSkip` immediately and the
+    /// sender can stop early — no data is transferred.
+    ///
+    /// Value: `(final_path, merkle_root)` for the `FileSaved` notification.
+    pub pre_skip_files: Arc<Mutex<HashMap<Uuid, (PathBuf, [u8; 32])>>>,
+    /// File IDs for which we already sent `FileSkip`.
+    /// Any late/stray chunk frames for these IDs should be ignored.
+    pub skipped_files: Arc<Mutex<HashSet<Uuid>>>,
+
+    /// Optional precomputed chunk hashes used to reduce sender warm-up latency.
+    pub prewarmed_hashes: Arc<Mutex<HashMap<Uuid, Vec<[u8; 32]>>>>,
+
+    /// Reverse index: file_id → transaction_id, for O(1) lookup.
+    pub file_to_transaction: Arc<Mutex<HashMap<Uuid, Uuid>>>,
 }
 
 // ── Inherent impl ─────────────────────────────────────────────────────────────
@@ -101,6 +123,17 @@ impl WebRTCConnection {
             .map_err(|_| anyhow!("Peer not responding to awake check"))
     }
 
+    /// Register a file that the receiver already has locally (identical Merkle root).
+    ///
+    /// When Metadata arrives for this file, the control handler will immediately
+    /// send `FileSkip` to the sender instead of creating a writer.
+    pub async fn register_pre_skip(&self, file_id: Uuid, path: PathBuf, merkle_root: [u8; 32]) {
+        self.pre_skip_files
+            .lock()
+            .await
+            .insert(file_id, (path, merkle_root));
+    }
+
     /// Mark a transaction as cancelled so in-flight send tasks stop early.
     pub async fn cancel_transaction(&self, transaction_id: Uuid) {
         self.cancelled_transactions
@@ -126,13 +159,44 @@ impl WebRTCConnection {
         if file_ids.is_empty() {
             return;
         }
+
+        // Collect temp/bitmap paths before removing state entries.
+        let mut paths_to_delete: Vec<(PathBuf, PathBuf)> = Vec::new();
+        {
+            let recv = self.recv_state.read().await;
+            for fid in file_ids {
+                if let Some(state) = recv.get(fid) {
+                    paths_to_delete.push((
+                        state.writer.temp_path_ref().to_path_buf(),
+                        state.writer.bitmap_path_ref().to_path_buf(),
+                    ));
+                }
+            }
+        }
+
         let mut recv = self.recv_state.write().await;
         let mut pending = self.pending_chunks.write().await;
         let mut destinations = self.accepted_destinations.write().await;
+        let mut skipped = self.skipped_files.lock().await;
         for fid in file_ids {
             recv.remove(fid);
             pending.remove(fid);
             destinations.remove(fid);
+            skipped.remove(fid);
+        }
+        drop(recv);
+        drop(pending);
+        drop(destinations);
+        drop(skipped);
+
+        // Spawn async deletion of partial temp files.
+        if !paths_to_delete.is_empty() {
+            tokio::spawn(async move {
+                for (temp, bitmap) in paths_to_delete {
+                    let _ = tokio::fs::remove_file(&temp).await;
+                    let _ = tokio::fs::remove_file(&bitmap).await;
+                }
+            });
         }
     }
 

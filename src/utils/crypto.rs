@@ -35,15 +35,15 @@ pub fn hmac_sha3_256(key: &[u8], data: &[u8]) -> [u8; 32] {
     // Inner hash: H(ipad || data)
     let inner_hash = {
         let mut inner = Sha3_256::new();
-        inner.update(&ipad);
+        inner.update(ipad);
         inner.update(data);
         inner.finalize()
     };
 
     // Outer hash: H(opad || inner_hash)
     let mut outer = Sha3_256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
+    outer.update(opad);
+    outer.update(inner_hash);
     let result = outer.finalize();
 
     let mut out = [0u8; 32];

@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use tokio::sync::mpsc;
 use crate::core::config::CHUNK_SIZE;
 use crate::core::connection::webrtc::ConnectionMessage;
+use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 /// Compute the total number of chunks for a file of the given size.
 ///

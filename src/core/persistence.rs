@@ -7,9 +7,9 @@
 //! - User preferences (display name, theme)
 
 use crate::core::transaction::{TransactionDirection, TransactionSnapshot};
-use ratatui::style::Color;
 use crate::workers::settings::Settings;
 use anyhow::Result;
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -294,7 +294,8 @@ impl Persistence {
 
     /// Clear chat history for a specific target and persist.
     pub fn clear_chat_target(&mut self, target: &ChatTargetSnapshot) -> Result<()> {
-        self.chat_history.retain(|m| !matches_target(&m.target, target));
+        self.chat_history
+            .retain(|m| !matches_target(&m.target, target));
         self.save()
     }
 

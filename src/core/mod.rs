@@ -60,10 +60,10 @@
 pub mod config;
 pub mod connection;
 pub mod engine;
+mod helpers;
 pub mod initializer;
 pub mod peer_registry;
 pub mod persistence;
 pub mod pipeline;
 pub mod security;
 pub mod transaction;
-mod helpers;

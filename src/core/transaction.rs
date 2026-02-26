@@ -14,13 +14,13 @@
 
 pub use crate::core::config::CHUNK_SIZE;
 use crate::core::config::TRANSACTION_EXPIRY_SECS;
+use crate::core::helpers;
 use crate::core::pipeline::chunk::ChunkBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
-use crate::core::helpers;
 
 /// All possible states a Transaction can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +103,8 @@ pub struct TransactionFile {
     #[serde(default)]
     pub merkle_root: Option<[u8; 32]>,
     pub retransmit_count: u32,
+    #[serde(default)]
+    pub pull_requested: bool,
 }
 
 impl TransactionFile {
@@ -120,6 +122,7 @@ impl TransactionFile {
             chunk_bitmap: Some(ChunkBitmap::new(total_chunks)),
             merkle_root: None,
             retransmit_count: 0,
+            pull_requested: false,
         }
     }
 
@@ -129,6 +132,7 @@ impl TransactionFile {
         self.completed = true;
         self.verified = Some(verified);
         self.transferred_chunks = self.total_chunks;
+        self.pull_requested = true;
     }
 
     /// Reset partial progress (used when resume info has no bitmap for this file).
@@ -136,6 +140,7 @@ impl TransactionFile {
         self.completed = false;
         self.verified = None;
         self.transferred_chunks = 0;
+        self.pull_requested = false;
         if let Some(ref mut bm) = self.chunk_bitmap {
             *bm = ChunkBitmap::new(self.total_chunks);
         }
@@ -285,6 +290,7 @@ impl Transaction {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_inner(
         id: Uuid,
         direction: TransactionDirection,
@@ -427,10 +433,10 @@ impl Transaction {
     ) {
         if let Some(f) = self.files.get_mut(&file_id) {
             f.transferred_chunks = transferred_chunks;
-            if let Some(bytes) = bitmap_bytes {
-                if let Some(bm) = ChunkBitmap::from_bytes(bytes) {
-                    f.chunk_bitmap = Some(bm);
-                }
+            if let Some(bytes) = bitmap_bytes
+                && let Some(bm) = ChunkBitmap::from_bytes(bytes)
+            {
+                f.chunk_bitmap = Some(bm);
             }
         }
     }
@@ -552,6 +558,7 @@ impl Transaction {
                         let count = (0..f.total_chunks).filter(|&i| bm.is_set(i)).count() as u32;
                         f.transferred_chunks = count;
                         f.chunk_bitmap = Some(bm);
+                        f.pull_requested = false;
                     }
                     None => f.reset_progress(),
                 }
@@ -560,6 +567,51 @@ impl Transaction {
 
         self.state = TransactionState::Active;
         self.resumed_at = Some(Instant::now());
+    }
+
+    /// Refresh an inbound transaction from a sender-provided manifest while
+    /// preserving any local progress already tracked per file ID.
+    pub fn apply_inbound_manifest(&mut self, manifest: &TransactionManifest, total_size: u64) {
+        if self.direction != TransactionDirection::Inbound {
+            return;
+        }
+
+        let mut old_files = std::mem::take(&mut self.files);
+        let mut new_map = HashMap::with_capacity(manifest.files.len());
+        let mut new_order = Vec::with_capacity(manifest.files.len());
+
+        for entry in &manifest.files {
+            if new_map.contains_key(&entry.file_id) {
+                continue;
+            }
+
+            let mut next =
+                TransactionFile::new(entry.file_id, entry.relative_path.clone(), entry.filesize);
+            next.merkle_root = entry.merkle_root;
+
+            if let Some(prev) = old_files.remove(&entry.file_id) {
+                next.full_path = prev.full_path;
+                next.retransmit_count = prev.retransmit_count;
+                let bm = prev
+                    .chunk_bitmap
+                    .unwrap_or_else(|| ChunkBitmap::new(prev.total_chunks))
+                    .rebased(next.total_chunks);
+                let transferred = (0..next.total_chunks).filter(|&i| bm.is_set(i)).count() as u32;
+                next.chunk_bitmap = Some(bm);
+                next.transferred_chunks = transferred;
+                next.completed = transferred == next.total_chunks;
+                next.verified = prev.verified.filter(|_| next.completed);
+                next.pull_requested = next.completed;
+            }
+
+            new_order.push(entry.file_id);
+            new_map.insert(entry.file_id, next);
+        }
+
+        self.files = new_map;
+        self.file_order = new_order;
+        self.parent_dir = manifest.parent_dir.clone();
+        self.total_size = total_size;
     }
 
     // ── Manifest ─────────────────────────────────────────────────────────
@@ -682,7 +734,7 @@ impl Transaction {
             if file_map.contains_key(&fs.file_id) {
                 continue;
             }
-            
+
             let bitmap = fs
                 .chunk_bitmap_bytes
                 .as_deref()
@@ -707,6 +759,7 @@ impl Transaction {
                 chunk_bitmap: Some(bitmap),
                 merkle_root: fs.merkle_root,
                 retransmit_count: fs.retransmit_count,
+                pull_requested: false,
             };
             file_map.insert(fs.file_id, tf);
             file_order.push(fs.file_id);
@@ -861,10 +914,10 @@ impl TransactionSnapshot {
             .unwrap_or_default()
             .as_secs();
 
-        self.expiration_time.map_or(false, |exp| now >= exp)
+        self.expiration_time.is_some_and(|exp| now >= exp)
             || self
                 .interrupted_at
-                .map_or(false, |at| now >= at + TRANSACTION_EXPIRY_SECS)
+                .is_some_and(|at| now >= at + TRANSACTION_EXPIRY_SECS)
     }
 }
 

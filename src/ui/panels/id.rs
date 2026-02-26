@@ -28,10 +28,7 @@ impl Component for IdPanel {
     fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-            ])
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
             .split(area);
 
         let peer_id_widget = Paragraph::new(app.peer_id.as_str())

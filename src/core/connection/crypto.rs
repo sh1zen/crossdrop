@@ -161,7 +161,13 @@ pub async fn handshake_offerer(
 
     // Compute shared secret and derive session key
     let shared_secret = eph.diffie_hellman(&peer_eph_pk);
-    let session_key = derive_session_key(&shared_secret, local_pk, remote_pk, b"crossdrop-session-v1", None);
+    let session_key = derive_session_key(
+        &shared_secret,
+        local_pk,
+        remote_pk,
+        b"crossdrop-session-v1",
+        None,
+    );
 
     Ok(SessionKeyManager::new(session_key, *local_pk, *remote_pk))
 }
@@ -184,7 +190,13 @@ pub async fn handshake_answerer(
 
     // Compute shared secret and derive session key
     let shared_secret = eph.diffie_hellman(&peer_eph_pk);
-    let session_key = derive_session_key(&shared_secret, local_pk, remote_pk, b"crossdrop-session-v1", None);
+    let session_key = derive_session_key(
+        &shared_secret,
+        local_pk,
+        remote_pk,
+        b"crossdrop-session-v1",
+        None,
+    );
 
     Ok(SessionKeyManager::new(session_key, *local_pk, *remote_pk))
 }

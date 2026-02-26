@@ -11,9 +11,12 @@ use crate::core::config::{
     CHUNK_SIZE, MAX_CONCURRENT_TRANSACTIONS, MAX_FILE_RETRANSMISSIONS, MAX_TRANSACTION_RETRIES,
     TRANSACTION_TIMEOUT,
 };
+use crate::core::connection::webrtc::types::FilePullRequestItem;
 use crate::core::connection::webrtc::AckContext;
 use crate::core::initializer::AppEvent;
-use crate::core::persistence::{Persistence, TransferRecord, TransferStatus};
+use crate::core::persistence::{
+    Persistence, TransferRecord, TransferStatsSnapshot, TransferStatus,
+};
 use crate::core::security::identity::PeerIdentity;
 use crate::core::security::replay::ReplayGuard;
 use crate::core::transaction::{
@@ -50,23 +53,31 @@ pub enum EngineAction {
     /// Metadata frames can find the correct save path.
     PrepareReceive {
         peer_id: String,
-        files: Vec<(Uuid, PathBuf)>,
+        /// `(file_id, dest_path, expected_filesize, manifest_merkle_root)` — the Merkle root is used
+        /// by the receiver to pre-check whether an identical file already exists
+        /// locally, enabling zero-transfer skipping without a sender roundtrip.
+        files: Vec<(Uuid, PathBuf, u64, Option<[u8; 32]>)>,
         resume_bitmaps: Vec<(Uuid, crate::core::pipeline::chunk::ChunkBitmap)>,
-    },
-    SendFileData {
-        peer_id: String,
-        file_path: String,
-        file_id: Uuid,
-        filename: String,
-    },
-    SendFolderData {
-        peer_id: String,
-        transaction_id: Uuid,
-        file_entries: Vec<(Uuid, String, String)>, // (file_id, full_path, relative_path)
     },
     SendTransactionComplete {
         peer_id: String,
         transaction_id: Uuid,
+    },
+    SendTransactionManifest {
+        peer_id: String,
+        transaction_id: Uuid,
+        manifest: TransactionManifest,
+        total_size: u64,
+    },
+    RequestFilePullBatch {
+        peer_id: String,
+        transaction_id: Uuid,
+        requests: Vec<FilePullRequestItem>,
+    },
+    ServePullBatch {
+        peer_id: String,
+        transaction_id: Uuid,
+        requests: Vec<PullServeRequest>,
     },
     AcceptResume {
         peer_id: String,
@@ -81,10 +92,6 @@ pub enum EngineAction {
         peer_id: String,
         transaction_id: Uuid,
         reason: String,
-    },
-    ResendFiles {
-        peer_id: String,
-        transaction_id: Uuid,
     },
     HandleRemoteFetch {
         peer_id: String,
@@ -102,6 +109,7 @@ pub enum EngineAction {
     /// peer (no outbound cancel message needed — peer already sent theirs).
     CleanupTransferFiles {
         peer_id: String,
+        transaction_id: Uuid,
         file_ids: Vec<Uuid>,
     },
     RetransmitChunks {
@@ -348,6 +356,31 @@ impl TransferEngine {
         }
     }
 
+    /// Clear transfer history and cumulative transfer statistics, both in-memory and on disk.
+    pub fn clear_transfer_stats_and_history(&mut self) -> bool {
+        let had_data = !self.transfer_history.is_empty()
+            || self.stats.files_sent > 0
+            || self.stats.files_received > 0
+            || self.stats.folders_sent > 0
+            || self.stats.folders_received > 0
+            || self.stats.messages_sent > 0
+            || self.stats.messages_received > 0;
+
+        self.transfer_history.clear();
+        self.stats = DataStats::default();
+        self.peer_file_stats.clear();
+
+        if let Ok(mut p) = Persistence::load() {
+            p.transfer_history.clear();
+            p.transfer_stats = TransferStatsSnapshot::default();
+            if let Err(e) = p.save() {
+                warn!(event = "transfer_clear_persist_failure", error = %e);
+            }
+        }
+
+        had_data
+    }
+
     pub fn can_start_transfer(&self) -> bool {
         self.transactions.active_count() < MAX_CONCURRENT_TRANSACTIONS
     }
@@ -381,6 +414,54 @@ impl TransferEngine {
             },
             format!("Cancelled: {}", display_name),
         )
+    }
+
+    /// Cancel all active transfers for a specific peer.
+    pub fn cancel_all_transfers_for_peer(&mut self, peer_id: &str) -> EngineOutcome {
+        let mut actions = Vec::new();
+        let mut statuses = Vec::new();
+
+        // Collect all active transaction IDs for the peer
+        let transaction_ids: Vec<Uuid> = self
+            .transactions
+            .active
+            .values()
+            .filter(|txn| txn.peer_id == peer_id && !txn.state.is_terminal())
+            .map(|txn| txn.id)
+            .collect();
+
+        // Cancel each transaction
+        for txn_id in transaction_ids {
+            if let Some(txn) = self.transactions.get_active_mut(&txn_id) {
+                let file_ids: Vec<Uuid> = txn.file_order.clone();
+                let display_name = txn.display_name.clone();
+                txn.cancel();
+                info!(
+                    event = "transfer_cancelled_by_user",
+                    transaction_id = %txn_id,
+                    name = %display_name
+                );
+                self.archive_transaction_with_status(txn_id, TransferStatus::Cancelled);
+                self.source_paths.remove(&txn_id);
+                actions.push(EngineAction::CancelTransaction {
+                    peer_id: peer_id.to_owned(),
+                    transaction_id: txn_id,
+                    file_ids,
+                });
+                statuses.push(format!("Cancelled: {}", display_name));
+            }
+        }
+
+        if actions.is_empty() {
+            EngineOutcome::empty()
+        } else {
+            let combined_status = if statuses.len() == 1 {
+                statuses[0].clone()
+            } else {
+                format!("Cancelled {} transfers", statuses.len())
+            };
+            EngineOutcome::with_actions(actions, combined_status)
+        }
     }
 
     // ── Manifest signing & validation ─────────────────────────────────────
@@ -450,10 +531,10 @@ impl TransferEngine {
             vec![(filename.to_owned(), filesize)],
         );
         // Set full_path on the single file for crash-resilient resume
-        if let Some(file_id) = txn.file_order.first() {
-            if let Some(tf) = txn.files.get_mut(file_id) {
-                tf.full_path = Some(file_path.to_owned());
-            }
+        if let Some(file_id) = txn.file_order.first()
+            && let Some(tf) = txn.files.get_mut(file_id)
+        {
+            tf.full_path = Some(file_path.to_owned());
         }
         let txn_id = txn.id;
         let total_size = txn.total_size;
@@ -511,10 +592,10 @@ impl TransferEngine {
 
         // Set full_path on each file for crash-resilient resume
         for file_id in &txn.file_order {
-            if let Some(tf) = txn.files.get_mut(file_id) {
-                if let Some(full) = full_paths.get(&tf.relative_path) {
-                    tf.full_path = Some(full.clone());
-                }
+            if let Some(tf) = txn.files.get_mut(file_id)
+                && let Some(full) = full_paths.get(&tf.relative_path)
+            {
+                tf.full_path = Some(full.clone());
             }
         }
 
@@ -606,7 +687,7 @@ impl TransferEngine {
         // Mirrors the defensive pattern in `incomplete_file_destinations`: prefer the
         // pre-computed full_path, but fall back to resolve_file_dest if it was not set
         // (should not happen in practice, but guards against any future regression).
-        let files: Vec<(Uuid, PathBuf)> = txn
+        let files: Vec<(Uuid, PathBuf, u64, Option<[u8; 32]>)> = txn
             .file_order
             .iter()
             .filter_map(|fid| {
@@ -620,14 +701,14 @@ impl TransferEngine {
                         &tf.relative_path,
                     )
                 };
-                Some((*fid, full_path))
+                Some((*fid, full_path, tf.filesize, tf.merkle_root))
             })
             .collect();
-        
+
         info!(
             event = "accept_inbound_prepare_files",
             transaction_id = %pending.transaction_id,
-            file_ids = ?files.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            file_ids = ?files.iter().map(|(id, _, _, _)| id).collect::<Vec<_>>(),
             "Preparing files for reception"
         );
 
@@ -764,17 +845,21 @@ impl TransferEngine {
             AppEvent::SendProgress {
                 file_id,
                 wire_bytes,
+                chunks_sent,
                 ..
             } => {
-                // Only accumulate wire-byte stats here.  Chunk-level progress on the
-                // sender side is advanced exclusively when the receiver ACKs the file
-                // (AckContext::FileReceived), keeping sender and receiver progress bars
-                // in sync.  Updating transferred_chunks per chunk sent caused the
-                // sender to run ahead of the receiver's confirmed state.
                 if let Some(txn) = self.transactions.find_by_file_mut(file_id) {
                     self.stats.bytes_sent += wire_bytes;
+                    // Advance transferred_chunks to reflect chunks actually sent so
+                    // the sender's progress bar tracks the receiver's bar during
+                    // active transfer.  Only advance (never retreat) to avoid
+                    // flickering if progress reports arrive out of order.
+                    if let Some(f) = txn.files.get_mut(file_id)
+                        && *chunks_sent > f.transferred_chunks
+                    {
+                        f.transferred_chunks = *chunks_sent;
+                    }
                     let txn_id = txn.id;
-                    // Still periodically persist so crash-recovery sees recent byte stats.
                     self.persist_active_transaction(&txn_id);
                 }
                 EngineOutcome::empty()
@@ -867,7 +952,11 @@ impl TransferEngine {
                 );
                 if !file_ids.is_empty() {
                     EngineOutcome::with_action(
-                        EngineAction::CleanupTransferFiles { peer_id, file_ids },
+                        EngineAction::CleanupTransferFiles {
+                            peer_id,
+                            transaction_id: *transaction_id,
+                            file_ids,
+                        },
                         status,
                     )
                 } else {
@@ -901,6 +990,29 @@ impl TransferEngine {
                     reason.as_deref().unwrap_or("unknown")
                 ))
             }
+
+            AppEvent::TransactionManifestReceived {
+                peer_id,
+                transaction_id,
+                manifest,
+                total_size,
+            } => self.handle_transaction_manifest_received(
+                peer_id,
+                transaction_id,
+                manifest,
+                *total_size,
+            ),
+
+            AppEvent::FilePullRequested {
+                peer_id,
+                transaction_id,
+                file_id,
+            } => self.handle_file_pull_requested(peer_id, transaction_id, file_id),
+            AppEvent::FilePullBatchRequested {
+                peer_id,
+                transaction_id,
+                requests,
+            } => self.handle_file_pull_batch_requested(peer_id, transaction_id, requests),
 
             AppEvent::RemoteFetchRequest {
                 peer_id,
@@ -1006,7 +1118,7 @@ impl TransferEngine {
         if self
             .pending_incoming
             .as_ref()
-            .map_or(false, |p| p.peer_id == peer_id)
+            .is_some_and(|p| p.peer_id == peer_id)
         {
             self.pending_incoming = None;
         }
@@ -1114,7 +1226,114 @@ impl TransferEngine {
             self.archive_transaction_with_status(txn_id, TransferStatus::Ok);
             EngineOutcome::with_status(format!("Transfer complete: {}", display_name))
         } else {
-            EngineOutcome::with_status(format!("Received: {}", filename))
+            let action = Self::next_file_pull_batch_action(txn);
+            let status = format!("Received: {}", filename);
+            if let Some(action) = action {
+                EngineOutcome::with_action(action, status)
+            } else {
+                EngineOutcome::with_status(status)
+            }
+        }
+    }
+
+    fn handle_transaction_manifest_received(
+        &mut self,
+        _peer_id: &str,
+        transaction_id: &Uuid,
+        manifest: &TransactionManifest,
+        total_size: u64,
+    ) -> EngineOutcome {
+        let Some(txn) = self.transactions.get_active_mut(transaction_id) else {
+            return EngineOutcome::empty();
+        };
+        if txn.direction != TransactionDirection::Inbound {
+            return EngineOutcome::empty();
+        }
+
+        txn.apply_inbound_manifest(manifest, total_size);
+        let action = Self::next_file_pull_batch_action(txn);
+        let status = format!("Manifest updated: {}", txn.display_name);
+        self.persist_active_transaction(transaction_id);
+        if let Some(action) = action {
+            EngineOutcome::with_action(action, status)
+        } else {
+            EngineOutcome::with_status(status)
+        }
+    }
+
+    fn handle_file_pull_requested(
+        &mut self,
+        peer_id: &str,
+        transaction_id: &Uuid,
+        file_id: &Uuid,
+    ) -> EngineOutcome {
+        self.handle_file_pull_batch_requested(
+            peer_id,
+            transaction_id,
+            &[FilePullRequestItem {
+                file_id: *file_id,
+                chunk_indices: Vec::new(),
+                have_bitmap: None,
+            }],
+        )
+    }
+
+    fn handle_file_pull_batch_requested(
+        &mut self,
+        peer_id: &str,
+        transaction_id: &Uuid,
+        requests: &[FilePullRequestItem],
+    ) -> EngineOutcome {
+        let Some(txn) = self.transactions.get_active_mut(transaction_id) else {
+            return EngineOutcome::empty();
+        };
+        if txn.direction != TransactionDirection::Outbound {
+            return EngineOutcome::empty();
+        }
+
+        let mut serve = Vec::new();
+        for req in requests {
+            let Some(tf) = txn.files.get(&req.file_id) else {
+                continue;
+            };
+            let file_path = tf.full_path.clone().or_else(|| {
+                self.source_paths.get(transaction_id).map(|src| {
+                    std::path::Path::new(src)
+                        .join(&tf.relative_path)
+                        .to_string_lossy()
+                        .to_string()
+                })
+            });
+
+            let Some(path) = file_path else {
+                warn!(
+                    event = "source_path_missing_for_pull",
+                    transaction_id = %transaction_id,
+                    file_id = %req.file_id
+                );
+                continue;
+            };
+
+            serve.push(PullServeRequest {
+                file_id: req.file_id,
+                file_path: path,
+                filename: tf.relative_path.clone(),
+                chunk_indices: req.chunk_indices.clone(),
+                have_bitmap: req.have_bitmap.clone(),
+            });
+        }
+
+        if serve.is_empty() {
+            EngineOutcome::with_status("No valid pull requests to serve")
+        } else {
+            EngineOutcome::with_action(
+                EngineAction::ServePullBatch {
+                    peer_id: peer_id.to_owned(),
+                    transaction_id: *transaction_id,
+                    requests: serve,
+                },
+                format!("Serving {} pull request(s)", requests.len()),
+            )
         }
     }
 
@@ -1219,59 +1438,17 @@ impl TransferEngine {
         }
         let display = txn.display_name.clone();
         let peer_id = txn.peer_id.clone();
-        let is_folder = txn.parent_dir.is_some();
-
-        let source_path = match self.source_paths.get(transaction_id).cloned() {
-            Some(p) => p,
-            None => {
-                error!(event = "source_path_missing", transaction_id = %transaction_id);
-                return EngineOutcome::with_status("Internal error: source path not found");
-            }
-        };
-
-        let txn = self.transactions.get_active_mut(transaction_id)
-            .expect("transaction was active at start of handle_transaction_accepted");
-        let actions = if is_folder {
-            // Use full_path from each file if available (already computed during initiate_folder_send)
-            // Fall back to joining source_path with relative_path if full_path is not set
-            let file_entries: Vec<(Uuid, String, String)> = txn
-                .file_order
-                .iter()
-                .filter_map(|fid| {
-                    txn.files.get(fid).map(|f| {
-                        let full_path = f.full_path.clone().unwrap_or_else(|| {
-                            // Fallback: join source_path with relative_path
-                            std::path::Path::new(&source_path)
-                                .join(&f.relative_path)
-                                .to_string_lossy()
-                                .to_string()
-                        });
-                        (*fid, full_path, f.relative_path.clone())
-                    })
-                })
-                .collect();
-            vec![EngineAction::SendFolderData {
-                peer_id,
-                transaction_id: *transaction_id,
-                file_entries,
-            }]
-        } else {
-            let first = txn.file_order.first().copied().unwrap_or(Uuid::nil());
-            let filename = txn
-                .files
-                .get(&first)
-                .map(|f| f.relative_path.clone())
-                .unwrap_or_default();
-            vec![EngineAction::SendFileData {
-                peer_id,
-                file_path: source_path,
-                file_id: first,
-                filename,
-            }]
-        };
+        let manifest = txn.build_manifest();
+        let total_size = txn.total_size;
+        let actions = vec![EngineAction::SendTransactionManifest {
+            peer_id,
+            transaction_id: *transaction_id,
+            manifest,
+            total_size,
+        }];
 
         self.persist_active_transaction(transaction_id);
-        EngineOutcome::with_actions(actions, format!("Sending: {}", display))
+        EngineOutcome::with_actions(actions, format!("Transfer ready (pull mode): {}", display))
     }
 
     fn handle_resume_requested(
@@ -1337,6 +1514,8 @@ impl TransferEngine {
         }
 
         txn.apply_resume_info(resume_info);
+        let manifest = txn.build_manifest();
+        let total_size = txn.total_size;
 
         // Clean persisted state — we are resuming now
         if let Ok(mut p) = Persistence::load() {
@@ -1349,9 +1528,11 @@ impl TransferEngine {
                     peer_id: peer_id.to_owned(),
                     transaction_id: txn_id,
                 },
-                EngineAction::ResendFiles {
+                EngineAction::SendTransactionManifest {
                     peer_id: peer_id.to_owned(),
                     transaction_id: txn_id,
+                    manifest,
+                    total_size,
                 },
             ],
             "Resuming transfer",
@@ -1373,7 +1554,9 @@ impl TransferEngine {
         info!(event = "resume_accepted", transaction_id = %txn_id, peer = %peer_id);
 
         if is_inbound {
-            let txn = self.transactions.get_active_mut(&txn_id)
+            let txn = self
+                .transactions
+                .get_active_mut(&txn_id)
                 .expect("transaction was just activated in handle_resume_accepted");
             let files = Self::incomplete_file_destinations(txn);
             let bitmaps = Self::incomplete_file_bitmaps(txn);
@@ -1405,9 +1588,8 @@ impl TransferEngine {
             .filter(|(_, t)| {
                 t.peer_id == peer_id
                     && t.state == TransactionState::Active
-                    && !t
-                        .resumed_at
-                        .map_or(false, |at| at.elapsed() < recently_resumed)
+                    && t.resumed_at
+                        .is_none_or(|at| at.elapsed() >= recently_resumed)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1587,11 +1769,46 @@ impl TransferEngine {
         self.persist_transfer_stats();
     }
 
-    pub fn source_path(&self, transaction_id: &Uuid) -> Option<&str> {
-        self.source_paths.get(transaction_id).map(String::as_str)
-    }
-
     // ── Internal helpers ──────────────────────────────────────────────────
+
+    /// Build a batched pull request for the next incomplete files.
+    fn next_file_pull_batch_action(txn: &mut Transaction) -> Option<EngineAction> {
+        const PULL_WINDOW: usize = 3;
+        let mut requests = Vec::with_capacity(PULL_WINDOW);
+
+        for fid in &txn.file_order {
+            if requests.len() >= PULL_WINDOW {
+                break;
+            }
+            let Some(tf) = txn.files.get_mut(fid) else {
+                continue;
+            };
+            if tf.completed || tf.pull_requested {
+                continue;
+            }
+            tf.pull_requested = true;
+            let have_bitmap = if tf.transferred_chunks > 0 {
+                tf.chunk_bitmap.as_ref().map(|bm| bm.to_bytes())
+            } else {
+                None
+            };
+            requests.push(FilePullRequestItem {
+                file_id: *fid,
+                chunk_indices: Vec::new(),
+                have_bitmap,
+            });
+        }
+
+        if requests.is_empty() {
+            None
+        } else {
+            Some(EngineAction::RequestFilePullBatch {
+                peer_id: txn.peer_id.clone(),
+                transaction_id: txn.id,
+                requests,
+            })
+        }
+    }
 
     /// Collect `(file_id, full_save_path)` for every incomplete file in `txn`.
     ///
@@ -1599,7 +1816,9 @@ impl TransferEngine {
     /// to what `accept_incoming` computes via `resolve_file_dest`.  This path is
     /// stored directly in `accepted_destinations`; `handle_metadata` uses it as-is
     /// without any secondary join.
-    fn incomplete_file_destinations(txn: &Transaction) -> Vec<(Uuid, PathBuf)> {
+    fn incomplete_file_destinations(
+        txn: &Transaction,
+    ) -> Vec<(Uuid, PathBuf, u64, Option<[u8; 32]>)> {
         txn.file_order
             .iter()
             .filter_map(|fid| {
@@ -1622,7 +1841,7 @@ impl TransferEngine {
                     return None;
                 };
 
-                Some((*fid, full_path))
+                Some((*fid, full_path, f.filesize, f.merkle_root))
             })
             .collect()
     }
@@ -1760,4 +1979,13 @@ impl Default for TransferEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PullServeRequest {
+    pub file_id: Uuid,
+    pub file_path: String,
+    pub filename: String,
+    pub chunk_indices: Vec<u32>,
+    pub have_bitmap: Option<Vec<u8>>,
 }

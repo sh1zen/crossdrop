@@ -44,6 +44,19 @@ impl ChunkBitmap {
         self.missing_chunks().count() as u32
     }
 
+    /// Rebase this bitmap to a new `total_chunks` preserving set bits that
+    /// still fit in range.
+    pub fn rebased(&self, total_chunks: u32) -> Self {
+        let mut out = Self::new(total_chunks);
+        let limit = self.total_chunks.min(total_chunks);
+        for i in 0..limit {
+            if self.is_set(i) {
+                out.set(i);
+            }
+        }
+        out
+    }
+
     /// Encode to a compact wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + self.bits.len() * 8);
@@ -74,13 +87,13 @@ impl ChunkBitmap {
     /// Return `(word_index, bit_index)` for `index`, or `None` if out of range.
     #[inline]
     fn location(&self, index: u32) -> Option<(usize, u32)> {
-        (index < self.total_chunks).then(|| ((index / WORD_BITS) as usize, index % WORD_BITS))
+        (index < self.total_chunks).then_some(((index / WORD_BITS) as usize, index % WORD_BITS))
     }
 }
 
 #[inline]
 fn words_needed(total_chunks: u32) -> usize {
-    ((total_chunks as usize) + 63) / 64
+    (total_chunks as usize).div_ceil(64)
 }
 
 #[cfg(test)]

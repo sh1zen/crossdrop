@@ -102,7 +102,9 @@ impl Component for ChatPanel {
         // Right panel: messages + typing indicator + input
         // Determine if any peer is typing for the current target
         let typing_peers: Vec<String> = app
-            .state.chat.typing
+            .state
+            .chat
+            .typing
             .typing_peers()
             .into_iter()
             .filter(|pid| match &app.state.chat.target {
@@ -144,9 +146,7 @@ impl Component for ChatPanel {
                         ),
                         Span::styled(
                             "You ",
-                            Style::default()
-                                .fg(accent)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(accent).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("> ", Style::default().fg(Color::DarkGray)),
                         Span::raw(&m.text),
@@ -157,7 +157,7 @@ impl Component for ChatPanel {
                             Style::default().fg(Color::Indexed(240)),
                         ),
                         Span::styled(
-                            format!("{} ", get_display_name(app, &pid)),
+                            format!("{} ", get_display_name(app, pid)),
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -337,6 +337,12 @@ impl Handler for ChatPanel {
                             });
                             let peer_count = app.state.peers.list.len() as u64;
                             app.engine.record_message_sent(msg_len * peer_count);
+                            // Keep per-peer sent-message stats aligned with room broadcast fan-out.
+                            for peer_id in app.state.peers.list.clone() {
+                                let stats =
+                                    app.state.peers.stats.entry(peer_id).or_insert((0, 0, 0, 0));
+                                stats.0 += 1;
+                            }
 
                             // Network: still sent individually to each peer
                             let node = node.clone();
@@ -369,7 +375,9 @@ impl Handler for ChatPanel {
 
                             // Update per-peer stats (messages sent)
                             let stats = app
-                                .state.peers.stats
+                                .state
+                                .peers
+                                .stats
                                 .entry(peer_id.clone())
                                 .or_insert((0, 0, 0, 0));
                             stats.0 += 1;

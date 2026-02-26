@@ -80,7 +80,13 @@ impl Component for HomePanel {
                     Span::raw(mode.label()),
                 ])),
                 Mode::Peers => {
-                    let online_count = app.state.peers.list.iter().filter(|p| app.is_peer_online(p)).count();
+                    let online_count = app
+                        .state
+                        .peers
+                        .list
+                        .iter()
+                        .filter(|p| app.is_peer_online(p))
+                        .count();
                     let total_count = app.state.peers.list.len();
                     ListItem::new(Line::from(vec![
                         Span::styled(" 💻  ".to_string(), Style::default().fg(accent)),

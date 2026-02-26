@@ -16,6 +16,7 @@ enum FocusElement {
     RemoteAccessToggle,      // Index 1
     RemoteKeyListenerToggle, // Index 2
     ThemeToggle,             // Index 3
+    ClearStatsHistory,       // Index 4
 }
 
 impl FocusElement {
@@ -25,6 +26,7 @@ impl FocusElement {
             1 => FocusElement::RemoteAccessToggle,
             2 => FocusElement::RemoteKeyListenerToggle,
             3 => FocusElement::ThemeToggle,
+            4 => FocusElement::ClearStatsHistory,
             _ => FocusElement::DisplayNameInput,
         }
     }
@@ -35,6 +37,7 @@ impl FocusElement {
             FocusElement::RemoteAccessToggle => 1,
             FocusElement::RemoteKeyListenerToggle => 2,
             FocusElement::ThemeToggle => 3,
+            FocusElement::ClearStatsHistory => 4,
         }
     }
 }
@@ -67,6 +70,7 @@ impl Component for SettingsPanel {
                 Constraint::Length(3), // Remote access toggle
                 Constraint::Length(3), // Remote key listener toggle
                 Constraint::Length(3), // Theme toggle
+                Constraint::Length(3), // Clear statistics/history
                 Constraint::Min(0),    // Spacer
             ])
             .split(area);
@@ -75,7 +79,11 @@ impl Component for SettingsPanel {
 
         // Display name input
         let name_focused = self.focused_element == FocusElement::DisplayNameInput;
-        let name_border_color = if name_focused { accent } else { Color::DarkGray };
+        let name_border_color = if name_focused {
+            accent
+        } else {
+            Color::DarkGray
+        };
 
         let name_block = Block::default()
             .borders(Borders::ALL)
@@ -90,7 +98,11 @@ impl Component for SettingsPanel {
 
         // Remote access toggle
         let toggle_focused = self.focused_element == FocusElement::RemoteAccessToggle;
-        let toggle_border_color = if toggle_focused { accent } else { Color::DarkGray };
+        let toggle_border_color = if toggle_focused {
+            accent
+        } else {
+            Color::DarkGray
+        };
 
         let toggle_status = if app.state.settings.remote_access {
             Span::styled(" ENABLED ", Style::default().fg(Color::Green))
@@ -137,11 +149,7 @@ impl Component for SettingsPanel {
             Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
         };
 
-        let rkl_line = Line::from(vec![
-            Span::raw("Share Keystrokes: "),
-            rkl_status,
-            rkl_help,
-        ]);
+        let rkl_line = Line::from(vec![Span::raw("Share Keystrokes: "), rkl_status, rkl_help]);
 
         let rkl_block = Block::default()
             .borders(Borders::ALL)
@@ -173,11 +181,7 @@ impl Component for SettingsPanel {
             Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
         };
 
-        let theme_line = Line::from(vec![
-            Span::raw("Theme: "),
-            theme_label,
-            theme_help,
-        ]);
+        let theme_line = Line::from(vec![Span::raw("Theme: "), theme_label, theme_help]);
 
         let theme_block = Block::default()
             .borders(Borders::ALL)
@@ -189,6 +193,33 @@ impl Component for SettingsPanel {
 
         let theme_widget = Paragraph::new(theme_line).block(theme_block);
         f.render_widget(theme_widget, chunks[3]);
+
+        // Clear statistics/history action
+        let clear_focused = self.focused_element == FocusElement::ClearStatsHistory;
+        let clear_border_color = if clear_focused {
+            accent
+        } else {
+            Color::DarkGray
+        };
+
+        let clear_help = if clear_focused {
+            Span::styled(" (Press 'r' to clear) ", Style::default().fg(Color::Gray))
+        } else {
+            Span::styled(" (Tab to focus) ", Style::default().fg(Color::DarkGray))
+        };
+
+        let clear_line = Line::from(vec![Span::raw("Transfer stats + history"), clear_help]);
+
+        let clear_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(clear_border_color))
+            .title(Span::styled(
+                " Clear Data ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+        let clear_widget = Paragraph::new(clear_line).block(clear_block);
+        f.render_widget(clear_widget, chunks[4]);
     }
 
     fn on_focus(&mut self, app: &mut App, _node: &PeerNode) {
@@ -264,7 +295,8 @@ impl Handler for SettingsPanel {
                     }
                     FocusElement::RemoteKeyListenerToggle => {
                         if c == 'k' || c == 'K' {
-                            app.state.settings.remote_key_listener = !app.state.settings.remote_key_listener;
+                            app.state.settings.remote_key_listener =
+                                !app.state.settings.remote_key_listener;
                             let enabled = app.state.settings.remote_key_listener;
                             // Persist to disk
                             if let Ok(mut p) = crate::core::persistence::Persistence::load() {
@@ -288,6 +320,11 @@ impl Handler for SettingsPanel {
                             }
                         }
                     }
+                    FocusElement::ClearStatsHistory => {
+                        if c == 'r' || c == 'R' {
+                            return Some(Action::ClearTransferStatsAndHistory);
+                        }
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -305,6 +342,7 @@ impl Focusable for SettingsPanel {
     fn focusable_elements(&self) -> Vec<FocusableElement> {
         vec![
             FocusableElement::TextInput,
+            FocusableElement::Toggle,
             FocusableElement::Toggle,
             FocusableElement::Toggle,
             FocusableElement::Toggle,

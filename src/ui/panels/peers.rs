@@ -63,7 +63,9 @@ impl Component for PeersPanel {
     fn render(&mut self, f: &mut Frame, app: &App, area: Rect) {
         let accent = app.state.settings.theme.accent();
         let items: Vec<ListItem> = app
-            .state.peers.list
+            .state
+            .peers
+            .list
             .iter()
             .enumerate()
             .map(|(i, p)| {
@@ -131,7 +133,13 @@ impl Component for PeersPanel {
             })
             .collect();
 
-        let online_count = app.state.peers.list.iter().filter(|p| app.is_peer_online(p)).count();
+        let online_count = app
+            .state
+            .peers
+            .list
+            .iter()
+            .filter(|p| app.is_peer_online(p))
+            .count();
         let total_count = app.state.peers.list.len();
         let peer_list = List::new(items).block(
             Block::default()
@@ -166,7 +174,8 @@ impl Handler for PeersPanel {
             }
             KeyCode::Down => {
                 if !app.state.peers.list.is_empty() {
-                    app.state.peers.selected_idx = (app.state.peers.selected_idx + 1) % app.state.peers.list.len();
+                    app.state.peers.selected_idx =
+                        (app.state.peers.selected_idx + 1) % app.state.peers.list.len();
                 }
                 Some(Action::None)
             }
@@ -197,6 +206,19 @@ impl Handler for PeersPanel {
                 // Remove a single saved peer (disconnect if online, remove from registry)
                 if let Some(peer_id) = app.state.peers.list.get(app.state.peers.selected_idx) {
                     let peer_id = peer_id.clone();
+                    // Cancel all active transfers for this peer first
+                    let outcome = app.engine.cancel_all_transfers_for_peer(&peer_id);
+                    if !outcome.actions.is_empty() || outcome.status.is_some() {
+                        // If there are transfers to cancel, execute the actions first
+                        let actions = outcome.actions;
+                        if let Some(status) = outcome.status {
+                            return Some(Action::SetStatus(status));
+                        }
+                        if !actions.is_empty() {
+                            return Some(Action::EngineActions(actions));
+                        }
+                    }
+                    // Then remove the peer
                     if app.is_peer_online(&peer_id) {
                         let node = node.clone();
                         let pid = peer_id.clone();

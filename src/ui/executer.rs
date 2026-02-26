@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::io::stdout;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
@@ -246,7 +246,9 @@ pub async fn run(args: Args, sos: SignalOfStop, log_buffer: LogBuffer) -> anyhow
     }
 
     let initial_mode = executer.context.current_mode;
-    executer.panels.on_focus(&mut executer.app, &node, initial_mode);
+    executer
+        .panels
+        .on_focus(&mut executer.app, &node, initial_mode);
 
     let should_quit = executer.run_event_loop(&node, &mut event_rx, &sos).await?;
 
@@ -268,11 +270,9 @@ fn restore_persisted_state(app: &mut App, node: &PeerNode, args: &Args) {
         return;
     };
 
-    if args.display_name.is_none() {
-        if !p.settings.display_name.is_empty() {
-            app.state.settings.display_name = p.settings.display_name.clone();
-            node.set_display_name(p.settings.display_name.clone());
-        }
+    if args.display_name.is_none() && !p.settings.display_name.is_empty() {
+        app.state.settings.display_name = p.settings.display_name.clone();
+        node.set_display_name(p.settings.display_name.clone());
     }
 
     // Restore theme
@@ -566,28 +566,13 @@ impl UIExecuter {
             f.render_widget(legend, chunks[0]);
         }
 
-        let stats = app.engine.stats();
         let wire_tx = app.total_wire_tx();
         let wire_rx = app.total_wire_rx();
         let stats_line = Paragraph::new(Line::from(vec![
             Span::styled(" TX: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format_file_size(wire_tx), Style::default().fg(Color::Green)),
-            Span::styled(
-                format!(
-                    " ({} msgs, {} files)",
-                    stats.messages_sent, stats.files_sent
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
             Span::styled("  |  RX: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format_file_size(wire_rx), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!(
-                    " ({} msgs, {} files)",
-                    stats.messages_received, stats.files_received
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
         ]))
         .style(Style::default().bg(Color::Black));
         f.render_widget(stats_line, chunks[1]);
@@ -617,7 +602,7 @@ impl UIExecuter {
                         .filter(|p| self.app.is_peer_online(p))
                         .cloned()
                         .collect();
-                    
+
                     // Send key to all online peers
                     for peer_id in online_peers {
                         let node = node.clone();
@@ -715,6 +700,21 @@ impl UIExecuter {
             }
             Action::ClearOfflinePeers => {
                 self.clear_offline_peers();
+            }
+            Action::ClearTransferStatsAndHistory => {
+                let had_data = self.app.engine.clear_transfer_stats_and_history();
+                self.app.state.files.history_scroll = 0;
+                self.app.state.files.history_selected_idx = 0;
+                self.app.state.files.active_transfer_idx = 0;
+                if had_data {
+                    self.app
+                        .notify
+                        .warn("Cleared transfer statistics and history".to_string());
+                } else {
+                    self.app
+                        .notify
+                        .info("Transfer statistics and history already empty".to_string());
+                }
             }
             Action::UpdateGlobalKeyboardListener => {
                 self.update_global_keyboard_listener();
@@ -834,15 +834,15 @@ impl UIExecuter {
             ref peer_id,
             explicit,
         } = event
+            && !explicit
+            && node.is_peer_connected(peer_id).await
         {
-            if !explicit && node.is_peer_connected(peer_id).await {
-                debug!(
-                    event = "stale_disconnect_ignored",
-                    peer = %short_id(peer_id),
-                    "Ignoring stale PeerDisconnected — peer has an active connection"
-                );
-                return;
-            }
+            debug!(
+                event = "stale_disconnect_ignored",
+                peer = %short_id(peer_id),
+                "Ignoring stale PeerDisconnected — peer has an active connection"
+            );
+            return;
         }
 
         // Route all transfer-related events through the engine first.
@@ -920,7 +920,7 @@ impl UIExecuter {
                     let entry = CapturedKey { key: key.clone() };
                     self.app.state.key_listener.remote_key_events.push(entry);
                 }
-                
+
                 info!(
                     event = "remote_key_received",
                     peer = %short_id(&peer_id),
@@ -1049,14 +1049,14 @@ impl UIExecuter {
                 get_display_name(&self.app, &peer_id)
             ));
 
-            if let Some(record) = self.peer_registry.peers.get(&peer_id) {
-                if !record.removed {
-                    let ticket = record.ticket.clone();
-                    let node_clone = node.clone();
-                    let pid = peer_id.clone();
-                    info!(event = "auto_reconnect_after_disconnect", peer = %short_id(&pid), "Spawning auto-reconnect after connection loss");
-                    tokio::spawn(reconnect_after_disconnect(node_clone, pid, ticket));
-                }
+            if let Some(record) = self.peer_registry.peers.get(&peer_id)
+                && !record.removed
+            {
+                let ticket = record.ticket.clone();
+                let node_clone = node.clone();
+                let pid = peer_id.clone();
+                info!(event = "auto_reconnect_after_disconnect", peer = %short_id(&pid), "Spawning auto-reconnect after connection loss");
+                tokio::spawn(reconnect_after_disconnect(node_clone, pid, ticket));
             }
         }
     }
@@ -1245,13 +1245,7 @@ impl UIExecuter {
                 // after PrepareReceive completes. The sender starts transmitting
                 // immediately upon receiving this response.
                 if let Err(e) = node
-                    .respond_to_transaction(
-                        &peer_id,
-                        transaction_id,
-                        accepted,
-                        dest_path,
-                        reason,
-                    )
+                    .respond_to_transaction(&peer_id, transaction_id, accepted, dest_path, reason)
                     .await
                 {
                     tracing::error!(
@@ -1270,55 +1264,80 @@ impl UIExecuter {
                 // CRITICAL: This must complete BEFORE SendTransactionResponse is sent.
                 // The sender starts transmitting immediately upon receiving the response,
                 // so we must have destinations registered first.
-                if let Err(e) = node.prepare_file_reception(&peer_id, files).await {
+                //
+                // Register ALL files in accepted_destinations (normal path).
+                // For files with a manifest merkle_root where the destination already
+                // exists, also spawn a background Merkle check.  If the check passes,
+                // it registers the file as pre-skip so handle_metadata can reply with
+                // FileSkip immediately — zero data transfer for identical files.
+                let normal_files: Vec<(uuid::Uuid, std::path::PathBuf)> = files
+                    .iter()
+                    .map(|(fid, path, _, _)| (*fid, path.clone()))
+                    .collect();
+
+                if let Err(e) = node.prepare_file_reception(&peer_id, normal_files).await {
                     tracing::error!("Failed to prepare file reception for {}: {}", peer_id, e);
                 }
-                if !resume_bitmaps.is_empty() {
-                    if let Err(e) = node.prepare_resume_bitmaps(&peer_id, resume_bitmaps).await {
-                        tracing::error!("Failed to register resume bitmaps for {}: {}", peer_id, e);
-                    }
+
+                // Spawn background Merkle checks for files that may be identical.
+                // Limit concurrency to avoid disk thrashing on large folders.
+                let max_precheck_jobs = std::thread::available_parallelism()
+                    .map(|n| n.get().clamp(4, 16))
+                    .unwrap_or(8);
+                let precheck_gate = Arc::new(Semaphore::new(max_precheck_jobs));
+                for (file_id, dest_path, expected_size, merkle_root_opt) in files {
+                    let Some(expected_root) = merkle_root_opt else {
+                        continue;
+                    };
+                    let node_clone = node.clone();
+                    let peer_id_clone = peer_id.clone();
+                    let gate = Arc::clone(&precheck_gate);
+                    tokio::spawn(async move {
+                        let _permit = match gate.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        // Fast path: if file is missing or size differs, skip Merkle work.
+                        match tokio::fs::metadata(&dest_path).await {
+                            Ok(meta) if meta.len() == expected_size => {}
+                            Ok(_) => return,
+                            Err(_) => return,
+                        }
+                        match compute_file_merkle_root(&dest_path).await {
+                            Ok(actual_root) if actual_root == expected_root => {
+                                if let Err(e) = node_clone
+                                    .register_pre_skip_files(
+                                        &peer_id_clone,
+                                        vec![(file_id, dest_path, expected_root)],
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to register pre-skip for {file_id}: {e}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        event = "pre_skip_registered",
+                                        %file_id,
+                                        "Pre-skip: existing file is identical, will skip transfer"
+                                    );
+                                }
+                            }
+                            Ok(_) => {} // different content — receive normally
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Merkle pre-check failed for {file_id}: {e} — receiving normally"
+                                );
+                            }
+                        }
+                    });
                 }
-            }
 
-            EngineAction::SendFileData {
-                peer_id,
-                file_path,
-                file_id,
-                filename,
-            } => {
-                let node = node.clone();
-                let event_tx = node.event_tx().clone();
-                tokio::spawn(async move {
-                    if let Err(e) = node
-                        .send_file_data(&peer_id, file_id, &file_path, &filename)
-                        .await
-                    {
-                        tracing::error!("File send error for {}: {}", filename, e);
-                        let _ = event_tx.send(AppEvent::Error(format!(
-                            "File send failed ({}): {}",
-                            filename, e
-                        )));
-                    }
-                });
-            }
-
-            EngineAction::SendFolderData {
-                peer_id,
-                transaction_id,
-                file_entries,
-            } => {
-                let node = node.clone();
-                let event_tx = node.event_tx().clone();
-                tokio::spawn(async move {
-                    if let Err(e) = node
-                        .send_folder_data(&peer_id, transaction_id, file_entries)
-                        .await
-                    {
-                        tracing::error!("Folder send error: {}", e);
-                        let _ =
-                            event_tx.send(AppEvent::Error(format!("Folder send failed: {}", e)));
-                    }
-                });
+                if !resume_bitmaps.is_empty()
+                    && let Err(e) = node.prepare_resume_bitmaps(&peer_id, resume_bitmaps).await
+                {
+                    tracing::error!("Failed to register resume bitmaps for {}: {}", peer_id, e);
+                }
             }
 
             EngineAction::SendTransactionComplete {
@@ -1332,6 +1351,192 @@ impl UIExecuter {
                         .await
                     {
                         tracing::error!("Failed to send completion for {}: {}", transaction_id, e);
+                    }
+                });
+            }
+
+            EngineAction::SendTransactionManifest {
+                peer_id,
+                transaction_id,
+                manifest,
+                total_size,
+            } => {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node
+                        .send_transaction_manifest(&peer_id, transaction_id, manifest, total_size)
+                        .await
+                    {
+                        tracing::error!("Failed to send manifest for {}: {}", transaction_id, e);
+                    }
+                });
+            }
+
+            EngineAction::RequestFilePullBatch {
+                peer_id,
+                transaction_id,
+                requests,
+            } => {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node
+                        .request_file_pull_batch(&peer_id, transaction_id, requests)
+                        .await
+                    {
+                        tracing::error!(
+                            "Failed to request pull batch for {}: {}",
+                            transaction_id,
+                            e
+                        );
+                    }
+                });
+            }
+
+            EngineAction::ServePullBatch {
+                peer_id,
+                transaction_id,
+                requests,
+            } => {
+                let node = node.clone();
+                let event_tx = node.event_tx().clone();
+                tokio::spawn(async move {
+                    // Kick off warm-up for full-file requests in parallel.
+                    let mut warmups = std::collections::HashMap::new();
+                    for r in &requests {
+                        if r.chunk_indices.is_empty() {
+                            let n = node.clone();
+                            let peer = peer_id.clone();
+                            let fid = r.file_id;
+                            let path = r.file_path.clone();
+                            warmups.insert(
+                                fid,
+                                tokio::spawn(async move {
+                                    let _ = n.prewarm_file_data(&peer, fid, &path).await;
+                                }),
+                            );
+                        }
+                    }
+
+                    for r in requests {
+                        if r.chunk_indices.is_empty() {
+                            if let Some(handle) = warmups.remove(&r.file_id) {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(150),
+                                    handle,
+                                )
+                                .await;
+                            }
+                            if let Some(bitmap_bytes) = r.have_bitmap.clone() {
+                                if let Some(bitmap) =
+                                    crate::core::pipeline::chunk::ChunkBitmap::from_bytes(
+                                        &bitmap_bytes,
+                                    )
+                                {
+                                    // Use sparse resume only when receiver already has
+                                    // at least one chunk; otherwise run hash negotiation
+                                    // path, which can skip unchanged files entirely.
+                                    let has_some_chunks =
+                                        bitmap.missing_count() < bitmap.total_chunks;
+                                    if has_some_chunks {
+                                        if let Err(e) = node
+                                            .send_file_data_resuming(
+                                                &peer_id,
+                                                r.file_id,
+                                                &r.file_path,
+                                                &r.filename,
+                                                bitmap,
+                                                Some(transaction_id),
+                                            )
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                "Sparse pull send error for {}: {}",
+                                                r.filename,
+                                                e
+                                            );
+                                            let _ = event_tx.send(AppEvent::Error(format!(
+                                                "Sparse pull failed ({}): {}",
+                                                r.filename, e
+                                            )));
+                                            return;
+                                        }
+                                    } else if let Err(e) = node
+                                        .send_file_data(
+                                            &peer_id,
+                                            r.file_id,
+                                            &r.file_path,
+                                            &r.filename,
+                                            Some(transaction_id),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "File pull send error for {}: {}",
+                                            r.filename,
+                                            e
+                                        );
+                                        let _ = event_tx.send(AppEvent::Error(format!(
+                                            "Pull send failed ({}): {}",
+                                            r.filename, e
+                                        )));
+                                        return;
+                                    }
+                                } else if let Err(e) = node
+                                    .send_file_data(
+                                        &peer_id,
+                                        r.file_id,
+                                        &r.file_path,
+                                        &r.filename,
+                                        Some(transaction_id),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "File pull send error for {}: {}",
+                                        r.filename,
+                                        e
+                                    );
+                                    let _ = event_tx.send(AppEvent::Error(format!(
+                                        "Pull send failed ({}): {}",
+                                        r.filename, e
+                                    )));
+                                    return;
+                                }
+                            } else if let Err(e) = node
+                                .send_file_data(
+                                    &peer_id,
+                                    r.file_id,
+                                    &r.file_path,
+                                    &r.filename,
+                                    Some(transaction_id),
+                                )
+                                .await
+                            {
+                                tracing::error!("File pull send error for {}: {}", r.filename, e);
+                                let _ = event_tx.send(AppEvent::Error(format!(
+                                    "Pull send failed ({}): {}",
+                                    r.filename, e
+                                )));
+                                return;
+                            }
+                        } else if let Err(e) = node
+                            .send_file_chunks_data(
+                                &peer_id,
+                                r.file_id,
+                                &r.file_path,
+                                &r.filename,
+                                r.chunk_indices.clone(),
+                                Some(transaction_id),
+                            )
+                            .await
+                        {
+                            tracing::error!("Chunk pull send error for {}: {}", r.filename, e);
+                            let _ = event_tx.send(AppEvent::Error(format!(
+                                "Chunk pull failed ({}): {}",
+                                r.filename, e
+                            )));
+                            return;
+                        }
                     }
                 });
             }
@@ -1364,10 +1569,47 @@ impl UIExecuter {
             EngineAction::SendResumeRequest {
                 peer_id,
                 transaction_id,
-                resume_info,
+                mut resume_info,
             } => {
+                // Before sending the resume request to the sender, strip bitmaps
+                // for files whose temp data no longer exists on disk.  If we
+                // include a stale bitmap the sender will skip those chunks, but
+                // the receiver has no data for them → file corruption.
+                if let Some(txn) = self.app.engine.transactions().get(&transaction_id) {
+                    let files_without_temp: Vec<uuid::Uuid> = resume_info
+                        .chunk_bitmaps
+                        .keys()
+                        .copied()
+                        .filter(|fid| {
+                            txn.files
+                                .get(fid)
+                                .and_then(|f| f.full_path.as_ref())
+                                .map(|fp| {
+                                    // Mirror the temp_path_for() logic from receiver.rs:
+                                    // append ".crossdrop-tmp" to the full save path.
+                                    let mut name = std::ffi::OsString::from(fp);
+                                    name.push(".crossdrop-tmp");
+                                    !std::path::Path::new(&name).exists()
+                                })
+                                .unwrap_or(true) // no path → treat as missing
+                        })
+                        .collect();
+                    for fid in &files_without_temp {
+                        tracing::warn!(
+                            file_id = %fid,
+                            "Resume: temp file missing, restarting file from scratch"
+                        );
+                        resume_info.chunk_bitmaps.remove(fid);
+                        resume_info.partial_offsets.remove(fid);
+                    }
+                }
                 let node = node.clone();
                 tokio::spawn(async move {
+                    // Wait for the data channels to be fully ready before sending
+                    // the resume request.  The control channel may still be in the
+                    // process of opening after the peer connection is established,
+                    // causing "permanently closed" errors without this delay.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     if let Err(e) = node
                         .send_resume_request(&peer_id, transaction_id, resume_info)
                         .await
@@ -1381,17 +1623,6 @@ impl UIExecuter {
                 });
             }
 
-            EngineAction::ResendFiles {
-                peer_id,
-                transaction_id,
-            } => {
-                if let Some(send_info) = self.collect_resend_info(&peer_id, transaction_id) {
-                    spawn_resend(node.clone(), send_info);
-                } else {
-                    tracing::warn!("Resume: no source path for transaction {}", transaction_id);
-                }
-            }
-
             EngineAction::CancelTransaction {
                 peer_id,
                 transaction_id,
@@ -1401,7 +1632,8 @@ impl UIExecuter {
                 tokio::spawn(async move {
                     // Mark the transaction as cancelled locally so any in-flight
                     // send_folder_data task stops iterating over remaining files.
-                    node.mark_transaction_cancelled(&peer_id, transaction_id).await;
+                    node.mark_transaction_cancelled(&peer_id, transaction_id)
+                        .await;
                     // Evict receiver state so no further chunks are written to disk.
                     node.cleanup_cancelled_files(&peer_id, &file_ids).await;
                     if let Err(e) = node.send_transaction_cancel(&peer_id, transaction_id).await {
@@ -1410,9 +1642,16 @@ impl UIExecuter {
                 });
             }
 
-            EngineAction::CleanupTransferFiles { peer_id, file_ids } => {
+            EngineAction::CleanupTransferFiles {
+                peer_id,
+                transaction_id,
+                file_ids,
+            } => {
                 let node = node.clone();
                 tokio::spawn(async move {
+                    // Stop any in-flight sender tasks for this transaction.
+                    node.mark_transaction_cancelled(&peer_id, transaction_id)
+                        .await;
                     node.cleanup_cancelled_files(&peer_id, &file_ids).await;
                 });
             }
@@ -1426,63 +1665,6 @@ impl UIExecuter {
                     .await;
             }
         }
-    }
-
-    // ── ResendFiles helpers ───────────────────────────────────────────────
-
-    fn collect_resend_info(&self, peer_id: &str, transaction_id: uuid::Uuid) -> Option<ResendInfo> {
-        let txn = self.app.engine.transactions().get(&transaction_id)?;
-
-        let incomplete: Vec<ResendFileInfo> = txn
-            .file_order
-            .iter()
-            .filter_map(|fid| {
-                let f = txn.files.get(fid)?;
-                if f.completed {
-                    return None;
-                }
-                // Use stored full_path if available, otherwise fall back to joining source_path with relative_path
-                let full_path = f.full_path.clone().or_else(|| {
-                    self.app
-                        .engine
-                        .source_path(&transaction_id)
-                        .filter(|s| !s.is_empty())
-                        .map(|src| {
-                            std::path::Path::new(src)
-                                .join(&f.relative_path)
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                });
-                let full_path = match full_path {
-                    Some(p) => p,
-                    None => {
-                        tracing::warn!(
-                            "Resume: no valid path for file '{}' in transaction {} (full_path={:?}, source_path={:?})",
-                            f.relative_path,
-                            transaction_id,
-                            f.full_path,
-                            self.app.engine.source_path(&transaction_id)
-                        );
-                        return None;
-                    }
-                };
-                
-                Some(ResendFileInfo {
-                    file_id: *fid,
-                    relative_path: f.relative_path.clone(),
-                    full_path,
-                    bitmap: f.chunk_bitmap.clone(),
-                })
-            })
-            .collect();
-
-        let is_folder = txn.parent_dir.is_some();
-        Some(ResendInfo {
-            peer_id: peer_id.to_string(),
-            files: incomplete,
-            is_folder,
-        })
     }
 
     // ── Remote fetch ──────────────────────────────────────────────────────
@@ -1559,75 +1741,6 @@ impl UIExecuter {
     }
 }
 
-// ── ResendInfo ────────────────────────────────────────────────────────────────
-
-struct ResendInfo {
-    peer_id: String,
-    files: Vec<ResendFileInfo>,
-    is_folder: bool,
-}
-
-struct ResendFileInfo {
-    file_id: uuid::Uuid,
-    relative_path: String,
-    full_path: String,
-    bitmap: Option<crate::core::pipeline::chunk::ChunkBitmap>,
-}
-
-fn spawn_resend(node: PeerNode, info: ResendInfo) {
-    if info.files.is_empty() {
-        tracing::info!("Resume: all files already complete");
-        return;
-    }
-
-    tracing::info!(
-        "Resume: re-sending {} file(s){}",
-        info.files.len(),
-        if info.is_folder { " (folder)" } else { "" }
-    );
-    for f in &info.files {
-        let missing = f.bitmap.as_ref().map(|b| b.missing_count()).unwrap_or(0);
-        tracing::debug!("  file {} '{}' ({} missing chunks)", f.file_id, f.relative_path, missing);
-    }
-
-    tokio::spawn(async move {
-        if !node
-            .wait_for_peer(&info.peer_id, std::time::Duration::from_secs(5))
-            .await
-        {
-            tracing::error!(
-                "Resume send error: peer {} not connected after wait",
-                info.peer_id
-            );
-            return;
-        }
-        let event_tx = node.event_tx().clone();
-        for f in info.files {
-            let result = if let Some(bm) = f.bitmap {
-                node.send_file_data_resuming(
-                    &info.peer_id,
-                    f.file_id,
-                    &f.full_path,
-                    &f.relative_path,
-                    bm,
-                )
-                .await
-            } else {
-                node.send_file_data(&info.peer_id, f.file_id, &f.full_path, &f.relative_path)
-                    .await
-            };
-            if let Err(e) = result {
-                tracing::error!("Resume send error for '{}': {}", f.relative_path, e);
-                let _ = event_tx.send(AppEvent::Error(format!(
-                    "Resume send failed ({}): {}",
-                    f.relative_path, e
-                )));
-                return;
-            }
-        }
-    });
-}
-
 // ── Folder metadata collection ────────────────────────────────────────────────
 
 /// Collect `(dirname, Vec<(relative_path, filesize)>)` without reading file contents.
@@ -1694,10 +1807,7 @@ fn key_legend_for_mode(mode: Mode, accent: Color) -> Vec<(&'static str, &'static
             ("Enter", "send", accent),
             ("Esc", "back", Color::Red),
         ],
-        Mode::Connect => vec![
-            ("Enter", "connect", accent),
-            ("Esc", "back", Color::Red),
-        ],
+        Mode::Connect => vec![("Enter", "connect", accent), ("Esc", "back", Color::Red)],
         Mode::Peers => vec![
             ("↑↓", "navigate", Color::DarkGray),
             ("Enter", "info", accent),
@@ -1726,6 +1836,7 @@ fn key_legend_for_mode(mode: Mode, accent: Color) -> Vec<(&'static str, &'static
         ],
         Mode::Settings => vec![
             ("Tab", "cycle focus", Color::DarkGray),
+            ("r", "clear data", Color::Yellow),
             ("Enter", "save", accent),
             ("Esc", "back", Color::Red),
         ],
@@ -1747,4 +1858,35 @@ fn key_legend_for_mode(mode: Mode, accent: Color) -> Vec<(&'static str, &'static
 #[inline]
 fn short_id(peer_id: &str) -> impl std::fmt::Display + '_ {
     crate::core::initializer::short_id_pub(peer_id)
+}
+
+/// Compute the Merkle root of a file by reading it chunk-by-chunk.
+///
+/// Used by the `PrepareReceive` background pre-skip check to compare an
+/// existing local file against the sender's manifest Merkle root.
+async fn compute_file_merkle_root(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    use crate::core::config::CHUNK_SIZE;
+    use crate::core::pipeline::merkle::{hash_chunk, IncrementalMerkleBuilder};
+    use tokio::io::AsyncReadExt;
+
+    let meta = tokio::fs::metadata(path).await?;
+    let filesize = meta.len();
+    if filesize == 0 {
+        return Ok(*IncrementalMerkleBuilder::with_capacity(1).build().root());
+    }
+
+    let total_chunks = filesize.div_ceil(CHUNK_SIZE as u64) as u32;
+    let mut builder = IncrementalMerkleBuilder::with_capacity(total_chunks as usize);
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+
+    for _ in 0..total_chunks {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        builder.add_leaf(hash_chunk(&buf[..n]));
+    }
+
+    Ok(*builder.build().root())
 }
