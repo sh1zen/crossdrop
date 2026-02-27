@@ -30,6 +30,12 @@ jobs:
     # 1. Check out the repository code so the workflow can access it
     - uses: actions/checkout@v4
 
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libx11-dev libxtst-dev libxi-dev libxdo-dev
+
     # 2. Cache the cargo directories to speed up future builds
     - name: Cache cargo dependencies
       uses: actions/cache@v4
