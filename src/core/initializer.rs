@@ -8,11 +8,13 @@ use crate::core::transaction::{ResumeInfo, TransactionManifest};
 use crate::utils::sos::SignalOfStop;
 use crate::workers::args::Args;
 use anyhow::{Context, Result};
+use iroh::address_lookup::DiscoveryEvent;
 use iroh::SecretKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::select;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -29,6 +31,10 @@ pub enum AppEvent {
         peer_id: String,
         /// `true` = user-initiated removal; `false` = connection lost.
         explicit: bool,
+    },
+    PeerDiscovered {
+        peer_id: String,
+        ticket: Option<String>,
     },
     ChatReceived {
         peer_id: String,
@@ -882,6 +888,54 @@ impl PeerNode {
     // ── Accept loop ──────────────────────────────────────────────────────
 
     pub async fn run_accept_loop(self) {
+        // Run discovery loop if discovery is available
+        if let Some(mut stream) = self.iroh.subscribe().await {
+            let this = self.clone();
+            tokio::spawn(async move {
+                use futures_lite::StreamExt;
+                loop {
+                    select! {
+                        _ = this.sos.wait() => break,
+                        event = stream.next() => {
+                            if let Some(event) = event {
+                                match event {
+                                    DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                                        let peer_id = endpoint_info.endpoint_id.to_string();
+                                        debug!(
+                                            event = "peer_discovered",
+                                            peer_id = %peer_id,
+                                            addrs_count = endpoint_info.addrs().count(),
+                                            "Peer discovered via mDNS"
+                                        );
+
+                                        // Try to create a ticket for automatic connection
+                                        let ticket = {
+                                            let addr = iroh::EndpointAddr::from(endpoint_info);
+                                            if !addr.addrs.is_empty() {
+                                                debug!(
+                                                    event = "discovery_ticket_gen",
+                                                    peer_id = %peer_id,
+                                                    addrs = ?addr.addrs,
+                                                    "Generating ticket from discovered addresses"
+                                                );
+                                            }
+                                            let ticket = crate::core::connection::Ticket::new(addr);
+                                            crate::core::connection::Ticket::export(ticket).ok()
+                                        };
+
+                                        let _ = this.event_tx.send(AppEvent::PeerDiscovered { peer_id, ticket });
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         loop {
             let sos = self.sos.clone();
             let iroh = self.iroh.clone();

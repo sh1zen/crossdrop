@@ -417,20 +417,27 @@ impl App {
         self.notify.error(msg);
     }
 
-    pub fn add_peer(&mut self, peer_id: String) {
+    pub fn add_peer(&mut self, peer_id: String, online: bool) {
         if !self.state.peers.list.contains(&peer_id) {
             self.state.peers.list.push(peer_id.clone());
         }
-        // Mark as online (re-connection or first connection)
+        // Mark status
+        let status = if online {
+            PeerStatus::Online
+        } else {
+            PeerStatus::Offline
+        };
         self.state
             .peers
             .status
-            .insert(peer_id.clone(), PeerStatus::Online);
-        // Track connection time
-        self.state
-            .peers
-            .connected_at
-            .insert(peer_id, crate::ui::helpers::format_absolute_timestamp_now());
+            .insert(peer_id.clone(), status);
+        // Track connection time only if online
+        if online {
+            self.state
+                .peers
+                .connected_at
+                .insert(peer_id, crate::ui::helpers::format_absolute_timestamp_now());
+        }
     }
 
     /// Transition a peer to offline state.

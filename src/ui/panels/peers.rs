@@ -71,12 +71,15 @@ impl Component for PeersPanel {
             .map(|(i, p)| {
                 let is_selected = i == app.state.peers.selected_idx;
                 let is_online = app.is_peer_online(p);
+                let is_connecting = app.state.peers.connecting.contains_key(p);
                 let display = get_display_name(app, p);
                 let short = short_peer_id(p);
 
-                // Status indicator: green circle for online, grey for offline
+                // Status indicator: green circle for online, yellow for connecting, grey for offline
                 let status_indicator = if is_online {
                     Span::styled("● ", Style::default().fg(Color::Green))
+                } else if is_connecting {
+                    Span::styled("● ", Style::default().fg(Color::Yellow))
                 } else {
                     Span::styled("● ", Style::default().fg(Color::DarkGray))
                 };
@@ -123,8 +126,17 @@ impl Component for PeersPanel {
 
                 // Show offline label
                 if !is_online {
+                    let label = if is_connecting {
+                        if let Some(status) = app.state.peers.connecting.get(p) {
+                            format!(" [{}]", status.to_lowercase())
+                        } else {
+                            " [connecting...]".to_string()
+                        }
+                    } else {
+                        " [offline]".to_string()
+                    };
                     spans.push(Span::styled(
-                        " [offline]",
+                        label,
                         Style::default().fg(Color::DarkGray),
                     ));
                 }

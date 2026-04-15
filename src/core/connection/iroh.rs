@@ -11,6 +11,8 @@ use crate::workers::args::RelayModeOption;
 use anyhow::Context;
 use iroh::address_lookup::dns::DnsAddressLookup;
 use iroh::address_lookup::pkarr::PkarrPublisher;
+use iroh::address_lookup::mdns::MdnsAddressLookup;
+use iroh::address_lookup::DiscoveryEvent;
 use iroh::endpoint::{Connection, Incoming, QuicTransportConfig};
 use iroh::{Endpoint, SecretKey};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -20,6 +22,7 @@ use tokio::select;
 /// Wrapper around Iroh endpoint for P2P connectivity.
 pub struct Iroh {
     endpoint: Option<Endpoint>,
+    discovery: Option<MdnsAddressLookup>,
 }
 
 impl Iroh {
@@ -31,7 +34,7 @@ impl Iroh {
         ipv6_addr: Option<std::net::SocketAddrV6>,
         port: u16,
     ) -> anyhow::Result<Self> {
-        let endpoint =
+        let (endpoint, discovery) =
             Self::bind_with_retry(secret_key, relay_mode.clone(), ipv4_addr, ipv6_addr, port)
                 .await?;
 
@@ -42,6 +45,7 @@ impl Iroh {
 
         Ok(Self {
             endpoint: Some(endpoint),
+            discovery,
         })
     }
 
@@ -66,7 +70,7 @@ impl Iroh {
         ipv4_addr: Option<std::net::SocketAddrV4>,
         ipv6_addr: Option<std::net::SocketAddrV6>,
         port: u16,
-    ) -> anyhow::Result<Endpoint> {
+    ) -> anyhow::Result<(Endpoint, Option<MdnsAddressLookup>)> {
         // Configure transport to allow more remote NAT traversal addresses
         // This prevents the "remote server configuration might cause nat traversal issues" warning
         // when the remote advertises more local addresses than our default limit
@@ -74,11 +78,15 @@ impl Iroh {
             .set_max_remote_nat_traversal_addresses(16)
             .build();
 
-        let mut builder = Endpoint::empty_builder(relay_mode.clone().into())
+        let mdns = MdnsAddressLookup::builder().build(secret_key.public())?;
+
+        let mut builder = Endpoint::empty_builder()
+            .relay_mode(relay_mode.clone().into())
             .alpns(vec![b"msg/1".to_vec()])
-            .secret_key(secret_key)
+            .secret_key(secret_key.clone())
             .address_lookup(PkarrPublisher::n0_dns())
             .address_lookup(DnsAddressLookup::n0_dns())
+            .address_lookup(mdns.clone())
             .transport_config(transport_config);
 
         // Configure IPv4 binding
@@ -98,7 +106,7 @@ impl Iroh {
             builder = builder.bind_addr(addr)?;
         }
 
-        Ok(builder.bind().await?)
+        Ok((builder.bind().await?, Some(mdns)))
     }
 
     /// Bind endpoint with retry logic for port conflicts.
@@ -108,7 +116,7 @@ impl Iroh {
         ipv4_addr: Option<std::net::SocketAddrV4>,
         ipv6_addr: Option<std::net::SocketAddrV6>,
         port: u16,
-    ) -> anyhow::Result<Endpoint> {
+    ) -> anyhow::Result<(Endpoint, Option<MdnsAddressLookup>)> {
         // Port 0 = OS picks a random available port, no retry needed
         if port == 0 {
             return Self::try_bind(secret_key, &relay_mode, ipv4_addr, ipv6_addr, 0).await;
@@ -131,11 +139,11 @@ impl Iroh {
             )
             .await
             {
-                Ok(endpoint) => {
+                Ok(res) => {
                     if offset > 0 {
                         tracing::info!("Port {port} was taken, bound to {try_port} instead");
                     }
-                    return Ok(endpoint);
+                    return Ok(res);
                 }
                 Err(e) => {
                     if Self::is_port_in_use_error(&e) {
@@ -200,6 +208,15 @@ impl Iroh {
         match endpoint.accept().await {
             None => anyhow::bail!("endpoint closed unexpectedly"),
             Some(conn) => Ok(conn),
+        }
+    }
+
+    /// Subscribe to discovery events.
+    pub async fn subscribe(&self) -> Option<impl futures_lite::Stream<Item = DiscoveryEvent> + Send + Unpin + 'static> {
+        if let Some(d) = self.discovery.as_ref() {
+            Some(d.subscribe().await)
+        } else {
+            None
         }
     }
 }

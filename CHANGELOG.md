@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
+## [0.1.1]
+
+### Added
+
+- Added auto discover on local network
+
 ## [0.1.0]
 
 ### Fixed

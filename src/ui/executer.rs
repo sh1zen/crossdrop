@@ -857,6 +857,19 @@ impl UIExecuter {
             AppEvent::PeerConnected { peer_id, remote_ip } => {
                 self.on_peer_connected(node, peer_id, remote_ip).await;
             }
+            AppEvent::PeerDiscovered { peer_id, ticket } => {
+                if !self.app.state.peers.list.contains(&peer_id) {
+                    self.app.add_peer(peer_id.clone(), false);
+                    info!(event = "peer_discovered_ui", peer = %short_id(&peer_id), "New peer discovered and added to list");
+                }
+                // Auto-connect if ticket is provided and not already connected
+                if let Some(ticket_str) = ticket {
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        let _ = node.connect_to_quiet(ticket_str).await;
+                    });
+                }
+            }
             AppEvent::PeerDisconnected { peer_id, explicit } => {
                 self.on_peer_disconnected(node, peer_id, explicit).await;
             }
@@ -970,7 +983,7 @@ impl UIExecuter {
         remote_ip: Option<String>,
     ) {
         self.app.state.peers.connecting.remove(&peer_id);
-        self.app.add_peer(peer_id.clone());
+        self.app.add_peer(peer_id.clone(), true);
 
         if let Some(key) = node.get_peer_key(&peer_id).await {
             self.app.state.peers.keys.insert(peer_id.clone(), key);
